@@ -2,6 +2,18 @@
 
 A small VS Code extension that registers a **customizable OpenRouter provider** in Copilot Chat. Copilot's built-in OpenRouter provider cannot send OpenRouter's `provider` routing object or a `session_id` (microsoft/vscode#283201; feature request microsoft/vscode-copilot-release#11420 still open). This extension makes its own HTTP calls to OpenRouter instead of going through Copilot's CAPI proxy, so every Copilot Chat request can carry whatever request-body options you want — and it tracks your key's credit usage while you work.
 
+## Quantization floor (always on)
+
+By default, every request tells OpenRouter to only serve "high-precision" quantizations — `bf16`, `fp16`, `fp8`, `mxfp8`, `fp6`, `unknown` — so a low-bit (e.g. int4) endpoint is never picked automatically. This is the **default**, not something you configure.
+
+To change it, **use the Custom Request panel** and paste a `provider.quantizations` list — your list **replaces** the default entirely. Other `provider` keys (`order`, `only`, `ignore`…) merge on top of the default floor, so model pins and the floor compose.
+
+```json
+{ "provider": { "quantizations": ["bf16"] } }
+```
+
+Paste nothing to keep the default floor.
+
 ## What it does
 
 - Adds a provider group **"OpenRouter: RC"** to the Copilot Chat model picker.
