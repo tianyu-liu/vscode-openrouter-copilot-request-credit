@@ -2,7 +2,7 @@
   "name": "openrouter-copilot-request-credit",
   "displayName": "OpenRouter for Copilot with Custom Request & Credit Check",
   "description": "OpenRouter provider for Copilot Chat with one control panel: paste a request body from the OpenRouter Request Builder and every chat request follows it, while the status bar tracks your key's credit usage.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "tianyu-liu",
   "repository": {
     "type": "git",
