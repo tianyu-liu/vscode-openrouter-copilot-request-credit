@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Build output
+out/
+*.tsbuildinfo
+
+# Packaged extension
+*.vsix
+
+# Test artifacts / downloaded VS Code test runner
+.vscode-test/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+
+# Local-only reports
+tmp/
+
+# Local-only agent context (never sync alongside AGENTS.md)
+AGENTS.lab.md
+
+# VS Code local settings (do not commit personal debug profiles)
+.vscode/
