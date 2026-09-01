@@ -227,7 +227,12 @@ function mergeReasoningConfig(body: Record<string, unknown>, key: string, value:
     if (value === undefined) {
         return;
     }
-    body.reasoning = { ...(body.reasoning as Record<string, unknown> | undefined), [key]: value };
+    const existing = body.reasoning;
+    const base =
+        typeof existing === 'object' && existing !== null && !Array.isArray(existing)
+            ? existing
+            : {};
+    body.reasoning = { ...(base as Record<string, unknown>), [key]: value };
 }
 
 export function buildRequestBody(
@@ -289,7 +294,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
     async clearKey(): Promise<void> {
         this.key = undefined;
         this.cachedInfo = undefined;
-        await clearStoredKey(this.secrets);;
+        await clearStoredKey(this.secrets);
         this.infoChangeEvent.fire();
     }
 
@@ -434,6 +439,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             }
             const { done, value } = await reader.read();
             if (done) {
+                flushToolCalls(toolCalls, progress);
                 break;
             }
             buffer += decoder.decode(value, { stream: true });
@@ -656,8 +662,8 @@ function accumulateToolCall(
     toolCalls: Map<number, { id: string; name: string; arguments: string }>,
     tc: any
 ): void {
-const index = tc.index ?? 0;
-        const current = toolCalls.get(index) ?? { id: tc.id ?? `call_${index}`, name: '', arguments: '' };
+    const index = tc.index ?? 0;
+    const current = toolCalls.get(index) ?? { id: tc.id ?? `call_${index}`, name: '', arguments: '' };
     if (tc.id) {
         current.id = tc.id;
     }

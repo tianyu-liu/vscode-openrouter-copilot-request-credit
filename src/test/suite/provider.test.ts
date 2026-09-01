@@ -201,6 +201,17 @@ suite("buildRequestBody", () => {
         assert.deepStrictEqual(body.reasoning, { max_tokens: 8000, effort: "high", enabled: false });
     });
 
+    test("a non-object template reasoning does not corrupt the body with a flattened key object", () => {
+        const body = buildRequestBody(
+            { reasoning: "high" },
+            "m",
+            [],
+            undefined,
+            { reasoningEffort: "medium" }
+        );
+        assert.deepStrictEqual(body.reasoning, { effort: "medium" });
+    });
+
     test("applies the quantization floor when the template has no provider", () => {
         const body = buildRequestBody({}, "m", [], undefined, undefined);
         assert.deepStrictEqual(body.provider, {
@@ -641,5 +652,23 @@ suite("provideLanguageModelChatResponse (stubbed stream)", () => {
         assert.strictEqual(call.callId, "call_1");
         assert.strictEqual(call.name, "get_weather");
         assert.deepStrictEqual(call.input, { location: "Tokyo" });
+    });
+
+    test("flushes pending tool calls when the stream ends at EOF without [DONE]", async () => {
+        const body = `data: ${JSON.stringify({
+            choices: [
+                {
+                    delta: { tool_calls: [{ index: 0, id: "call_7", function: { name: "get_info", arguments: '{"q":"x"}' } }] },
+                },
+            ],
+        })}\n\n`;
+        nextResponses.push(() => new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } }));
+        await run();
+        const toolParts = reported.filter((p) => p instanceof vscode.LanguageModelToolCallPart);
+        assert.strictEqual(toolParts.length, 1, "tool call flushed even with no [DONE]");
+        const call = toolParts[0] as vscode.LanguageModelToolCallPart;
+        assert.strictEqual(call.callId, "call_7");
+        assert.strictEqual(call.name, "get_info");
+        assert.deepStrictEqual(call.input, { q: "x" });
     });
 });
