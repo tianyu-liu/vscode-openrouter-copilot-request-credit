@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { randomBytes } from 'crypto';
+import { presetSlugFromPickerValue, stripTemplateComments } from './provider';
 import {
     buildDetail,
     formatReset,
@@ -77,6 +78,12 @@ export function readConfig(cfg: vscode.WorkspaceConfiguration = getConfig()): Co
     return { limit, resetPeriod, includeByok, refreshIntervalMinutes };
 }
 
+export interface PresetRow {
+    slug: string;
+    name: string;
+    model?: string;
+}
+
 export function renderPanelHtml(
     info: KeyInfo | undefined,
     limit: number,
@@ -87,7 +94,9 @@ export function renderPanelHtml(
     maskedKey?: string,
     accountCredits?: AccountCredits,
     errorMessage?: string,
-    template?: Record<string, unknown>
+    template?: Record<string, unknown>,
+    presets?: PresetRow[],
+    presetConfig?: Record<string, unknown>
 ): string {
     const nonce = randomBytes(16).toString('hex');
     const detail = info ? buildDetail(info, limit, resetPeriod, includeByok, accountCredits) : undefined;
@@ -149,16 +158,43 @@ export function renderPanelHtml(
             <button id="refresh">Refresh</button>
         </div>`;
     const templateValue = template ? JSON.stringify(template, null, 2) : '';
-    const templateJson = JSON.stringify(templateValue).replace(/</g, '\\u003c');
+    const selectedPreset = templatePresetSlug(template) ?? '';
+    const presetComment = template && presetConfig && selectedPreset !== ''
+        ? JSON.stringify(presetConfig, null, 2)
+              .split('\n')
+              .map((line) => `// ${line}`)
+              .join('\n')
+        : '';
+    const templateJson = JSON.stringify(presetComment ? `${templateValue}\n${presetComment}` : templateValue).replace(/</g, '\\u003c');
+    const currentPreset = selectedPreset;
+    const presetOptions: Array<{ slug: string; label: string }> = (presets ?? []).map(p => ({
+        slug: p.slug,
+        label: `${p.name}${p.model ? ` \u2192 ${p.model}` : ' (routing profile)'}`,
+    }));
+    if (currentPreset !== '' && !presetOptions.some(p => p.slug === currentPreset)) {
+        presetOptions.push({ slug: currentPreset, label: `${currentPreset} (not in list)` });
+    }
+    const presetSelectHtml = `<select id="presetSelect">
+            <option value="" ${currentPreset === '' ? 'selected' : ''}>No preset loaded</option>
+            ${presetOptions
+                .map(
+                    (p) => `<option value="${esc(p.slug)}" ${p.slug === currentPreset ? 'selected' : ''}>${esc(p.label)}</option>`
+                )
+                .join('')}
+        </select>`;
+    const presetsHint = presets !== undefined && presets.length === 0
+        ? '<p class="muted">No presets found for this key.</p>'
+        : '';
     const footnoteRows: Array<[string, string]> = [
         ['fn-1', '<code>stream</code> \u2014 always on; responses stream token-by-token.'],
         ['fn-2', '<code>session_id</code> \u2014 a per-window random ID is always sent, so OpenRouter keeps your prompt cache warm and groups your requests in Activity.'],
         ['fn-3', 'Applied to every Copilot Chat request to OpenRouter until cleared; each turn the live conversation and tools are merged in, so any pasted <code>messages</code>/<code>prompt</code>/<code>model</code> fields are ignored.'],
         ['fn-4', 'Reasoning effort / enabled \u2014 taken from the model picker\u2019s Thinking Effort selector and spread into the template\u2019s <code>reasoning</code> object (overwrites <code>effort</code>/<code>enabled</code> only; other keys like <code>max_tokens</code>/<code>exclude</code> survive).'],
-        ['fn-5', 'Pasted <code>provider</code> fields merge over the built-in defaults; everything else you paste is sent verbatim to every request, with no separate UI for it.'],
+        ['fn-5', 'No built-in defaults \u2014 everything you paste, including a <code>provider</code> object, is sent verbatim to every request, with no separate UI for it.'],
         ['fn-6', 'Usage accounting \u2014 OpenRouter attaches a <code>usage</code> chunk to every streamed response automatically; nothing to paste.'],
         ['fn-7', 'Key storage (SecretStorage) and the https-only base URL are not configurable.'],
         ['fn-8', 'Anthropic-family models (<code>anthropic/*</code>) get a top-level <code>cache_control</code> (a 5-minute ephemeral breakpoint that advances with the conversation) unless your template sets its own <code>cache_control</code>.'],
+        ['fn-9', 'Presets \u2014 selecting a preset in the Presets section sends <code>"preset": "&lt;slug&gt;"</code> with every request; model presets also appear in the model picker as <code>@preset/&lt;slug&gt;</code>. Picker preset entries only affect turns on that entry \u2014 other models are untouched while the custom request is empty. If both are set, the picker entry wins as the preset reference (a different <code>preset</code> in the custom request is dropped for that turn) and the custom request\u2019s other fields still apply on top. Preset requests keep the preset\u2019s own provider routing: the extension adds no default <code>provider</code>, so the preset\u2019s routing applies unless a pasted <code>provider</code> overrides it.'],
     ];
     const footnotesHtml = footnoteRows
         .map(([id, text]) => `<p class="tmplnote"><a id="${id}">${id.slice(3)}.</a> ${text}</p>`)
@@ -255,6 +291,16 @@ export function renderPanelHtml(
         ${updatedLine}
     </div>
 
+    <div class="section divider">
+        <div class="section-title">Presets</div>
+        <div class="keyline">
+            <label class="optlabel" for="presetSelect">Preset</label>
+            ${presetSelectHtml}
+        </div>
+        ${presetsHint}
+        <p class="muted">Selecting a preset saves <code>{"preset": "&lt;slug&gt;"}</code> as the custom request below; the preset\u2019s own configuration then applies to every request. Select \u201cNo preset loaded\u201d to unload it. The resolved configuration is shown under the JSON as <code>//</code> comments, which are ignored on save \u2014 copy fields into the JSON to override the preset.</p>
+    </div>
+
     <div class="section">
         <div class="section-title">Custom Request</div>
         <textarea id="template" rows="10" placeholder="Paste a request body from the OpenRouter Request Builder (or any Chat Completions JSON)."></textarea>
@@ -282,7 +328,7 @@ export function renderPanelHtml(
             if (keyEl.value !== currentKeyMask) keyEl.type = 'password';
         });
         bind('saveKey', 'click', () => {
-            vsc.postMessage({ type: 'saveKey', value: keyEl.value, currentKeyMask });
+            vsc.postMessage({ type: 'saveKey', value: keyEl.value, currentKeyMasked: currentKeyMask });
         });
         bind('limit', 'change', () => {
             vsc.postMessage({ type: 'saveLimit', value: document.getElementById('limit').value });
@@ -302,6 +348,27 @@ export function renderPanelHtml(
         bind('saveTemplate', 'click', () => {
             vsc.postMessage({ type: 'saveTemplate', value: templateEl.value });
         });
+        bind('presetSelect', 'change', () => {
+            vsc.postMessage({ type: 'selectPreset', value: document.getElementById('presetSelect').value });
+        });
+        window.addEventListener('message', (event) => {
+            const m = event.data;
+            if (!m || m.type !== 'presetSelection' || typeof m.value !== 'string') {
+                return;
+            }
+            const selectEl = document.getElementById('presetSelect');
+            if (!selectEl) {
+                return;
+            }
+            const exists = Array.from(selectEl.options).some((o) => o.value === m.value);
+            if (!exists && m.value !== '') {
+                const option = document.createElement('option');
+                option.value = m.value;
+                option.textContent = m.value + ' (not in list)';
+                selectEl.appendChild(option);
+            }
+            selectEl.value = m.value;
+        });
     </script>
 </div>
 </body>
@@ -317,7 +384,6 @@ function esc(s: string): string {
 export interface PanelMessage {
     type: string;
     value?: unknown;
-    /** Masked rendering of the currently stored key (saveKey no-op guard). */
     currentKeyMasked?: string;
 }
 
@@ -331,6 +397,20 @@ export interface PanelDeps {
     clearTemplate: () => Promise<void>;
     setKey: (value: string) => Promise<void>;
     clearKey: () => Promise<void>;
+    syncPresetSelection: (slug: string | undefined) => void;
+}
+
+export function templatePresetSlug(template: Record<string, unknown> | undefined): string | undefined {
+    const preset = template?.preset;
+    return typeof preset === 'string' && preset.trim() !== '' ? preset : undefined;
+}
+
+function presetSlugOf(raw: string): string | undefined {
+    try {
+        return templatePresetSlug(JSON.parse(stripTemplateComments(raw)) as Record<string, unknown>);
+    } catch {
+        return undefined;
+    }
 }
 
 async function saveConfig(deps: PanelDeps, key: string, value: unknown): Promise<void> {
@@ -349,8 +429,6 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Pr
                 return;
             }
             if (msg.currentKeyMasked === trimmed) {
-                // The field still shows the masked display of the current key:
-                // saving it unchanged would overwrite the real secret.
                 return;
             }
             await deps.setKey(trimmed);
@@ -402,6 +480,7 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Pr
             const raw = String(msg.value ?? '');
             if (raw.trim() === '') {
                 await deps.clearTemplate();
+                deps.syncPresetSelection(undefined);
                 deps.info('Custom request cleared.');
                 return;
             }
@@ -410,13 +489,36 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Pr
                 deps.error(result.error ?? 'invalid template');
                 return;
             }
+            deps.syncPresetSelection(presetSlugOf(raw));
             deps.info('Custom request saved.');
             return;
         }
         case 'clearTemplate':
             await deps.clearTemplate();
+            deps.syncPresetSelection(undefined);
             deps.info('Custom request cleared.');
             return;
+        case 'selectPreset': {
+            const slug = presetSlugFromPickerValue(String(msg.value ?? ''));
+            if (slug === '') {
+                await deps.clearTemplate();
+                await deps.doRefresh();
+                deps.info('Preset unloaded; custom request cleared.');
+                return;
+            }
+            if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(slug)) {
+                deps.error('invalid preset');
+                return;
+            }
+            const result = await deps.saveTemplate(JSON.stringify({ preset: slug }));
+            if (!result.ok) {
+                deps.error(result.error ?? 'invalid template');
+                return;
+            }
+            await deps.doRefresh();
+            deps.info(`Preset "${slug}" loaded as the request template.`);
+            return;
+        }
         case 'refresh':
             await deps.refresh();
             return;

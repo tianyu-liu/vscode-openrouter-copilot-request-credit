@@ -11,13 +11,61 @@ import {
 
 const TEMPLATE_KEY = 'requestTemplate';
 const DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
-const DEFAULT_PROVIDER: Record<string, unknown> = {
-    quantizations: ['bf16', 'fp16', 'fp8', 'mxfp8', 'fp6', 'unknown'],
-};
+const PRESET_ID_PREFIX = '@preset/';
+const MAX_PRESET_LOOKUPS = 25;
 const SESSION_ID = crypto.randomUUID();
 const MAX_RETRIES = 3;
 const RETRY_DELAYS_MS = [1000, 2000, 4000];
 const MAX_BACKOFF_MS = 10000;
+const MAX_SSE_BUFFER_CHARS = 4_000_000;
+const PRESET_LOOKUP_CONCURRENCY = 5;
+
+export interface PresetSummary {
+    slug: string;
+    name: string;
+    model?: string;
+}
+
+function presetModelOf(config: Record<string, unknown> | undefined): string | undefined {
+    const model = config?.model;
+    return typeof model === 'string' && model.trim() !== '' ? model : undefined;
+}
+
+export function presetSlugFromPickerValue(value: string): string {
+    const trimmed = value.trim();
+    return trimmed.toLowerCase().startsWith(PRESET_ID_PREFIX)
+        ? trimmed.slice(PRESET_ID_PREFIX.length)
+        : trimmed;
+}
+
+function presetSlugFromModelId(modelId: string): string | undefined {
+    const index = modelId.indexOf(PRESET_ID_PREFIX);
+    return index >= 0 ? modelId.slice(index + PRESET_ID_PREFIX.length) : undefined;
+}
+
+async function mapWithConcurrency<T, R>(
+    items: readonly T[],
+    limit: number,
+    fn: (item: T) => Promise<R>
+): Promise<R[]> {
+    const results: R[] = new Array(items.length);
+    let next = 0;
+    const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+        while (next < items.length) {
+            const index = next++;
+            results[index] = await fn(items[index]);
+        }
+    });
+    await Promise.all(workers);
+    return results;
+}
+
+export function stripTemplateComments(raw: string): string {
+    return raw
+        .split(/\r?\n/)
+        .filter((line) => !line.trim().startsWith('//'))
+        .join('\n');
+}
 
 type ResponsePart = vscode.LanguageModelResponsePart | vscode.LanguageModelThinkingPart;
 const thinkingPartCtor = vscode.LanguageModelThinkingPart as
@@ -96,6 +144,9 @@ async function fetchWithRetry(
             }
         } else if (response !== undefined && (!isRetryable(response.status) || attempt >= MAX_RETRIES)) {
             return response;
+        }
+        if (response !== undefined) {
+            await response.body?.cancel();
         }
         if (token.isCancellationRequested) {
             throw new vscode.CancellationError();
@@ -240,7 +291,8 @@ export function buildRequestBody(
     modelId: string,
     messages: unknown[],
     tools: unknown,
-    modelConfiguration: { readonly [key: string]: unknown } | undefined
+    modelConfiguration: { readonly [key: string]: unknown } | undefined,
+    cacheModelId?: string
 ): Record<string, unknown> {
     const body: Record<string, unknown> = {
         ...(template ?? {}),
@@ -250,18 +302,18 @@ export function buildRequestBody(
         stream: true,
         session_id: SESSION_ID,
     };
-    const provider = body.provider;
-    if (provider === undefined) {
-        body.provider = DEFAULT_PROVIDER;
-    } else if (typeof provider === 'object' && provider !== null && !Array.isArray(provider)) {
-        const user = provider as Record<string, unknown>;
-        if (!('quantizations' in user)) {
-            body.provider = { ...DEFAULT_PROVIDER, ...user };
-        }
+    if (presetSlugFromModelId(modelId) !== undefined) {
+        delete body.preset;
     }
-    mergeReasoningConfig(body, 'effort', effortFromModelConfiguration(modelConfiguration));
+    const effort = effortFromModelConfiguration(modelConfiguration);
+    if (effort === 'none') {
+        mergeReasoningConfig(body, 'enabled', false);
+    } else {
+        mergeReasoningConfig(body, 'effort', effort);
+    }
     mergeReasoningConfig(body, 'enabled', enabledFromModelConfiguration(modelConfiguration));
-    if (modelId.replace(/^~/, '').split('/')[0] === 'anthropic' && !('cache_control' in body)) {
+    const cacheId = cacheModelId ?? modelId;
+    if (cacheId.replace(/^~/, '').split('/')[0] === 'anthropic' && !('cache_control' in body)) {
         body.cache_control = { type: 'ephemeral' };
     }
     return body;
@@ -273,6 +325,9 @@ interface ChatModelInfo extends vscode.LanguageModelChatInformation {
 
 export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider {
     private cachedInfo: ChatModelInfo[] | undefined;
+    private cachedPresets: PresetSummary[] | undefined;
+    private presetsPromise: Promise<PresetSummary[] | undefined> | undefined;
+    private readonly presetConfigs = new Map<string, Record<string, unknown>>();
     private key: string | undefined;
     private template: Record<string, unknown> | undefined;
     private readonly infoChangeEvent = new vscode.EventEmitter<void>();
@@ -287,6 +342,9 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
     async setKey(value: string): Promise<void> {
         this.key = value;
         this.cachedInfo = undefined;
+        this.cachedPresets = undefined;
+        this.presetsPromise = undefined;
+        this.presetConfigs.clear();
         await storeKey(this.secrets, value);
         this.infoChangeEvent.fire();
     }
@@ -294,18 +352,30 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
     async clearKey(): Promise<void> {
         this.key = undefined;
         this.cachedInfo = undefined;
+        this.cachedPresets = undefined;
+        this.presetsPromise = undefined;
+        this.presetConfigs.clear();
         await clearStoredKey(this.secrets);
         this.infoChangeEvent.fire();
     }
 
+    resetCatalogCache(): void {
+        this.cachedInfo = undefined;
+        this.cachedPresets = undefined;
+        this.presetsPromise = undefined;
+        this.presetConfigs.clear();
+        this.infoChangeEvent.fire();
+    }
+
     async setTemplate(raw: string): Promise<{ ok: boolean; error?: string }> {
-        if (raw.trim() === '') {
+        const cleaned = stripTemplateComments(raw);
+        if (cleaned.trim() === '') {
             await this.clearTemplate();
             return { ok: true };
         }
         let parsed: unknown;
         try {
-            parsed = JSON.parse(raw);
+            parsed = JSON.parse(cleaned);
         } catch {
             return { ok: false, error: 'The pasted text is not valid JSON.' };
         }
@@ -370,7 +440,45 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         const models = await this.fetchCatalog(key, token);
         const info = models.map(m => this.toInfo(m));
         this.cachedInfo = info;
+        if (this.cachedPresets) {
+            this.appendPresetEntries(info, models);
+            return info;
+        }
+        void this.attachPresets(key, models, info);
         return info;
+    }
+
+    private appendPresetEntries(info: ChatModelInfo[], models: ModelCatalogEntry[]): void {
+        for (const preset of this.cachedPresets ?? []) {
+            const entry = this.toPresetInfo(preset, models);
+            if (entry) {
+                info.push(entry);
+            }
+        }
+    }
+
+    private async attachPresets(
+        key: string,
+        models: ModelCatalogEntry[],
+        snapshot: ChatModelInfo[]
+    ): Promise<void> {
+        try {
+            const presets = await this.ensurePresets(key);
+            if (presets === undefined || this.cachedInfo !== snapshot) {
+                return;
+            }
+            this.cachedPresets = presets;
+            const entries = presets
+                .map(p => this.toPresetInfo(p, models))
+                .filter((e): e is ChatModelInfo => e !== undefined);
+            if (entries.length === 0 || this.cachedInfo !== snapshot) {
+                return;
+            }
+            this.cachedInfo = [...snapshot, ...entries];
+            this.infoChangeEvent.fire();
+        } catch {
+            // the picker stays models-only until the next query when the sweep fails or is cancelled
+        }
     }
 
     async provideLanguageModelChatResponse(
@@ -391,6 +499,8 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         const modelConfiguration = (
             options as { modelConfiguration?: { readonly [key: string]: unknown } }
         ).modelConfiguration;
+        const presetSlug = presetSlugFromModelId(model.id);
+        const presetModel = presetSlug !== undefined ? presetModelOf(this.presetConfigs.get(presetSlug)) : undefined;
         const body = buildRequestBody(
             template,
             model.id,
@@ -399,99 +509,108 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
                 type: 'function',
                 function: { name: tool.name, description: tool.description, parameters: tool.inputSchema },
             })),
-            modelConfiguration
+            modelConfiguration,
+            presetModel
         );
 
+        lastStreamUsage = undefined;
         const controller = new AbortController();
         const abortListener = token.onCancellationRequested(() => controller.abort());
 
         try {
-
-        const response = await fetchWithRetry(
-            `${baseUrl()}/chat/completions`,
-            {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    Authorization: `Bearer ${key}`,
-                    'HTTP-Referer': 'https://github.com/tianyu-liu/vscode-openrouter-copilot-request-credit',
-                    'X-Title': 'OpenRouter for Copilot',
+            const response = await fetchWithRetry(
+                `${baseUrl()}/chat/completions`,
+                {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        Authorization: `Bearer ${key}`,
+                        'HTTP-Referer': 'https://github.com/tianyu-liu/vscode-openrouter-copilot-request-credit',
+                        'X-Title': 'OpenRouter for Copilot',
+                    },
+                    body: JSON.stringify(body),
+                    signal: controller.signal,
                 },
-                body: JSON.stringify(body),
-                signal: controller.signal,
-            },
-            token
-        );
-        await throwIfNotOk(response);
-        if (!response.body) {
-            throw new Error('OpenRouter returned no response body.');
-        }
+                token
+            );
+            await throwIfNotOk(response);
+            if (!response.body) {
+                throw new Error('OpenRouter returned no response body.');
+            }
 
-        const generationId = response.headers.get('x-generation-id') ?? undefined;
-        const toolCalls = new Map<number, { id: string; name: string; arguments: string }>();
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-        while (true) {
-            if (token.isCancellationRequested) {
-                await reader.cancel();
-                return;
-            }
-            const { done, value } = await reader.read();
-            if (done) {
-                flushToolCalls(toolCalls, progress);
-                break;
-            }
-            buffer += decoder.decode(value, { stream: true });
-            let newline: number;
-            while ((newline = buffer.indexOf('\n')) >= 0) {
-                const line = buffer.slice(0, newline).trim();
-                buffer = buffer.slice(newline + 1);
-                if (!line.startsWith('data:')) {
-                    continue;
-                }
-                const data = line.slice(5).trim();
-                if (data === '') {
-                    continue;
-                }
-                if (data === '[DONE]') {
-                    flushToolCalls(toolCalls, progress);
+            const generationId = response.headers.get('x-generation-id') ?? undefined;
+            const toolCalls = new Map<number, { id: string; name: string; arguments: string }>();
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            while (true) {
+                if (token.isCancellationRequested) {
+                    await reader.cancel();
                     return;
                 }
-                let json: any;
-                try {
-                    json = JSON.parse(data);
-                } catch {
-                    throw new Error('OpenRouter: malformed SSE data line in the stream response.');
-                }
-                if (json.error !== undefined) {
-                    throw mapStreamedError(json, generationId) ?? new Error('OpenRouter stream error.');
-                }
-                const choice = json.choices?.[0];
-                if (!choice) {
-                    continue;
-                }
-                const delta = choice.delta ?? {};
-                if (typeof delta.content === 'string' && delta.content.length > 0) {
-                    progress.report(new vscode.LanguageModelTextPart(delta.content));
-                }
-                reportThinkingParts(delta, progress);
-                for (const tc of delta.tool_calls ?? []) {
-                    accumulateToolCall(toolCalls, tc);
-                }
-                if (choice.finish_reason === 'tool_calls') {
+                const { done, value } = await reader.read();
+                if (done) {
                     flushToolCalls(toolCalls, progress);
+                    break;
                 }
-                if (json.usage !== undefined && typeof json.usage === 'object' && json.usage !== null) {
-                    lastStreamUsage = json.usage;
+                buffer += decoder.decode(value, { stream: true });
+                if (buffer.length > MAX_SSE_BUFFER_CHARS) {
+                    throw new Error('OpenRouter: oversized SSE line in the stream response.');
+                }
+                let newline: number;
+                while ((newline = buffer.indexOf('\n')) >= 0) {
+                    const line = buffer.slice(0, newline).trim();
+                    buffer = buffer.slice(newline + 1);
+                    if (!line.startsWith('data:')) {
+                        continue;
+                    }
+                    const data = line.slice(5).trim();
+                    if (data === '') {
+                        continue;
+                    }
+                    if (data === '[DONE]') {
+                        flushToolCalls(toolCalls, progress);
+                        return;
+                    }
+                    let json: any;
+                    try {
+                        json = JSON.parse(data);
+                    } catch {
+                        throw new Error('OpenRouter: malformed SSE data line in the stream response.');
+                    }
+                    if (json.error !== undefined) {
+                        throw mapStreamedError(json, generationId) ?? new Error('OpenRouter stream error.');
+                    }
+                    const choice = json.choices?.[0];
+                    if (!choice) {
+                        continue;
+                    }
+                    const delta = choice.delta ?? {};
+                    if (typeof delta.content === 'string' && delta.content.length > 0) {
+                        progress.report(new vscode.LanguageModelTextPart(delta.content));
+                    }
+                    reportThinkingParts(delta, progress);
+                    for (const tc of delta.tool_calls ?? []) {
+                        accumulateToolCall(toolCalls, tc);
+                    }
+                    if (choice.finish_reason === 'tool_calls') {
+                        flushToolCalls(toolCalls, progress);
+                    }
+                    if (json.usage !== undefined && typeof json.usage === 'object' && json.usage !== null) {
+                        lastStreamUsage = json.usage;
+                    }
                 }
             }
+        } catch (err) {
+            if (token.isCancellationRequested && !(err instanceof vscode.CancellationError)) {
+                throw new vscode.CancellationError();
+            }
+            throw err;
+        } finally {
+            abortListener.dispose();
+            controller.abort();
         }
-    } finally {
-        abortListener.dispose();
-        controller.abort();
     }
-}
 
     async provideTokenCount(
         _model: vscode.LanguageModelChatInformation,
@@ -517,8 +636,182 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             token
         );
         await throwIfNotOk(response);
-        const json = (await response.json()) as { data?: ModelCatalogEntry[] };
+        let json: { data?: ModelCatalogEntry[] };
+        try {
+            json = (await response.json()) as { data?: ModelCatalogEntry[] };
+        } catch {
+            throw new Error('OpenRouter /models returned an unexpected (non-JSON) response body.');
+        }
         return json.data ?? [];
+    }
+
+    async getPresets(): Promise<PresetSummary[]> {
+        if (this.cachedPresets) {
+            return this.cachedPresets;
+        }
+        const key = await this.getKey(true);
+        if (!key) {
+            return [];
+        }
+        const presets = await this.ensurePresets(key);
+        if (presets !== undefined && !this.cachedPresets) {
+            this.cachedPresets = presets;
+        }
+        return this.cachedPresets ?? [];
+    }
+
+    private ensurePresets(key: string): Promise<PresetSummary[] | undefined> {
+        const existing = this.presetsPromise;
+        if (existing) {
+            return existing;
+        }
+        const cts = new vscode.CancellationTokenSource();
+        const promise = this.fetchPresets(key, cts.token).finally(() => {
+            cts.dispose();
+            if (this.presetsPromise === promise) {
+                this.presetsPromise = undefined;
+            }
+        });
+        this.presetsPromise = promise;
+        return promise;
+    }
+
+    private async fetchPresets(key: string, token: vscode.CancellationToken): Promise<PresetSummary[] | undefined> {
+        try {
+            const response = await fetchWithRetry(
+                `${baseUrl()}/presets?limit=100`,
+                { headers: { Authorization: `Bearer ${key}` } },
+                token
+            );
+            if (!response.ok) {
+                return undefined;
+            }
+            const json = (await response.json()) as { data?: Array<Record<string, unknown>> };
+            const summaries: PresetSummary[] = (json.data ?? [])
+                .filter((raw) => raw.status === 'active' && typeof raw.slug === 'string' && raw.slug.trim() !== '')
+                .map((raw) => {
+                    const slug = raw.slug as string;
+                    return {
+                        slug,
+                        name: typeof raw.name === 'string' && raw.name.trim() !== '' ? raw.name : slug,
+                    };
+                });
+            await mapWithConcurrency(summaries.slice(0, MAX_PRESET_LOOKUPS), PRESET_LOOKUP_CONCURRENCY, async (summary) => {
+                summary.model = presetModelOf(await this.fetchPresetConfig(key, summary.slug, token));
+            });
+            return summaries;
+        } catch (err) {
+            if (err instanceof vscode.CancellationError) {
+                throw err;
+            }
+            return undefined;
+        }
+    }
+
+    async getPresetConfig(slug: string): Promise<Record<string, unknown> | undefined> {
+        const cached = this.presetConfigs.get(slug);
+        if (cached) {
+            return cached;
+        }
+        const key = await this.getKey(true);
+        if (!key) {
+            return undefined;
+        }
+        const cts = new vscode.CancellationTokenSource();
+        try {
+            return await this.fetchPresetConfig(key, slug, cts.token);
+        } finally {
+            cts.dispose();
+        }
+    }
+
+    private async fetchPresetConfig(
+        key: string,
+        slug: string,
+        token: vscode.CancellationToken
+    ): Promise<Record<string, unknown> | undefined> {
+        try {
+            const response = await fetchWithRetry(
+                `${baseUrl()}/presets/${encodeURIComponent(slug)}`,
+                { headers: { Authorization: `Bearer ${key}` } },
+                token
+            );
+            if (!response.ok) {
+                return undefined;
+            }
+            const json = (await response.json()) as {
+                data?: { designated_version?: { config?: unknown } };
+            };
+            const config = json.data?.designated_version?.config;
+            if (!config || typeof config !== 'object' || Array.isArray(config)) {
+                return undefined;
+            }
+            const result = config as Record<string, unknown>;
+            this.presetConfigs.set(slug, result);
+            return result;
+        } catch (err) {
+            if (err instanceof vscode.CancellationError) {
+                throw err;
+            }
+            return undefined;
+        }
+    }
+
+    private resolvePresetBase(model: string, models: ModelCatalogEntry[]): ModelCatalogEntry | undefined {
+        const byId = (id: string): ModelCatalogEntry | undefined => models.find(m => m.id === id);
+        const exact = byId(model);
+        if (exact) {
+            return exact;
+        }
+        const withoutFullDate = model.replace(/-\d{8}$/, '');
+        if (withoutFullDate !== model) {
+            const match = byId(withoutFullDate);
+            if (match) {
+                return match;
+            }
+        }
+        const withoutShortDate = model.replace(/-(?:0[1-9]|1[0-2])(?:[0-2]\d|3[01])$/, '');
+        if (withoutShortDate !== model) {
+            const match = byId(withoutShortDate);
+            if (match) {
+                return match;
+            }
+        }
+        return undefined;
+    }
+
+    private toPresetInfo(preset: PresetSummary, models: ModelCatalogEntry[]): ChatModelInfo | undefined {
+        if (!preset.model) {
+            return undefined;
+        }
+        const id = `${PRESET_ID_PREFIX}${preset.slug}`;
+        const base = this.resolvePresetBase(preset.model, models);
+        const baseInfo = base ? buildModelInfo(base) : undefined;
+        const tooltip = [
+            `**Preset: ${preset.name}**`,
+            `\`${id}\` → \`${preset.model}\` with the preset's pinned provider routing.`,
+            'The extension adds no default provider routing; a pasted `provider` still overrides the preset.',
+            baseInfo?.tooltip ?? 'The preset\u2019s model is not in the public catalog; token limits are assumed defaults.',
+        ].join('\n\n');
+        const info: ChatModelInfo = {
+            id,
+            name: preset.name,
+            family: 'preset',
+            version: id,
+            maxInputTokens: baseInfo?.maxInputTokens ?? 1_048_576,
+            maxOutputTokens: baseInfo?.maxOutputTokens ?? 16_384,
+            detail: baseInfo?.detail ? `preset · ${baseInfo.detail}` : 'preset',
+            tooltip,
+            capabilities: {
+                toolCalling: base?.supports_tool_parameters !== false,
+                imageInput: (base?.architecture?.input_modalities ?? []).includes('image'),
+            },
+        };
+        const reasoningSchema = base ? buildReasoningSchema(base) : undefined;
+        if (reasoningSchema) {
+            info.configurationSchema = reasoningSchema;
+        }
+        return info;
     }
 
     private toInfo(m: ModelCatalogEntry): ChatModelInfo {

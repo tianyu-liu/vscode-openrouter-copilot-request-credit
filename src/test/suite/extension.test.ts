@@ -1,6 +1,6 @@
 import * as assert from "assert";
 import * as vscode from "vscode";
-import { createPanelDeps, doRefresh, getStatusText, refresh } from "../../extension";
+import { createPanelDeps, doRefresh, getStatusText, refresh, stopRefreshTimerForTesting } from "../../extension";
 import { handlePanelMessage } from "../../panel";
 
 const EXTENSION_ID = "tianyu-liu.openrouter-copilot-request-credit";
@@ -72,10 +72,6 @@ function installFetchStub(): void {
     }) as typeof fetch;
 }
 
-function restoreFetch(): void {
-    globalThis.fetch = originalFetch;
-}
-
 async function settle(): Promise<void> {
     for (let i = 0; i < 200; i++) {
         const queued = pending.splice(0);
@@ -120,7 +116,10 @@ suiteSetup(() => {
 });
 
 suiteTeardown(() => {
-    restoreFetch();
+    stopRefreshTimerForTesting();
+    globalThis.fetch = ((input: unknown) => {
+        throw new Error(`test run fetched after teardown: ${String(input)}`);
+    }) as typeof fetch;
 });
 
 suite("extension manifest", () => {
@@ -164,6 +163,7 @@ suite("extension manifest", () => {
         assert.strictEqual((props["openrouterCopilot.creditRefreshIntervalMinutes"] as any).minimum, 1);
         assert.strictEqual((props["openrouterCopilot.creditRefreshIntervalMinutes"] as any).maximum, 1440);
         for (const key of [
+            "openrouterCopilot.baseUrl",
             "openrouterCopilot.creditLimit",
             "openrouterCopilot.creditResetPeriod",
             "openrouterCopilot.creditIncludeByok",
@@ -183,6 +183,7 @@ suite("extension behavior without a key", () => {
             await ext.activate();
         }
         assert.ok(ext!.isActive, "extension should be active");
+        stopRefreshTimerForTesting();
     });
 });
 

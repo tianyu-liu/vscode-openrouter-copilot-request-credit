@@ -27,10 +27,9 @@ declare module 'vscode' {
 	export interface ProvideLanguageModelChatResponseOptions {
 
 		/**
-		 * What extension initiated the request to the language model, or
-		 * `undefined` if the request was initiated by other functionality in the editor.
+		 * An optional list of tools that are available to the language model.
 		 */
-		readonly requestInitiator: string;
+		readonly tools?: readonly LanguageModelChatTool[];
 
 		/**
 		 * Per-model configuration provided by the user. This contains values configured
@@ -139,6 +138,7 @@ declare module 'vscode' {
 	export interface LanguageModelChatProvider<T extends LanguageModelChatInformation = LanguageModelChatInformation> {
 		provideLanguageModelChatInformation(options: PrepareLanguageModelChatModelOptions, token: CancellationToken): ProviderResult<T[]>;
 		provideLanguageModelChatResponse(model: T, messages: readonly LanguageModelChatRequestMessage[], options: ProvideLanguageModelChatResponseOptions, progress: Progress<LanguageModelResponsePart2>, token: CancellationToken): Thenable<void>;
+		provideTokenCount(model: T, text: string | LanguageModelChatRequestMessage, token: CancellationToken): Thenable<number>;
 	}
 
 	/**
@@ -146,12 +146,10 @@ declare module 'vscode' {
 	 */
 	export interface PrepareLanguageModelChatModelOptions {
 		/**
-		 * Configuration for the model. This is only present if the provider has declared that it requires configuration via the `configuration` property.
-		 * The object adheres to the schema that the extension provided during declaration.
+		 * Whether or not the user should be prompted via some UI flow, or if models should be attempted to be resolved silently.
+		 * If silent is true, all models may not be resolved due to lack of info such as API keys.
 		 */
-		readonly configuration?: {
-			readonly [key: string]: any;
-		};
+		readonly silent: boolean;
 	}
 
 	export interface ChatRequest {

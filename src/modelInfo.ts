@@ -3,7 +3,6 @@ export interface ModelPricing {
     completion?: string;
     input_cache_read?: string;
     input_cache_write?: string;
-    input_cache_write_1h?: string;
     internal_reasoning?: string;
     request?: string;
     image?: string;
@@ -203,7 +202,7 @@ export function buildModelInfo(m: ModelCatalogEntry): ModelInfo {
     const pCr = priceOr(pricing.input_cache_read, pIn);
     const pCw = priceOr(pricing.input_cache_write, pIn);
     const pThink = priceOr(pricing.internal_reasoning, pOut);
-    const hasPricing = pIn > 0 || pOut > 0;
+    const hasPricing = pricing.prompt !== undefined || pricing.completion !== undefined || pIn > 0 || pOut > 0;
 
     const hasContextLength = m.context_length != null || m.top_provider?.context_length != null;
     const maxInputTokens = m.context_length ?? m.top_provider?.context_length ?? 1_048_576;

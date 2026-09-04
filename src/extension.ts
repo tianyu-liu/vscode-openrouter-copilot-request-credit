@@ -8,6 +8,7 @@ import {
     PanelMessage,
     readConfig,
     renderPanelHtml,
+    templatePresetSlug,
 } from './panel';
 import { readKey } from './storage';
 import { OpenRouterChatProvider } from './provider';
@@ -28,6 +29,14 @@ let lastAccountCredits: AccountCredits | undefined;
 let lastErrorMessage: string | undefined;
 
 let currentRun: { controller: AbortController; done: Promise<KeyInfo | undefined> } | undefined;
+
+let refreshTimerDisarmedForTesting = false;
+
+export function stopRefreshTimerForTesting(): void {
+    refreshTimerDisarmedForTesting = true;
+    if (refreshTimer) clearInterval(refreshTimer);
+    refreshTimer = undefined;
+}
 
 function errorMessage(err: unknown): string {
     const message = err instanceof Error ? err.message : String(err);
@@ -97,6 +106,8 @@ async function fetchApi<T>(apiKey: string, resource: string, signal?: AbortSigna
     return asDataObject(json, `/api/v1/${resource}`) as unknown as T;
 }
 
+let panelRenderSeq = 0;
+
 async function updatePanel(
     secrets: vscode.SecretStorage,
     info: KeyInfo | undefined,
@@ -104,11 +115,18 @@ async function updatePanel(
     storedKey?: string | null
 ): Promise<void> {
     if (!panel) return;
+    const render = ++panelRenderSeq;
+    const stale = (): boolean => render !== panelRenderSeq || (signal?.aborted ?? false) || !panel;
     const { limit, resetPeriod, includeByok, refreshIntervalMinutes } = readConfig();
     const key = storedKey !== undefined ? storedKey : await readKey(secrets);
-    if (signal?.aborted || !panel) return;
+    if (stale()) return;
     const template = provider ? await provider.getTemplate() : undefined;
-    if (signal?.aborted || !panel) return;
+    if (stale()) return;
+    const presets = provider ? await provider.getPresets() : [];
+    if (stale()) return;
+    const presetSlug = templatePresetSlug(template);
+    const presetConfig = presetSlug && provider ? await provider.getPresetConfig(presetSlug) : undefined;
+    if (stale()) return;
     panel.webview.html = renderPanelHtml(
         info,
         limit,
@@ -119,7 +137,9 @@ async function updatePanel(
         key ? maskKey(key) : undefined,
         lastAccountCredits,
         lastErrorMessage,
-        template
+        template,
+        presets,
+        presetConfig
     );
 }
 
@@ -137,6 +157,8 @@ export function createPanelDeps(
         clearTemplate: () => prov.clearTemplate(),
         setKey: (value) => prov.setKey(value),
         clearKey: () => prov.clearKey(),
+        syncPresetSelection: (slug) =>
+            void panel?.webview.postMessage({ type: 'presetSelection', value: slug ?? '' }),
     };
 }
 
@@ -270,6 +292,7 @@ export function activate(context: vscode.ExtensionContext): void {
     const applyConfig = (): void => {
         if (refreshTimer) clearInterval(refreshTimer);
         refreshTimer = undefined;
+        if (refreshTimerDisarmedForTesting) return;
         const { refreshIntervalMinutes } = readConfig();
         refreshTimer = setInterval(() => {
             refresh(context.secrets).catch(() => undefined);
@@ -280,6 +303,9 @@ export function activate(context: vscode.ExtensionContext): void {
         vscode.workspace.onDidChangeConfiguration((e) => {
             if (!e.affectsConfiguration('openrouterCopilot')) return;
             applyConfig();
+            if (e.affectsConfiguration('openrouterCopilot.baseUrl')) {
+                provider?.resetCatalogCache();
+            }
             if (
                 e.affectsConfiguration('openrouterCopilot.creditLimit') ||
                 e.affectsConfiguration('openrouterCopilot.creditResetPeriod') ||
@@ -301,6 +327,7 @@ export function deactivate(): void {
     currentRun?.controller.abort();
     currentRun = undefined;
     statusBarItem = undefined;
+    panel?.dispose();
     panel = undefined;
     provider = undefined;
 }

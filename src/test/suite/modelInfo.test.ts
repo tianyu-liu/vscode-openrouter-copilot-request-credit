@@ -61,7 +61,6 @@ suite("model info", () => {
                 completion: "0.000025",
                 input_cache_read: "0.0000005",
                 input_cache_write: "0.00000625",
-                input_cache_write_1h: "0.00001",
             },
         };
         const info = buildModelInfo(m);
@@ -70,6 +69,17 @@ suite("model info", () => {
         assert.ok(info.tooltip.includes("- cache write: $6.250"), "cache-write row");
         assert.ok(info.tooltip.includes("- uncached: $5.000"), "uncached priced at prompt");
         assert.ok(!info.tooltip.includes("$10"), "1h ephemeral price no longer used");
+    });
+
+    test("explicitly free models show a $0 estimate instead of the not-listed fallback", () => {
+        const m: ModelCatalogEntry = {
+            id: "deepseek/deepseek-v4-flash:free",
+            pricing: { prompt: "0", completion: "0", input_cache_read: "0", input_cache_write: "0" },
+        };
+        const info = buildModelInfo(m);
+        assert.match(info.tooltip, /^\*\*~ \$0\.000 \/ 1M tokens \(est\.\)\*\*/);
+        assert.strictEqual(info.detail, "~$0.000/1M");
+        assert.ok(!info.tooltip.includes("not listed by OpenRouter"));
     });
 
     test("internal_reasoning supplies the thinking price when present", () => {

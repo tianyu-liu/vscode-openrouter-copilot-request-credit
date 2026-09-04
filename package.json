@@ -2,14 +2,14 @@
   "name": "openrouter-copilot-request-credit",
   "displayName": "OpenRouter for Copilot with Custom Request & Credit Check",
   "description": "OpenRouter provider for Copilot Chat with one control panel: paste a request body from the OpenRouter Request Builder and every chat request follows it, while the status bar tracks your key's credit usage.",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "publisher": "tianyu-liu",
   "repository": {
     "type": "git",
     "url": "https://github.com/tianyu-liu/vscode-openrouter-copilot-request-credit.git"
   },
   "engines": {
-    "vscode": "^1.121.0"
+    "vscode": "^1.134.0"
   },
   "enabledApiProposals": [
     "chatProvider",
@@ -59,7 +59,8 @@
           "openrouterCopilot.baseUrl": {
             "type": "string",
             "default": "https://openrouter.ai/api/v1",
-            "description": "OpenRouter API base URL used by the Copilot Chat provider."
+            "scope": "application",
+            "description": "OpenRouter API base URL used by the Copilot Chat provider. Application-scoped: workspace overrides are ignored so a project cannot redirect your key to another host."
           },
           "openrouterCopilot.creditLimit": {
             "type": "number",
@@ -114,7 +115,7 @@
   "devDependencies": {
     "@types/mocha": "^10.0.6",
     "@types/node": "^22.0.0",
-    "@types/vscode": "^1.104.0",
+    "@types/vscode": "1.134.0",
     "@vscode/test-electron": "^2.4.1",
     "@vscode/vsce": "^3.2.0",
     "mocha": "^10.4.0",
