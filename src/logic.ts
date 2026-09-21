@@ -188,11 +188,19 @@ export function formatReset(date: Date | string, withSeconds = false): string {
 }
 
 // A Copilot chat session's store (chatSessions/<sessionId>.jsonl) records the
-// user-visible chat title as a `{"kind":1,"k":["customTitle"],"v":"<title>"}`
-// line near the head. This pulls that title out of the file's first chunk so the
-// panel can label a session by name instead of a truncated id. Pure and
-// tolerant: a malformed or absent line simply yields `undefined`.
+// user-visible chat title in one of two shapes near the head:
+//
+//   {"kind":1,"k":["customTitle"],"v":"<title>"}          (a rename mutation)
+//   {"kind":0,"v":{...,"customTitle":"<title>",...}}       (the initial state)
+//
+// Both must be understood: a session that was never renamed has no mutation
+// record at all, only the nested field on the `kind:0` line. This pulls that
+// title out of the file's first chunk so the panel can label a session by name
+// instead of a truncated id. Pure and tolerant: a malformed or absent line
+// simply yields `undefined`.
 export function parseSessionTitle(raw: string): string | undefined {
+    let nested: string | undefined;
+    let explicit: string | undefined;
     for (const line of raw.split(/\r?\n/)) {
         const trimmed = line.trim();
         if (trimmed === "") continue;
@@ -206,8 +214,33 @@ export function parseSessionTitle(raw: string): string | undefined {
         const { k, v } = record as { k?: unknown; v?: unknown };
         if (Array.isArray(k) && k.length === 1 && k[0] === "customTitle" && typeof v === "string") {
             const title = v.trim();
-            if (title !== "") return title;
+            // A rename follows the initial state, so the last one in the head is
+            // the freshest; keep scanning rather than returning on the first.
+            if (title !== "") explicit = title;
+            continue;
         }
+        if (nested === undefined && v !== null && typeof v === "object" && !Array.isArray(v)) {
+            const title = (v as { customTitle?: unknown }).customTitle;
+            if (typeof title === "string" && title.trim() !== "") nested = title.trim();
+        }
+    }
+    if (explicit !== undefined) return explicit;
+    if (nested !== undefined) return nested;
+    // The `kind:0` line embeds the whole transcript, so it outgrows the bounded
+    // head read long before the title does; when it is cut mid-object the line
+    // no longer parses and the title must be recovered from the raw text.
+    return titleFromRawHead(raw);
+}
+
+/** Recover `customTitle` from a chunk that may end mid-JSON. */
+function titleFromRawHead(raw: string): string | undefined {
+    const match = /"customTitle"\s*:\s*("(?:[^"\\]|\\.)*")/.exec(raw);
+    if (!match) return undefined;
+    try {
+        const title = JSON.parse(match[1]);
+        if (typeof title === "string" && title.trim() !== "") return title.trim();
+    } catch {
+        // A title cut off mid-string cannot be recovered.
     }
     return undefined;
 }

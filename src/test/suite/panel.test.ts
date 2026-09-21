@@ -81,12 +81,52 @@ suite("renderSessionCosts", () => {
                 ],
             }),
         ]);
+        assert.ok(html.includes("<table class=\"routes\">"), "routes render as a table");
+        assert.match(html, /<tr><th>Cost<\/th><th>Provider<\/th><th>Model<\/th><th>Calls<\/th><th>Cached<\/th><\/tr>/, "header row");
         assert.ok(html.includes("Fireworks (BYOK)"), "the BYOK host is named once, with a marker");
-        assert.ok(!html.includes("Fireworks \u00b7 BYOK"), "the provider is not repeated");
-        assert.ok(html.includes("deepseek/deepseek-v4.1-flash"), "model named");
+        assert.ok(html.includes("deepseek/deepseek-v4.1-flash"), "model named in its own cell");
         assert.ok(html.includes("Morph"), "the second provider named");
         assert.ok(!html.includes("Morph (BYOK)"), "an OpenRouter-charged route never carries the BYOK marker");
-        assert.strictEqual((html.match(/class="route"/g) ?? []).length, 2, "one row per route");
+        assert.strictEqual((html.match(/<tbody>/g) ?? []).length, 1, "a single table body");
+        assert.strictEqual((html.match(/<tr>\s*<td/g) ?? []).length, 2, "one row per route");
+        assert.ok(!html.includes("<tfoot>"), "no separate footer row");
+    });
+
+    // The blended session rate stays in the summary line (never a 0.0% when the
+    // session reported no prompt tokens).
+    test("the summary line carries the session-blended cache rate", () => {
+        const html = renderSessionCosts([sessionFixture({ promptTokens: 1000, cachedTokens: 823 })]);
+        assert.ok(html.includes("2 call(s) \u00b7 82.3% cached"), html);
+        const summary = (s: SessionCost) => renderSessionCosts([s]).match(/<span class="muted">([^<]*)<\/span>/)![1];
+        assert.ok(!summary(sessionFixture({ promptTokens: 0, cachedTokens: 0 })).includes("cached"), "no rate at all");
+    });
+
+    // Session hopping: one chat, two models — each route's cache figure is its own.
+    test("a session that hopped models shows a separate cache rate per route", () => {
+        const route = (over: Partial<SessionCost["routes"][number]>) => ({
+            provider: "Fireworks",
+            model: "deepseek/deepseek-v4.1-flash",
+            byok: true,
+            paid: 0.001,
+            openRouter: 0,
+            upstream: 0.001,
+            promptTokens: 1000,
+            completionTokens: 10,
+            cachedTokens: 0,
+            calls: 1,
+            updatedAt: 1,
+            ...over,
+        });
+        const html = renderSessionCosts([
+            sessionFixture({
+                routes: [
+                    route({ cachedTokens: 823, paid: 0.002 }),
+                    route({ provider: "Morph", model: "z-ai/glm-5.3-flash", byok: false, openRouter: 0.001, upstream: 0, cachedTokens: 12, paid: 0.001 }),
+                ],
+            }),
+        ]);
+        assert.ok(html.includes(">82.3%<"), html);
+        assert.ok(html.includes(">1.2%<"), html);
     });
 
     test("the session body leaves no stray gap after the session id line", () => {

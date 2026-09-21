@@ -3,7 +3,8 @@ import { randomBytes } from 'crypto';
 import {
     presetSlugFromPickerValue,
     stripTemplateComments,
-    routeCostLine,
+    routeCostCells,
+    cacheShareSuffix,
     MAX_TRACKED_SESSIONS,
     type SessionCost,
 } from './provider';
@@ -111,11 +112,18 @@ export function renderSessionCosts(sessions: SessionCost[] | undefined): string 
             const label = session.title ?? `${short.slice(0, 8)}${short.length > 8 ? '\u2026' : ''}`;
             const open = index === 0 ? ' open' : '';
             const routeRows = session.routes
-                .map(r => `<li class="route">${esc(routeCostLine(r))}</li>`)
+                .map(r => {
+                    const c = routeCostCells(r);
+                    return `<tr>
+                                <td class="num">${esc(c.cost)}</td>
+                                <td>${esc(c.provider)}</td>
+                                <td>${esc(c.model ?? '\u2014')}</td>
+                                <td class="num">${esc(c.calls)}</td>
+                                <td class="num">${esc(c.cached ?? '\u2014')}</td>
+                            </tr>`;
+                })
                 .join('');
-            const cacheShare = session.promptTokens > 0
-                ? ` \u00b7 ${((session.cachedTokens / session.promptTokens) * 100).toFixed(1)}% cached`
-                : '';
+            const cacheShare = cacheShareSuffix(session);
             const updated = session.updatedAt >= 1e12 ? formatReset(new Date(session.updatedAt), true) : undefined;
             return `<details class="session"${open}>
                         <summary>
@@ -125,7 +133,12 @@ export function renderSessionCosts(sessions: SessionCost[] | undefined): string 
                             ${updated ? `<span class="muted sessiontime">${esc(updated)}</span>` : ''}
                         </summary>
                         <div class="sessionbody">
-                            <ul class="routes">${routeRows}</ul>
+                            <table class="routes">
+                                <thead>
+                                    <tr><th>Cost</th><th>Provider</th><th>Model</th><th>Calls</th><th>Cached</th></tr>
+                                </thead>
+                                <tbody>${routeRows}</tbody>
+                            </table>
                             <p class="muted">OpenRouter session <code>${esc(session.sessionId)}</code></p>
                         </div>
                     </details>`;
@@ -334,8 +347,14 @@ export function renderPanelHtml(
     .sessiontime { white-space: nowrap; font-size: 11px; }
     .sessionbody { padding: 0 0 4px 18px; }
     .sessionbody p { margin: 0; }
-    ul.routes { margin: 0 0 6px; padding-left: 18px; }
-    li.route { font-size: 12px; font-family: var(--vscode-editor-font-family, monospace); margin: 2px 0; }
+    table.routes { margin: 2px 0 6px; border-collapse: collapse; font-size: 12px;
+                   font-family: var(--vscode-editor-font-family, monospace); }
+    table.routes th { text-align: left; font-weight: 600; padding: 2px 12px 2px 0;
+                      color: var(--vscode-descriptionForeground, #888);
+                      border-bottom: 1px solid var(--vscode-panel-border, rgba(0,0,0,0.1)); }
+    table.routes td { padding: 2px 12px 2px 0; vertical-align: top; }
+    table.routes td:last-child, table.routes th:last-child { padding-right: 0; }
+    table.routes td.num { text-align: right; }
 
 </style>
 </head>

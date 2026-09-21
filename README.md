@@ -53,8 +53,9 @@ The panel's **Session spend** section shows what each Copilot chat session has c
 
 ```
 ▾ $0.001656  Confirm work transfer to Windows   4 call(s) · 85.7% cached   2026/09/22 01:30:05
-      $0.001627 · Fireworks (BYOK) · deepseek/deepseek-v4.1-flash · 3 call(s)
-      $0.00002910 · Morph · z-ai/glm-5.3-flash · 1 call(s)
+      Cost        Provider          Model                           Calls  Cached
+      $0.001627   Fireworks (BYOK)  deepseek/deepseek-v4.1-flash    3      92.0%
+      $0.00002910 Morph             z-ai/glm-5.3-flash              1      66.8%
 ▸ $0.004200  bbbb9999…   1 call(s) · 99.2% cached   2026/09/22 00:58:12
 ```
 

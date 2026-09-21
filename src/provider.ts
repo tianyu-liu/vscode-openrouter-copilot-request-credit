@@ -447,12 +447,51 @@ export function getSessionCost(sessionId: string): SessionCost | undefined {
     return found ? snapshotSession(found) : undefined;
 }
 
-/** One route's line, e.g. `$0.0031 · Fireworks (BYOK) · deepseek/deepseek-v4.1-flash · 3 calls`.
- *  An OpenRouter-charged route carries no marker (the absence of `(BYOK)` says it). */
-export function routeCostLine(route: CostRoute): string {
-    const kind = route.openRouter > 0 ? '' : ' (BYOK)';
-    const model = route.model ? ` \u00b7 ${route.model}` : '';
-    return `${formatUsdPrecise(route.paid)} \u00b7 ${route.provider}${kind}${model} \u00b7 ${route.calls} call(s)`;
+/** Bare cache-rate percentage, e.g. `82.3%`; `undefined` when the bucket saw no
+ *  prompt tokens, so the figure is never a misleading `0.0%`. */
+export function cacheSharePercent(bucket: { promptTokens: number; cachedTokens: number }): string | undefined {
+    if (!(bucket.promptTokens > 0)) {
+        return undefined;
+    }
+    return `${((bucket.cachedTokens / bucket.promptTokens) * 100).toFixed(1)}%`;
+}
+
+/** Share of a bucket's prompt tokens served from cache, e.g. `82.3% cached`. */
+export function cacheShareText(bucket: { promptTokens: number; cachedTokens: number }): string | undefined {
+    const percent = cacheSharePercent(bucket);
+    return percent ? `${percent} cached` : undefined;
+}
+
+/** `cacheShareText` with its inline separator, e.g. ` · 82.3% cached`; empty
+ *  when there is no rate to show. */
+export function cacheShareSuffix(bucket: { promptTokens: number; cachedTokens: number }): string {
+    const text = cacheShareText(bucket);
+    return text ? ` \u00b7 ${text}` : '';
+}
+
+/** One route's row cells. The cache rate is per route, not per session:
+ *  switching models mid-chat splits the session into several routes whose cache
+ *  behavior differs, so a blended figure would hide the good or bad one. */
+export interface CostRouteCells {
+    cost: string;
+    /** Provider name, marked `(BYOK)` when OpenRouter charged nothing. */
+    provider: string;
+    /** Model slug, or `undefined` when the call did not report one. */
+    model?: string;
+    calls: string;
+    /** Bare rate, e.g. `82.3%` — the `Cached` column header supplies the word.
+     *  `undefined` when no prompt tokens were reported. */
+    cached?: string;
+}
+
+export function routeCostCells(route: CostRoute): CostRouteCells {
+    return {
+        cost: formatUsdPrecise(route.paid),
+        provider: route.openRouter > 0 ? route.provider : `${route.provider} (BYOK)`,
+        model: route.model || undefined,
+        calls: String(route.calls),
+        cached: cacheSharePercent(route),
+    };
 }
 
 function reportUsagePart(progress: vscode.Progress<ResponsePart>, usage: unknown): void {

@@ -25,7 +25,7 @@ import {
     stripTemplateComments,
     toOpenAI,
     turnCostOf,
-    routeCostLine,
+    routeCostCells,
     TurnCost,
 } from "../../provider";
 
@@ -2280,8 +2280,8 @@ suite("stripTemplateComments and setTemplate", () => {
     });
 });
 
-suite("routeCostLine", () => {
-    const route = (over: Partial<Parameters<typeof routeCostLine>[0]> = {}) => ({
+suite("routeCostCells", () => {
+    const route = (over: Partial<Parameters<typeof routeCostCells>[0]> = {}) => ({
         provider: "Fireworks",
         model: "deepseek/deepseek-v4.1-flash",
         byok: true,
@@ -2296,20 +2296,36 @@ suite("routeCostLine", () => {
         ...over,
     });
 
-    test("a BYOK route names the provider once, marked (BYOK)", () => {
-        assert.strictEqual(
-            routeCostLine(route()),
-            "$0.4957 \u00b7 Fireworks (BYOK) \u00b7 deepseek/deepseek-v4.1-flash \u00b7 175 call(s)"
-        );
+    test("a BYOK route marks the provider cell, keeping the model in its own column", () => {
+        assert.deepStrictEqual(routeCostCells(route()), {
+            cost: "$0.4957",
+            provider: "Fireworks (BYOK)",
+            model: "deepseek/deepseek-v4.1-flash",
+            calls: "175",
+            cached: "0.0%",
+        });
     });
 
     test("an OpenRouter-charged route carries no marker", () => {
-        const line = routeCostLine(route({ provider: "Morph", model: "z-ai/glm-5.3-flash", byok: false, paid: 0.0000291, openRouter: 0.0000291, upstream: 0, calls: 1 }));
-        assert.strictEqual(line, "$0.00002910 \u00b7 Morph \u00b7 z-ai/glm-5.3-flash \u00b7 1 call(s)");
-        assert.ok(!line.includes("(BYOK)"), "no marker on a shared-pool route");
+        const cells = routeCostCells(route({ provider: "Morph", model: "z-ai/glm-5.3-flash", byok: false, paid: 0.0000291, openRouter: 0.0000291, upstream: 0, calls: 1 }));
+        assert.strictEqual(cells.provider, "Morph");
+        assert.ok(!cells.provider.includes("(BYOK)"), "no marker on a shared-pool route");
+        assert.strictEqual(cells.cost, "$0.00002910");
+        assert.strictEqual(cells.calls, "1");
     });
 
-    test("a route with no model name still reads cleanly", () => {
-        assert.strictEqual(routeCostLine(route({ model: "" })), "$0.4957 \u00b7 Fireworks (BYOK) \u00b7 175 call(s)");
+    test("a route with no model name leaves the model cell empty", () => {
+        assert.strictEqual(routeCostCells(route({ model: "" })).model, undefined);
+    });
+
+    // The rate is per route, so hopping between models in one chat still shows
+    // each endpoint's own cache behavior instead of a blended session figure.
+    test("each route carries its own cache rate, one decimal place", () => {
+        assert.strictEqual(routeCostCells(route({ promptTokens: 1000, cachedTokens: 823 })).cached, "82.3%");
+        assert.strictEqual(routeCostCells(route({ provider: "Morph", promptTokens: 40, cachedTokens: 0 })).cached, "0.0%");
+    });
+
+    test("a route that reported no prompt tokens yields no rate rather than 0.0%", () => {
+        assert.strictEqual(routeCostCells(route({ promptTokens: 0, cachedTokens: 0 })).cached, undefined);
     });
 });

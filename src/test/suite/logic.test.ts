@@ -1014,6 +1014,57 @@ suite("logic.parseSessionTitle", () => {
         const raw = ['not json', '{"kind":1,"k":["customTitle"],"v":"Named chat"}'].join("\n");
         assert.strictEqual(parseSessionTitle(raw), "Named chat");
     });
+
+    // A never-renamed session has no mutation record: the title lives on the
+    // `kind:0` state line only.
+    test("reads the nested customTitle on the initial-state record", () => {
+        const raw = '{"kind":0,"v":{"version":3,"customTitle":"Test request","sessionId":"0ef97316"}}';
+        assert.strictEqual(parseSessionTitle(raw), "Test request");
+    });
+
+    test("a rename wins over the initial-state title", () => {
+        const raw = [
+            '{"kind":0,"v":{"version":3,"customTitle":"Test request","sessionId":"x"}}',
+            '{"kind":2,"k":["requests"],"v":[]}',
+            '{"kind":1,"k":["customTitle"],"v":"Renamed later"}',
+        ].join("\n");
+        assert.strictEqual(parseSessionTitle(raw), "Renamed later");
+    });
+
+    // The head is append-only, so of several renames the last one is current.
+    test("the last rename in the head wins", () => {
+        const raw = [
+            '{"kind":0,"v":{"version":3,"customTitle":"Generated title","sessionId":"x"}}',
+            '{"kind":1,"k":["customTitle"],"v":"First rename"}',
+            '{"kind":1,"k":["customTitle"],"v":"Second rename"}',
+        ].join("\n");
+        assert.strictEqual(parseSessionTitle(raw), "Second rename");
+    });
+
+    // Precedence guard: the parsed state title beats an earlier raw-text
+    // `customTitle` occurrence, so the structured branch is what returns it.
+    test("the state title is not shadowed by an earlier raw customTitle occurrence", () => {
+        const raw = '{"kind":0,"v":{"decoy":{"customTitle":"Decoy"},"customTitle":"Real title"}}';
+        assert.strictEqual(parseSessionTitle(raw), "Real title");
+    });
+
+    // The `kind:0` line embeds the whole transcript, so a long session outgrows
+    // the bounded head read and the line arrives cut mid-object — it no longer
+    // parses, but the title sits well before the cut.
+    test("recovers the title from a state line truncated past the 64 KB cap", () => {
+        const long = `{"kind":0,"v":{"version":3,"customTitle":"Test request","requests":[${'"x",'.repeat(20000)}`;
+        assert.strictEqual(parseSessionTitle(long), "Test request");
+        assert.throws(() => JSON.parse(long), "the fixture must genuinely be unparseable");
+    });
+
+    test("handles escaped characters in a recovered title", () => {
+        const long = `{"kind":0,"v":{"customTitle":"Say \\"hi\\"","requests":[${'"x",'.repeat(20000)}`;
+        assert.strictEqual(parseSessionTitle(long), 'Say "hi"');
+    });
+
+    test("a title cut off mid-string is not guessed at", () => {
+        assert.strictEqual(parseSessionTitle('{"kind":0,"v":{"customTitle":"Test req'), undefined);
+    });
 });
 
 suite("logic.used* helpers", () => {
