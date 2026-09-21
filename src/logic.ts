@@ -51,12 +51,14 @@ export function maskKey(label: string | null | undefined): string {
     if (!label) return "unknown key";
     const len = label.length;
     if (len <= 4) return "****";
+    if (len < 9) return "****";
     // Reveal a small leading/trailing fragment only: at most ~1/4 of long keys
-    // (capped at 12 + 3 characters), and at most 3 characters (2 + 1) for short
-    // keys so the mask never reveals most of a short secret.
-    const long = len >= 16;
-    const head = long ? Math.min(12, Math.floor(len / 5)) : 2;
-    const tail = long ? Math.min(3, Math.floor(len / 16)) : 1;
+    // (capped at 12 + 3 characters). Keys shorter than 9 characters reveal
+    // nothing, and keys from 9 to 15 reveal a single leading character with no
+    // trailing character, so the mask never reveals most of a short secret.
+    if (len < 16) return `${label.slice(0, 1)}...`;
+    const head = Math.min(12, Math.floor(len / 5));
+    const tail = Math.min(3, Math.floor(len / 16));
     return `${label.slice(0, head)}...${label.slice(-tail)}`;
 }
 
@@ -108,6 +110,44 @@ export function formatUsdOrNa(n: number | null | undefined): string {
 }
 
 /**
+ * Round to `digits` significant digits — the standard "round to working
+ * precision" guard for binary-floating-point noise. An IEEE-754 double carries
+ * about 15-17 significant decimal digits, so rounding to 15 strips the noise
+ * digits (`1e-5 + 2e-5` is `3.0000000000000004e-5`) while preserving every digit
+ * a real value actually has. 14 is a safe margin; the default of 15 measured
+ * lossless on every figure this extension handles.
+ *
+ * Do **not** lower this to hide drift cheaply. Measured over 100k accumulated
+ * micro-dollar turns: plain float accumulation drifted 5.8e-13 relative
+ * (invisible at any display precision), quantizing each turn to whole
+ * nano-dollars biased 2.7e-5 relative, and rounding each step to **6** digits
+ * produced a **5.3%** error. Rounding too hard injects bias instead of removing
+ * noise. Non-finite input rounds to 0.
+ */
+export function roundSignificant(n: number, digits = 15): number {
+    const v = toNum(n);
+    if (!Number.isFinite(v) || v === 0) return 0;
+    return Number(v.toPrecision(digits));
+}
+
+/**
+ * Render a USD amount with enough decimals that a non-zero value never displays
+ * as "$0.00". Per-turn OpenRouter costs are routinely micro-dollars (a `$1.3e-5`
+ * BYOK turn is normal), which `formatUsd`'s `toFixed(2)` would round to a
+ * useless "$0.00". Precision scales with magnitude; below 1e-6 it switches to
+ * exponential notation. Zero (and negatives) render "$0".
+ */
+export function formatUsdPrecise(n: number): string {
+    const v = roundSignificant(n);
+    if (!Number.isFinite(v) || v <= 0) return "$0";
+    if (v >= HUGE_AMOUNT) return hugeAmountText(v, true);
+    if (v >= 0.01) return `$${v.toFixed(4)}`;
+    if (v >= 0.0001) return `$${v.toFixed(6)}`;
+    if (v >= 0.000001) return `$${v.toFixed(8)}`;
+    return `$${v.toExponential(2)}`;
+}
+
+/**
  * General ("g") style formatting with auto rounding: drops trailing zeros so
  * 10 → "10", 10.5 → "10.5", 10.1234 → "10.12". Used for compact figures like
  * the status bar's limit denominator. Non-finite input renders "n/a".
@@ -145,6 +185,31 @@ export function formatReset(date: Date | string, withSeconds = false): string {
         timeZoneName: "short",
     }).split(" ").pop() ?? "";
     return `${y}/${m}/${day} ${h}:${min}${withSeconds ? `:${sec}` : ""} ${tz}`;
+}
+
+// A Copilot chat session's store (chatSessions/<sessionId>.jsonl) records the
+// user-visible chat title as a `{"kind":1,"k":["customTitle"],"v":"<title>"}`
+// line near the head. This pulls that title out of the file's first chunk so the
+// panel can label a session by name instead of a truncated id. Pure and
+// tolerant: a malformed or absent line simply yields `undefined`.
+export function parseSessionTitle(raw: string): string | undefined {
+    for (const line of raw.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (trimmed === "") continue;
+        let record: unknown;
+        try {
+            record = JSON.parse(trimmed);
+        } catch {
+            continue;
+        }
+        if (typeof record !== "object" || record === null) continue;
+        const { k, v } = record as { k?: unknown; v?: unknown };
+        if (Array.isArray(k) && k.length === 1 && k[0] === "customTitle" && typeof v === "string") {
+            const title = v.trim();
+            if (title !== "") return title;
+        }
+    }
+    return undefined;
 }
 
 /** Next Monday 00:00 UTC (for weekly resets; ISO weekday 1 = Monday). */
@@ -517,14 +582,14 @@ export function buildStatus(
         view.mode === "manual"
             ? view.used
             : view.mode === "auto"
-              ? usedThisPeriod(info, view.effectivePeriod, view.includeByok)
-              : toNum(accountCredits?.total_usage);
+                ? usedThisPeriod(info, view.effectivePeriod, view.includeByok)
+                : toNum(accountCredits?.total_usage);
     const resetLine =
         view.mode === "manual"
             ? view.resetDate
             : view.mode === "auto"
-              ? describeReset(info.limit_reset)
-              : "No reset";
+                ? describeReset(info.limit_reset)
+                : "No reset";
 
     // Status bar: keep the $ on the remaining figure, omit it on the
     // denominator (general format, auto rounding). Only the manual guardrail
@@ -533,8 +598,8 @@ export function buildStatus(
         view.mode === "unlimited"
             ? `OR ${formatUsdOrNa(view.remainingNum)}`
             : view.mode === "manual"
-              ? `${view.exhausted ? "$(error) " : ""}OR ${formatUsd(view.remainingNum)}/${formatCompact(view.limitNum)}`
-              : `OR ${formatUsdOrNa(view.remainingNum)}/${formatCompact(view.limitNum)}`;
+                ? `${view.exhausted ? "$(error) " : ""}OR ${formatUsd(view.remainingNum)}/${formatCompact(view.limitNum)}`
+                : `OR ${formatUsdOrNa(view.remainingNum)}/${formatCompact(view.limitNum)}`;
 
     return {
         text,

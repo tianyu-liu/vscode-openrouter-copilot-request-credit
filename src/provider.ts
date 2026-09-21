@@ -8,22 +8,29 @@ import {
     enabledFromModelConfiguration,
     type ModelCatalogEntry,
 } from './modelInfo';
+import { formatUsdPrecise, roundSignificant } from './logic';
 
 const TEMPLATE_KEY = 'requestTemplate';
 const DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
 const PRESET_ID_PREFIX = '@preset/';
 const MAX_PRESET_LOOKUPS = 25;
-const SESSION_ID = crypto.randomUUID();
+const WINDOW_SESSION_ID = crypto.randomUUID();
+const SESSION_ID_PREFIX = 'copilot-chat:';
+const MAX_SESSION_ID_CHARS = 256;
 const MAX_RETRIES = 3;
 const RETRY_DELAYS_MS = [1000, 2000, 4000];
 const MAX_BACKOFF_MS = 10000;
 const MAX_SSE_BUFFER_CHARS = 4_000_000;
 const PRESET_LOOKUP_CONCURRENCY = 5;
+const USAGE_MIME = 'usage';
+const NANO_AIU_PER_CREDIT = 1_000_000_000;
+const POST_RESPONSE_TIMEOUT_MS = 60_000;
 
 export interface PresetSummary {
     slug: string;
     name: string;
     model?: string;
+    lookupSkipped?: boolean;
 }
 
 function presetModelOf(config: Record<string, unknown> | undefined): string | undefined {
@@ -74,14 +81,387 @@ const thinkingPartCtor = vscode.LanguageModelThinkingPart as
 
 let warnedBadBaseUrl = false;
 let delayFn: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+let postTimeoutMs = POST_RESPONSE_TIMEOUT_MS;
 let lastStreamUsage: unknown;
+let lastStreamProvider: string | undefined;
+
+export function getLastStreamProvider(): string | undefined {
+    return lastStreamProvider;
+}
 
 export function setRetryDelayForTesting(fn: (ms: number) => Promise<void>): void {
     delayFn = fn;
 }
 
+export function setPostTimeoutForTesting(ms: number): void {
+    postTimeoutMs = ms;
+}
+
 export function getLastStreamUsage(): unknown {
     return lastStreamUsage;
+}
+
+export function sessionIdFor(conversationId: unknown): string {
+    if (typeof conversationId !== 'string') {
+        return WINDOW_SESSION_ID;
+    }
+    const trimmed = conversationId.trim();
+    if (trimmed === '') {
+        return WINDOW_SESSION_ID;
+    }
+    return `${SESSION_ID_PREFIX}${trimmed}`.slice(0, MAX_SESSION_ID_CHARS);
+}
+
+/**
+ * How long after the last real chat turn an unidentified call may still be
+ * attributed to it. Internal calls (sub-agents, summarization) happen while the
+ * parent turn runs, so a generous window is safe; beyond it, attributing spend to
+ * a long-finished chat would be worse than dropping it.
+ */
+const PARENT_ATTRIBUTION_WINDOW_MS = 10 * 60 * 1000;
+
+let lastActiveSessionId: string | undefined;
+let lastActiveAt = 0;
+
+/**
+ * Decide which session a model call's cost belongs to.
+ *
+ * A call that carries Copilot's conversation id **is** a chat turn and becomes the
+ * current session. A call without one is an internal call — a sub-agent or
+ * summarization pass — and is attributed to the chat that triggered it (the most
+ * recently active session) rather than inventing a session of its own.
+ *
+ * The parent *cannot* be read from the request: the copilot extension passes
+ * `conversationId` to sub-agent calls only inside `telemetryProperties`, which is
+ * never forwarded to a provider — `ExtensionContributedChatEndpoint` puts only the
+ * top-level `conversationId` into `modelOptions._conversationId`. Hence the
+ * most-recently-active heuristic. It is correct while internal calls run inside
+ * their parent turn (the normal case); two chats interleaving could occasionally
+ * misattribute, which is why the window is bounded.
+ *
+ * Returns `undefined` when there is nothing to attribute to, in which case the call
+ * is not tracked at all rather than creating a meaningless entry.
+ */
+export function resolveCostSession(sessionId: string, hasConversationId: boolean, now = Date.now()): string | undefined {
+    if (hasConversationId) {
+        lastActiveSessionId = sessionId;
+        lastActiveAt = now;
+        persistParentSession?.(sessionId, now);
+        return sessionId;
+    }
+    if (lastActiveSessionId !== undefined && now - lastActiveAt <= PARENT_ATTRIBUTION_WINDOW_MS) {
+        return lastActiveSessionId;
+    }
+    return undefined;
+}
+
+/**
+ * Restore the last active chat from a previous window so an internal call right
+ * after a reload still joins its parent's OpenRouter session. The attribution
+ * window still applies, so a long-idle parent is not resurrected.
+ */
+export function hydrateParentAttribution(stored: { sessionId?: unknown; at?: unknown } | undefined): void {
+    if (!stored || typeof stored.sessionId !== 'string' || !stored.sessionId.startsWith(SESSION_ID_PREFIX)) {
+        return;
+    }
+    const at = typeof stored.at === 'number' && Number.isFinite(stored.at) ? stored.at : 0;
+    if (at > lastActiveAt) {
+        lastActiveSessionId = stored.sessionId;
+        lastActiveAt = at;
+    }
+}
+
+export function resetParentAttributionForTesting(): void {
+    lastActiveSessionId = undefined;
+    lastActiveAt = 0;
+}
+
+function finiteNumber(value: unknown): number | undefined {
+    return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+export function buildUsagePart(usage: unknown): Record<string, unknown> | undefined {
+    if (typeof usage !== 'object' || usage === null || Array.isArray(usage)) {
+        return undefined;
+    }
+    const raw = usage as Record<string, unknown>;
+    const prompt = finiteNumber(raw.prompt_tokens);
+    const completion = finiteNumber(raw.completion_tokens);
+    const total = finiteNumber(raw.total_tokens);
+    if (prompt === undefined || completion === undefined || total === undefined) {
+        return undefined;
+    }
+    const rawDetails =
+        typeof raw.prompt_tokens_details === 'object' && raw.prompt_tokens_details !== null
+            ? (raw.prompt_tokens_details as Record<string, unknown>)
+            : {};
+    const part: Record<string, unknown> = {
+        prompt_tokens: Math.max(0, prompt),
+        completion_tokens: Math.max(0, completion),
+        total_tokens: Math.max(0, total),
+        prompt_tokens_details: {
+            ...rawDetails,
+            cached_tokens: Math.max(0, finiteNumber(rawDetails.cached_tokens) ?? 0),
+        },
+    };
+    const cost = finiteNumber(raw.cost);
+    if (cost !== undefined && cost > 0) {
+        part.copilot_usage = { total_nano_aiu: cost * NANO_AIU_PER_CREDIT };
+    }
+    return part;
+}
+
+export interface TurnCost {
+    openRouter: number;
+    upstream?: number;
+    isByok: boolean;
+    provider?: string;
+    promptTokens: number;
+    completionTokens: number;
+    cachedTokens: number;
+}
+
+const turnCostEmitter = new vscode.EventEmitter<TurnCost>();
+export const onTurnCost: vscode.Event<TurnCost> = turnCostEmitter.event;
+
+export function turnCostOf(usage: unknown, provider?: string): TurnCost | undefined {
+    if (typeof usage !== 'object' || usage === null || Array.isArray(usage)) {
+        return undefined;
+    }
+    const raw = usage as Record<string, unknown>;
+    const details =
+        typeof raw.cost_details === 'object' && raw.cost_details !== null
+            ? (raw.cost_details as Record<string, unknown>)
+            : {};
+    const openRouter = finiteNumber(raw.cost) ?? 0;
+    const upstream = finiteNumber(details.upstream_inference_cost);
+    const orPayable = openRouter > 0 ? openRouter : 0;
+    const byokPayable = upstream !== undefined && upstream > 0 ? upstream : undefined;
+    if (orPayable === 0 && byokPayable === undefined) {
+        return undefined;
+    }
+    const promptTokens = Math.max(0, finiteNumber(raw.prompt_tokens) ?? 0);
+    const tokenDetails =
+        typeof raw.prompt_tokens_details === 'object' && raw.prompt_tokens_details !== null
+            ? (raw.prompt_tokens_details as Record<string, unknown>)
+            : {};
+    const cachedTokens = Math.max(0, finiteNumber(tokenDetails.cached_tokens) ?? 0);
+    return {
+        openRouter: Math.max(0, orPayable),
+        upstream: byokPayable !== undefined ? Math.max(0, byokPayable) : undefined,
+        isByok: raw.is_byok === true || (orPayable === 0 && byokPayable !== undefined),
+        provider: typeof provider === 'string' && provider.trim() !== '' ? provider : undefined,
+        promptTokens,
+        completionTokens: Math.max(0, finiteNumber(raw.completion_tokens) ?? 0),
+        cachedTokens,
+    };
+}
+
+/**
+ * Running spend for one chat session.
+ *
+ * Keyed by session id because Copilot drives a tool-using turn as **one model
+ * call per tool round**, and each round enters as a separate invocation of
+ * `provideLanguageModelChatResponse`. Per-invocation state therefore could not
+ * see the whole turn; this deliberately outlives the call.
+ */
+export interface CostBucket {
+    paid: number;
+    openRouter: number;
+    upstream: number;
+    promptTokens: number;
+    completionTokens: number;
+    cachedTokens: number;
+    calls: number;
+}
+
+/** One model/provider pair within a session: a session can mix several, e.g. a
+ *  Fireworks BYOK route for most turns and an OpenRouter-hosted model for one. */
+export interface CostRoute extends CostBucket {
+    /** `provider` is the serving host; `model` the requested model slug. */
+    provider: string;
+    model: string;
+    byok: boolean;
+    updatedAt: number;
+}
+
+export interface SessionCost extends CostBucket {
+    sessionId: string;
+    /** Name of the session as the window reports it, when known. */
+    title?: string;
+    byok: boolean;
+    routes: CostRoute[];
+    updatedAt: number;
+}
+
+const sessionCosts = new Map<string, SessionCost>();
+export const MAX_TRACKED_SESSIONS = 10;
+const SESSION_COSTS_KEY = 'sessionCosts';
+const PARENT_SESSION_KEY = 'parentSession';
+
+/** Persist hook, supplied by the provider once it has global state. Kept as a
+ *  module-level callback so the accumulator stays callable from tests. */
+let persistSessionCosts: ((snapshot: SessionCost[]) => void) | undefined;
+let persistParentSession: ((sessionId: string, at: number) => void) | undefined;
+
+let lastStamp = 0;
+
+/**
+ * A strictly increasing recency stamp, in milliseconds.
+ *
+ * `Date.now()` alone is not enough: several sessions can be recorded inside the
+ * same millisecond (tests, or a burst of tool rounds), and equal stamps make the
+ * cap's ordering fall back to insertion order — which evicts the *newest* and
+ * keeps stale sessions. Bumping past the previous value guarantees a total order
+ * while staying a usable timestamp.
+ */
+function stamp(): number {
+    lastStamp = Math.max(Date.now(), lastStamp + 1);
+    return lastStamp;
+}
+
+function trimToCap(): void {
+    if (sessionCosts.size <= MAX_TRACKED_SESSIONS) {
+        return;
+    }
+    const keep = [...sessionCosts.values()]
+        .sort((a, b) => b.updatedAt - a.updatedAt)
+        .slice(0, MAX_TRACKED_SESSIONS);
+    sessionCosts.clear();
+    for (const session of keep) {
+        sessionCosts.set(session.sessionId, session);
+    }
+}
+
+/**
+ * Merge persisted costs into the in-memory store at startup.
+ *
+ * Deliberately additive rather than a replace: constructing a provider must not
+ * discard live state, so an entry already in memory wins (it is the newer one)
+ * and only genuinely-absent sessions are restored. That also makes hydration
+ * idempotent if a second provider instance is ever created.
+ */
+export function hydrateSessionCosts(sessions: SessionCost[] | undefined): void {
+    for (const session of sessions ?? []) {
+        if (
+            session &&
+            typeof session.sessionId === 'string' &&
+            // Only real chat sessions are restored. Entries persisted by an earlier
+            // revision for unidentified calls carry a bare per-window UUID; those
+            // are now attributed to their parent instead, so they are dropped.
+            session.sessionId.startsWith(SESSION_ID_PREFIX) &&
+            Number.isFinite(session.paid) &&
+            session.paid > 0 &&
+            !sessionCosts.has(session.sessionId)
+        ) {
+            sessionCosts.set(session.sessionId, { ...session, routes: session.routes ?? [] });
+        }
+    }
+    trimToCap();
+}
+
+export function resetSessionCostsForTesting(): void {
+    sessionCosts.clear();
+}
+
+function newBucket(): CostBucket {
+    return { paid: 0, openRouter: 0, upstream: 0, promptTokens: 0, completionTokens: 0, cachedTokens: 0, calls: 0 };
+}
+
+function addToBucket(bucket: CostBucket, cost: TurnCost): void {
+    const payable = cost.openRouter > 0 ? cost.openRouter : (cost.upstream ?? 0);
+    bucket.paid = roundSignificant(bucket.paid + payable);
+    bucket.openRouter = roundSignificant(bucket.openRouter + cost.openRouter);
+    bucket.upstream = roundSignificant(bucket.upstream + (cost.upstream ?? 0));
+    bucket.promptTokens += cost.promptTokens;
+    bucket.completionTokens += cost.completionTokens;
+    bucket.cachedTokens += cost.cachedTokens;
+    bucket.calls += 1;
+}
+
+/** Fold one model call's usage into its session's total and its route bucket.
+ *  Returns the updated snapshot, or `undefined` when the call reported no
+ *  payable cost. */
+export function accumulateSessionCost(
+    sessionId: string,
+    usage: unknown,
+    provider?: string,
+    model?: string
+): SessionCost | undefined {
+    // An unidentified call is not tracked: a session of its own would be a
+    // meaningless row that never accumulates (see `resolveCostSession`).
+    if (typeof sessionId !== 'string' || sessionId.trim() === '') {
+        return undefined;
+    }
+    const cost = turnCostOf(usage, provider);
+    if (!cost) {
+        return undefined;
+    }
+    const now = stamp();
+    const session = sessionCosts.get(sessionId) ?? {
+        sessionId,
+        ...newBucket(),
+        byok: false,
+        routes: [],
+        updatedAt: now,
+    };
+    addToBucket(session, cost);
+    session.byok = session.byok || cost.isByok;
+    session.updatedAt = now;
+
+    const routeKey = `${cost.provider ?? 'unknown'}\u0000${model ?? ''}`;
+    let route = session.routes.find(r => `${r.provider}\u0000${r.model}` === routeKey);
+    if (!route) {
+        route = { provider: cost.provider ?? 'unknown', model: model ?? '', byok: cost.isByok, ...newBucket(), updatedAt: now };
+        session.routes.push(route);
+    }
+    addToBucket(route, cost);
+    route.byok = route.byok || cost.isByok;
+    route.updatedAt = now;
+    // Most expensive route first: that is what a reader wants to see.
+    session.routes.sort((a, b) => b.paid - a.paid);
+
+    sessionCosts.set(sessionId, session);
+
+    // Bound the map: keep only the most recently updated sessions.
+    trimToCap();
+    persistSessionCosts?.(getSessionCosts());
+    turnCostEmitter.fire(cost);
+    return snapshotSession(session);
+}
+
+function snapshotSession(session: SessionCost): SessionCost {
+    return { ...session, routes: session.routes.map(r => ({ ...r })) };
+}
+
+/** Every tracked session's running total, most recent first. */
+export function getSessionCosts(): SessionCost[] {
+    return [...sessionCosts.values()]
+        .sort((a, b) => b.updatedAt - a.updatedAt)
+        .map(snapshotSession);
+}
+
+/** The session's running total, or `undefined` if it has spent nothing yet. */
+export function getSessionCost(sessionId: string): SessionCost | undefined {
+    const found = sessionCosts.get(sessionId);
+    return found ? snapshotSession(found) : undefined;
+}
+
+/** One route's line, e.g. `$0.0031 · Fireworks (BYOK) · deepseek/deepseek-v4.1-flash · 3 calls`.
+ *  An OpenRouter-charged route carries no marker (the absence of `(BYOK)` says it). */
+export function routeCostLine(route: CostRoute): string {
+    const kind = route.openRouter > 0 ? '' : ' (BYOK)';
+    const model = route.model ? ` \u00b7 ${route.model}` : '';
+    return `${formatUsdPrecise(route.paid)} \u00b7 ${route.provider}${kind}${model} \u00b7 ${route.calls} call(s)`;
+}
+
+function reportUsagePart(progress: vscode.Progress<ResponsePart>, usage: unknown): void {
+    const part = buildUsagePart(usage);
+    if (part) {
+        progress.report(
+            new vscode.LanguageModelDataPart(new TextEncoder().encode(JSON.stringify(part)), USAGE_MIME)
+        );
+    }
 }
 
 export function baseUrl(): string {
@@ -124,7 +504,7 @@ async function fetchWithRetry(
     token: vscode.CancellationToken
 ): Promise<Response> {
     let attempt = 0;
-    for (;;) {
+    for (; ;) {
         if (token.isCancellationRequested) {
             throw new vscode.CancellationError();
         }
@@ -138,6 +518,9 @@ async function fetchWithRetry(
         if (thrown !== undefined) {
             if (token.isCancellationRequested) {
                 throw new vscode.CancellationError();
+            }
+            if (init.signal?.aborted && !token.isCancellationRequested) {
+                throw thrown;
             }
             if (attempt >= MAX_RETRIES) {
                 throw thrown;
@@ -292,7 +675,8 @@ export function buildRequestBody(
     messages: unknown[],
     tools: unknown,
     modelConfiguration: { readonly [key: string]: unknown } | undefined,
-    cacheModelId?: string
+    cacheModelId?: string,
+    sessionId?: string
 ): Record<string, unknown> {
     const body: Record<string, unknown> = {
         ...(template ?? {}),
@@ -300,13 +684,22 @@ export function buildRequestBody(
         messages,
         tools,
         stream: true,
-        session_id: SESSION_ID,
     };
+    delete body.session_id;
+    if (typeof sessionId === 'string' && sessionId.trim() !== '') {
+        body.session_id = sessionId;
+    }
     if (presetSlugFromModelId(modelId) !== undefined) {
         delete body.preset;
     }
     const effort = effortFromModelConfiguration(modelConfiguration);
     if (effort === 'none') {
+        const existing = body.reasoning;
+        if (typeof existing === 'object' && existing !== null && !Array.isArray(existing)) {
+            const clone = { ...(existing as Record<string, unknown>) };
+            delete clone.effort;
+            body.reasoning = clone;
+        }
         mergeReasoningConfig(body, 'enabled', false);
     } else {
         mergeReasoningConfig(body, 'effort', effort);
@@ -325,23 +718,47 @@ interface ChatModelInfo extends vscode.LanguageModelChatInformation {
 
 export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider {
     private cachedInfo: ChatModelInfo[] | undefined;
+    private catalogPromise: Promise<ModelCatalogEntry[]> | undefined;
     private cachedPresets: PresetSummary[] | undefined;
     private presetsPromise: Promise<PresetSummary[] | undefined> | undefined;
     private readonly presetConfigs = new Map<string, Record<string, unknown>>();
     private key: string | undefined;
     private template: Record<string, unknown> | undefined;
     private readonly infoChangeEvent = new vscode.EventEmitter<void>();
+    private persistQueue: Promise<unknown> = Promise.resolve();
 
     readonly onDidChangeLanguageModelChatInformation: vscode.Event<void> = this.infoChangeEvent.event;
 
     constructor(
         private readonly secrets: vscode.SecretStorage,
         private readonly state: vscode.Memento
-    ) {}
+    ) {
+        // Restore spend recorded in previous windows, then keep it up to date.
+        // Persisted so the panel's Session spend survives a reload or restart;
+        // the accumulator itself stays a module-level map so it is testable.
+        hydrateSessionCosts(this.state.get<SessionCost[]>(SESSION_COSTS_KEY));
+        hydrateParentAttribution(this.state.get<{ sessionId: string; at: number }>(PARENT_SESSION_KEY));
+        persistSessionCosts = (snapshot) => {
+            const value = snapshot.length === 0 ? undefined : snapshot;
+            this.persistQueue = this.persistQueue
+                .then(() => this.state.update(SESSION_COSTS_KEY, value))
+                .catch(() => undefined);
+        };
+        persistParentSession = (sessionId, at) => {
+            this.persistQueue = this.persistQueue
+                .then(() => this.state.update(PARENT_SESSION_KEY, { sessionId, at }))
+                .catch(() => undefined);
+        };
+    }
+
+    dispose(): void {
+        this.infoChangeEvent.dispose();
+    }
 
     async setKey(value: string): Promise<void> {
         this.key = value;
         this.cachedInfo = undefined;
+        this.catalogPromise = undefined;
         this.cachedPresets = undefined;
         this.presetsPromise = undefined;
         this.presetConfigs.clear();
@@ -352,6 +769,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
     async clearKey(): Promise<void> {
         this.key = undefined;
         this.cachedInfo = undefined;
+        this.catalogPromise = undefined;
         this.cachedPresets = undefined;
         this.presetsPromise = undefined;
         this.presetConfigs.clear();
@@ -361,6 +779,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
 
     resetCatalogCache(): void {
         this.cachedInfo = undefined;
+        this.catalogPromise = undefined;
         this.cachedPresets = undefined;
         this.presetsPromise = undefined;
         this.presetConfigs.clear();
@@ -437,7 +856,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         if (!key) {
             return [];
         }
-        const models = await this.fetchCatalog(key, token);
+        const models = await this.ensureCatalog(key, token);
         const info = models.map(m => this.toInfo(m));
         this.cachedInfo = info;
         if (this.cachedPresets) {
@@ -446,6 +865,20 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         }
         void this.attachPresets(key, models, info);
         return info;
+    }
+
+    private ensureCatalog(key: string, token: vscode.CancellationToken): Promise<ModelCatalogEntry[]> {
+        const existing = this.catalogPromise;
+        if (existing) {
+            return existing;
+        }
+        const promise = this.fetchCatalog(key, token).finally(() => {
+            if (this.catalogPromise === promise) {
+                this.catalogPromise = undefined;
+            }
+        });
+        this.catalogPromise = promise;
+        return promise;
     }
 
     private appendPresetEntries(info: ChatModelInfo[], models: ModelCatalogEntry[]): void {
@@ -499,6 +932,14 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         const modelConfiguration = (
             options as { modelConfiguration?: { readonly [key: string]: unknown } }
         ).modelConfiguration;
+        const conversationId = (options.modelOptions as { _conversationId?: unknown } | undefined)?._conversationId;
+        const hasConversationId = typeof conversationId === 'string' && conversationId.trim() !== '';
+        // Attribute the call to the chat that owns it: the chat itself for a turn,
+        // or the last active chat for an internal (sub-agent / utility) call, so
+        // OpenRouter's Sessions view agrees with the panel. With no known parent no
+        // `session_id` is sent at all, so an unowned call cannot mint an orphan
+        // OpenRouter session.
+        const sessionId = resolveCostSession(sessionIdFor(conversationId), hasConversationId);
         const presetSlug = presetSlugFromModelId(model.id);
         const presetModel = presetSlug !== undefined ? presetModelOf(this.presetConfigs.get(presetSlug)) : undefined;
         const body = buildRequestBody(
@@ -510,12 +951,18 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
                 function: { name: tool.name, description: tool.description, parameters: tool.inputSchema },
             })),
             modelConfiguration,
-            presetModel
+            presetModel,
+            sessionId
         );
 
         lastStreamUsage = undefined;
+        lastStreamProvider = undefined;
+        let usage: unknown;
+        let provider: string | undefined;
+
         const controller = new AbortController();
         const abortListener = token.onCancellationRequested(() => controller.abort());
+        const timeoutId = setTimeout(() => controller.abort(), postTimeoutMs);
 
         try {
             const response = await fetchWithRetry(
@@ -533,6 +980,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
                 },
                 token
             );
+            clearTimeout(timeoutId);
             await throwIfNotOk(response);
             if (!response.body) {
                 throw new Error('OpenRouter returned no response body.');
@@ -546,11 +994,17 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             while (true) {
                 if (token.isCancellationRequested) {
                     await reader.cancel();
-                    return;
+                    throw new vscode.CancellationError();
                 }
                 const { done, value } = await reader.read();
                 if (done) {
                     flushToolCalls(toolCalls, progress);
+                    reportUsagePart(progress, usage);
+                    if (sessionId !== undefined) {
+                        accumulateSessionCost(sessionId, usage, provider, model.id);
+                    }
+                    lastStreamUsage = usage;
+                    lastStreamProvider = provider;
                     break;
                 }
                 buffer += decoder.decode(value, { stream: true });
@@ -570,6 +1024,12 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
                     }
                     if (data === '[DONE]') {
                         flushToolCalls(toolCalls, progress);
+                        reportUsagePart(progress, usage);
+                        if (sessionId !== undefined) {
+                            accumulateSessionCost(sessionId, usage, provider, model.id);
+                        }
+                        lastStreamUsage = usage;
+                        lastStreamProvider = provider;
                         return;
                     }
                     let json: any;
@@ -580,6 +1040,12 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
                     }
                     if (json.error !== undefined) {
                         throw mapStreamedError(json, generationId) ?? new Error('OpenRouter stream error.');
+                    }
+                    if (typeof json.provider === 'string' && json.provider.trim() !== '') {
+                        provider = json.provider;
+                    }
+                    if (json.usage !== undefined && typeof json.usage === 'object' && json.usage !== null) {
+                        usage = json.usage;
                     }
                     const choice = json.choices?.[0];
                     if (!choice) {
@@ -596,17 +1062,20 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
                     if (choice.finish_reason === 'tool_calls') {
                         flushToolCalls(toolCalls, progress);
                     }
-                    if (json.usage !== undefined && typeof json.usage === 'object' && json.usage !== null) {
-                        lastStreamUsage = json.usage;
-                    }
                 }
             }
         } catch (err) {
             if (token.isCancellationRequested && !(err instanceof vscode.CancellationError)) {
                 throw new vscode.CancellationError();
             }
+            if (controller.signal.aborted && !token.isCancellationRequested) {
+                throw new Error(
+                    `OpenRouter did not respond within ${POST_RESPONSE_TIMEOUT_MS / 1000} seconds.`
+                );
+            }
             throw err;
         } finally {
+            clearTimeout(timeoutId);
             abortListener.dispose();
             controller.abort();
         }
@@ -645,7 +1114,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         return json.data ?? [];
     }
 
-    async getPresets(): Promise<PresetSummary[]> {
+    async getPresets(): Promise<PresetSummary[] | undefined> {
         if (this.cachedPresets) {
             return this.cachedPresets;
         }
@@ -653,11 +1122,19 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         if (!key) {
             return [];
         }
-        const presets = await this.ensurePresets(key);
-        if (presets !== undefined && !this.cachedPresets) {
+        let presets: PresetSummary[] | undefined;
+        try {
+            presets = await this.ensurePresets(key);
+        } catch {
+            return undefined;
+        }
+        if (presets === undefined) {
+            return undefined;
+        }
+        if (!this.cachedPresets) {
             this.cachedPresets = presets;
         }
-        return this.cachedPresets ?? [];
+        return this.cachedPresets;
     }
 
     private ensurePresets(key: string): Promise<PresetSummary[] | undefined> {
@@ -699,6 +1176,9 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             await mapWithConcurrency(summaries.slice(0, MAX_PRESET_LOOKUPS), PRESET_LOOKUP_CONCURRENCY, async (summary) => {
                 summary.model = presetModelOf(await this.fetchPresetConfig(key, summary.slug, token));
             });
+            for (const summary of summaries.slice(MAX_PRESET_LOOKUPS)) {
+                summary.lookupSkipped = true;
+            }
             return summaries;
         } catch (err) {
             if (err instanceof vscode.CancellationError) {
@@ -842,7 +1322,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
 function contentOrString(text: string[], multimodal: unknown[]): string | unknown[] | null {
     const content: unknown[] = [];
     if (text.length > 0) {
-        content.push(text.join('\n'));
+        content.push(multimodal.length > 0 ? { type: 'text', text: text.join('\n') } : text.join('\n'));
     }
     content.push(...multimodal);
     if (content.length === 0) {

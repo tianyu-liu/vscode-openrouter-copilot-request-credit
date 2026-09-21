@@ -1,0 +1,7 @@
+# Line endings
+#
+# This project is developed on both WSL (Linux) and Windows. Without this file a
+# Windows checkout can convert sources to CRLF, which churns diffs and makes the
+# same file differ by platform. Pin LF in the working tree everywhere so the
+# checkout is identical on both.
+* text=auto eol=lf

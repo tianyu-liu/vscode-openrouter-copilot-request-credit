@@ -1,7 +1,7 @@
 import * as assert from "assert";
 import * as vscode from "vscode";
-import { handlePanelMessage, PanelDeps, renderPanelHtml } from "../../panel";
-import { stripTemplateComments } from "../../provider";
+import { handlePanelMessage, PanelDeps, renderPanelHtml, renderSessionCosts } from "../../panel";
+import { SessionCost, stripTemplateComments } from "../../provider";
 import { KEY_SECRET } from "../../storage";
 import { KeyInfo } from "../../logic";
 
@@ -16,6 +16,134 @@ const BASE_INFO: KeyInfo = {
     usage_monthly: 40,
     is_free_tier: false,
 };
+
+function sessionFixture(over: Partial<SessionCost> = {}): SessionCost {
+    return {
+        sessionId: "copilot-chat:aaaaaaaa-1111-2222-3333-444444444444",
+        paid: 0.001,
+        openRouter: 0,
+        upstream: 0.001,
+        promptTokens: 1000,
+        completionTokens: 10,
+        cachedTokens: 900,
+        calls: 2,
+        byok: true,
+        updatedAt: 1,
+        routes: [
+            {
+                provider: "Fireworks",
+                model: "deepseek/deepseek-v4.1-flash",
+                byok: true,
+                paid: 0.001,
+                openRouter: 0,
+                upstream: 0.001,
+                promptTokens: 1000,
+                completionTokens: 10,
+                cachedTokens: 900,
+                calls: 2,
+                updatedAt: 1,
+            },
+        ],
+        ...over,
+    };
+}
+
+suite("renderSessionCosts", () => {
+    test("empty state explains that no spend has been recorded", () => {
+        const html = renderSessionCosts(undefined);
+        assert.ok(html.includes("No OpenRouter spend recorded yet"), html);
+        assert.ok(!html.includes("<details"), "no collapsible rows when there is nothing to show");
+    });
+
+    test("the footer says up to 10 sessions are kept, and that they persist", () => {
+        const html = renderSessionCosts([sessionFixture()]);
+        assert.ok(html.includes("up to the 10 most recent"), html);
+        assert.ok(html.includes("kept across window reloads"), html);
+    });
+
+    test("one collapsible row per session, with the newest expanded", () => {
+        const html = renderSessionCosts([
+            sessionFixture({ sessionId: "copilot-chat:new-session", paid: 0.002 }),
+            sessionFixture({ sessionId: "copilot-chat:old-session", paid: 0.001 }),
+        ]);
+        assert.strictEqual((html.match(/<details/g) ?? []).length, 2, "one details per session");
+        assert.strictEqual((html.match(/\bopen\b/g) ?? []).length, 1, "only the first is expanded");
+        const firstDetails = html.slice(html.indexOf("<details"));
+        assert.ok(firstDetails.includes("new-session") || firstDetails.includes("new…"), "the newest session is expanded");
+    });
+
+    test("a session lists its provider/model routes", () => {
+        const html = renderSessionCosts([
+            sessionFixture({
+                routes: [
+                    { provider: "Fireworks", model: "deepseek/deepseek-v4.1-flash", byok: true, paid: 0.0016, openRouter: 0, upstream: 0.0016, promptTokens: 1, completionTokens: 1, cachedTokens: 0, calls: 3, updatedAt: 1 },
+                    { provider: "Morph", model: "z-ai/glm-5.3-flash", byok: false, paid: 0.00003, openRouter: 0.00003, upstream: 0, promptTokens: 1, completionTokens: 1, cachedTokens: 0, calls: 1, updatedAt: 2 },
+                ],
+            }),
+        ]);
+        assert.ok(html.includes("Fireworks (BYOK)"), "the BYOK host is named once, with a marker");
+        assert.ok(!html.includes("Fireworks \u00b7 BYOK"), "the provider is not repeated");
+        assert.ok(html.includes("deepseek/deepseek-v4.1-flash"), "model named");
+        assert.ok(html.includes("Morph"), "the second provider named");
+        assert.ok(!html.includes("Morph (BYOK)"), "an OpenRouter-charged route never carries the BYOK marker");
+        assert.strictEqual((html.match(/class="route"/g) ?? []).length, 2, "one row per route");
+    });
+
+    test("the session body leaves no stray gap after the session id line", () => {
+        const html = renderPanelHtml(undefined, 10, "daily", true, 5);
+        assert.match(html, /\.sessionbody p \{ margin: 0; \}/, "the trailing paragraph margin is zeroed");
+    });
+
+    test("shows no window total, just the per-session rows", () => {
+        const html = renderSessionCosts([
+            sessionFixture({ sessionId: "a", paid: 0.002 }),
+            sessionFixture({ sessionId: "b", paid: 0.003 }),
+        ]);
+        assert.ok(!/across \d+ session/.test(html), "no 'across N session(s)' summary line");
+        assert.ok(!html.includes("$0.005000"), "no summed window total");
+        assert.ok(html.includes("$0.002000") && html.includes("$0.003000"), "each session's own total is shown");
+    });
+
+    test("sessions without spend are omitted", () => {
+        const html = renderSessionCosts([
+            sessionFixture({ sessionId: "with-spend", paid: 0.001 }),
+            sessionFixture({ sessionId: "no-spend", paid: 0, upstream: 0, openRouter: 0 }),
+        ]);
+        assert.strictEqual((html.match(/<details/g) ?? []).length, 1, "only the spending session is listed");
+        assert.ok(!html.includes("no-spend"), "a zero-spend session is not shown");
+    });
+
+    test("escapes session ids and titles into the HTML", () => {
+        const html = renderSessionCosts([
+            sessionFixture({ sessionId: "copilot-chat:<script>alert(1)</script>", paid: 0.001 }),
+        ]);
+        assert.ok(!html.includes("<script>alert(1)"), "a hostile session id cannot inject markup");
+        assert.ok(html.includes("&lt;script&gt;"), "it is escaped instead");
+    });
+
+    test("uses the chat title as the session label when known", () => {
+        const html = renderSessionCosts([sessionFixture({ title: "Confirm work transfer to Windows" })]);
+        assert.ok(html.includes("Confirm work transfer to Windows"), "the title labels the row");
+    });
+
+    test("a hostile chat title is escaped, never injected", () => {
+        const html = renderSessionCosts([sessionFixture({ title: "<img src=x onerror=alert(1)>" })]);
+        assert.ok(!html.includes("<img src=x"), "the title cannot inject markup");
+        assert.ok(html.includes("&lt;img src=x"), "it is escaped instead");
+    });
+
+    test("shows the last-update time when the stamp is a real clock value", () => {
+        const when = new Date(2026, 8, 22, 1, 30, 5).getTime();
+        const html = renderSessionCosts([sessionFixture({ updatedAt: when })]);
+        assert.ok(html.includes("sessiontime"), "the timestamp is rendered");
+        assert.match(html, /2026\/09\/22 01:30:05/, html);
+    });
+
+    test("omits the timestamp when updatedAt is not a plausible clock value", () => {
+        const html = renderSessionCosts([sessionFixture({ updatedAt: 1 })]);
+        assert.ok(!html.includes("sessiontime"), "no bogus 1970 stamp");
+    });
+});
 
 suite("renderPanelHtml", () => {
     test("ships a per-render nonce CSP and escapes the masked key into the script", () => {
@@ -107,6 +235,47 @@ suite("renderPanelHtml", () => {
         assert.ok(html.includes('id="fn-6"'), "usage accounting footnote anchor present");
         assert.ok(html.includes('id="fn-7"'), "key storage footnote anchor present");
         assert.ok(html.includes('id="fn-8"'), "anthropic cache_control footnote anchor present");
+        assert.ok(html.includes('id="fn-10"'), "per-turn usage footnote anchor present");
+        assert.ok(html.includes("Session spend"), "the session-spend section is rendered");
+    });
+
+    test("footnote fn-2 states the real session_id behavior (no per-window random ID)", () => {
+        const html = renderPanelHtml(undefined, 10, "daily", true, 5);
+        assert.ok(html.includes("there is no per-window random ID"), "the no-random-id rule is documented");
+        assert.ok(
+            !html.includes("does a per-window random ID apply"),
+            "the stale per-window-random-ID claim is removed"
+        );
+        assert.ok(
+            html.includes("the most recently active chat\u2019s id is used instead"),
+            "parent-chat attribution for internal calls is documented"
+        );
+    });
+
+    test("footnote fn-10 documents the per-turn token and cost readout honestly", () => {
+        const html = renderPanelHtml(undefined, 10, "daily", true, 5);
+        assert.ok(html.includes('id="fn-10"'), "per-turn usage footnote anchor present");
+        assert.ok(
+            html.includes("forwards OpenRouter\u2019s own <code>usage</code> chunk"),
+            "usage passthrough to Copilot documented"
+        );
+        assert.ok(html.includes("the context-usage ring shows used / max tokens"), "context ring documented");
+        assert.ok(
+            html.includes("Session spend"),
+            "the real cost surface is named"
+        );
+        assert.ok(
+            html.includes("cost_details.upstream_inference_cost"),
+            "the BYOK cost fallback is documented"
+        );
+        assert.ok(
+            !html.includes("response footer shows the turn"),
+            "must not claim a footer cost that Copilot cannot render for this provider"
+        );
+        assert.ok(
+            html.includes("never written into the chat transcript"),
+            "must not imply cost is injected into the conversation"
+        );
     });
 
     test("footnotes surface the anthropic cache_control and the verbatim passthrough rules", () => {
@@ -342,6 +511,12 @@ suite("handlePanelMessage", () => {
         assert.deepStrictEqual(s.syncedPresets, [undefined], "no preset field to sync");
     });
 
+    test("saveTemplate re-renders so the resolved preset comment block is refreshed", async () => {
+        const s = spyDeps();
+        await handlePanelMessage({ type: "saveTemplate", value: '{"preset":"faster-glm-flash"}' }, s.deps);
+        assert.strictEqual(s.refreshes, 1, "a successful save triggers the same re-render path the loadPreset flow uses");
+    });
+
     test("saveTemplate syncs the dropdown with the template's preset field", async () => {
         const s = spyDeps();
         await handlePanelMessage({ type: "saveTemplate", value: '{"preset":"faster-glm-flash","temperature":0.2}' }, s.deps);
@@ -434,8 +609,8 @@ suite("handlePanelMessage", () => {
 
     test("selectPreset accepts slugs containing dots", async () => {
         const s = spyDeps();
-        await handlePanelMessage({ type: "selectPreset", value: "lab.v1-router" }, s.deps);
-        assert.deepStrictEqual(s.templates, ['{"preset":"lab.v1-router"}']);
+        await handlePanelMessage({ type: "selectPreset", value: "custom.v1-router" }, s.deps);
+        assert.deepStrictEqual(s.templates, ['{"preset":"custom.v1-router"}']);
         assert.strictEqual(s.errors.length, 0);
     });
 });
@@ -443,7 +618,7 @@ suite("handlePanelMessage", () => {
 suite("renderPanelHtml presets section", () => {
     const PRESETS = [
         { slug: "faster-glm-flash", name: "faster-glm-flash", model: "z-ai/glm-5.3-flash-20260826" },
-        { slug: "lab-routing", name: "lab-routing" },
+        { slug: "custom-routing", name: "custom-routing" },
     ];
 
     test("renders a preset dropdown whose default option loads no preset", () => {
@@ -485,6 +660,30 @@ suite("renderPanelHtml presets section", () => {
         const none = renderPanelHtml(undefined, 10, "daily", true, 5);
         assert.ok(!none.includes("No presets found for this key."));
         assert.ok(!none.includes('value="faster-glm-flash"'));
+    });
+
+    test("distinguishes a failed presets fetch from a legitimately empty list", () => {
+        const failed = renderPanelHtml(undefined, 10, "daily", true, 5, undefined, undefined, undefined, undefined, undefined, undefined);
+        assert.ok(failed.includes("Presets could not be loaded for this key."), "a failed fetch says so");
+        assert.ok(!failed.includes("No presets found for this key."), "a failed fetch is not reported as an empty key");
+        const empty = renderPanelHtml(undefined, 10, "daily", true, 5, undefined, undefined, undefined, undefined, undefined, []);
+        assert.ok(empty.includes("No presets found for this key."), "an empty list keeps the empty wording");
+        assert.ok(!empty.includes("Presets could not be loaded for this key."));
+        const listed = renderPanelHtml(undefined, 10, "daily", true, 5, undefined, undefined, undefined, undefined, undefined, PRESETS);
+        assert.ok(!listed.includes("Presets could not be loaded for this key."), "a list renders no failure hint");
+        assert.ok(!listed.includes("No presets found for this key."), "a list renders no empty hint");
+    });
+
+    test("labels lookup-skipped presets apart from model-less routing profiles", () => {
+        const presets = [
+            { slug: "pinned", name: "pinned", model: "z-ai/glm-5.3-flash" },
+            { slug: "skipped", name: "skipped", lookupSkipped: true },
+            { slug: "no-model", name: "no-model" },
+        ];
+        const html = renderPanelHtml(undefined, 10, "daily", true, 5, undefined, undefined, undefined, undefined, undefined, presets);
+        assert.ok(html.includes("skipped (lookup skipped)"), "a lookup-skipped preset is labelled distinctly");
+        assert.ok(html.includes("no-model (routing profile)"), "a genuinely model-less preset keeps the routing-profile label");
+        assert.ok(!html.includes("skipped (routing profile)"), "a skipped lookup is not mislabelled as a routing profile");
     });
 
     test("prefills the textarea with the JSON first and the resolved preset config as comments after it", () => {

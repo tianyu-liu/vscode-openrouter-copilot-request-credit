@@ -9,6 +9,6 @@ tmp/**
 **/*.map
 .gitignore
 AGENTS.md
-AGENTS.lab.md
+.kilo/**
 **/tsconfig.json
 **/*.vsix

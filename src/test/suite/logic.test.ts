@@ -1,4 +1,86 @@
 import * as assert from "assert";
+
+suite("formatUsdPrecise", () => {
+    test("a real per-turn BYOK cost never collapses to $0.00", () => {
+        // Captured from a live Fireworks BYOK turn: $1.342e-5.
+        const out = formatUsdPrecise(1.342e-5);
+        assert.notStrictEqual(out, "$0.00");
+        assert.strictEqual(out, "$0.00001342");
+    });
+
+    test("precision scales with magnitude so tiny values stay readable", () => {
+        assert.strictEqual(formatUsdPrecise(12.5), "$12.5000");
+        assert.strictEqual(formatUsdPrecise(0.05), "$0.0500");
+        assert.strictEqual(formatUsdPrecise(0.0000291), "$0.00002910");
+        assert.strictEqual(formatUsdPrecise(0.0000004), "$4.00e-7");
+    });
+
+    test("zero, negatives and non-finite render $0 rather than junk", () => {
+        assert.strictEqual(formatUsdPrecise(0), "$0");
+        assert.strictEqual(formatUsdPrecise(-1), "$0");
+        assert.strictEqual(formatUsdPrecise(Number.NaN), "$0");
+        assert.strictEqual(formatUsdPrecise(Number.POSITIVE_INFINITY), "$0");
+    });
+
+    test("huge values do not become exponential notation", () => {
+        const out = formatUsdPrecise(1e21);
+        assert.ok(!out.includes("e+"), out);
+    });
+
+    test("float artifacts are rounded away before formatting", () => {
+        // What naive accumulation produces for 1e-5 + 2e-5.
+        const artifact = 1e-5 + 2e-5;
+        assert.notStrictEqual(artifact, 3e-5, "the raw sum really does drift");
+        assert.strictEqual(formatUsdPrecise(artifact), "$0.00003000");
+        assert.strictEqual(formatUsdPrecise(0.1 + 0.2), "$0.3000");
+    });
+});
+
+suite("roundSignificant", () => {
+    test("suppresses accumulated float artifacts", () => {
+        assert.strictEqual(roundSignificant(1e-5 + 2e-5), 3e-5);
+        assert.strictEqual(roundSignificant(0.1 + 0.2), 0.3);
+        assert.strictEqual(roundSignificant(0.0013420000000000003), 0.001342);
+    });
+
+    test("the default is working precision, so no real value is altered", () => {
+        // 15 significant digits is the standard boundary: a double has ~15-17,
+        // so this strips representation noise without touching real digits.
+        for (const v of [123.456789, 0.0000291, 1.342e-5, 987654321.123456]) {
+            assert.strictEqual(roundSignificant(v), v, `${v} must be preserved`);
+        }
+    });
+
+    test("rounding harder than working precision injects bias, not noise removal", () => {
+        // Regression guard: an earlier revision rounded to 6 significant digits
+        // on every accumulation step, which biased 100k accumulated turns by
+        // 5.3%. The default must stay well above that.
+        let six = 0;
+        let working = 0;
+        const per = 1.234567e-5;
+        for (let i = 0; i < 100000; i++) {
+            six = Number((six + per).toPrecision(6));
+            working = roundSignificant(working + per);
+        }
+        const exact = per * 100000;
+        assert.ok(Math.abs(six - exact) / exact > 0.01, `6-digit rounding should visibly drift, got ${six}`);
+        assert.ok(Math.abs(working - exact) / exact < 1e-12, `working precision should not drift, got ${working}`);
+    });
+
+    test("harmless inputs are left alone", () => {
+        assert.strictEqual(roundSignificant(0), 0);
+        assert.strictEqual(roundSignificant(-0), 0);
+        assert.strictEqual(roundSignificant(Number.NaN), 0);
+        assert.strictEqual(roundSignificant(Number.POSITIVE_INFINITY), 0);
+        assert.strictEqual(roundSignificant(42), 42);
+    });
+
+    test("the digit count is adjustable", () => {
+        assert.strictEqual(roundSignificant(123.456789, 3), 123);
+        assert.strictEqual(roundSignificant(123.456789, 9), 123.456789);
+        assert.strictEqual(roundSignificant(1e-5 + 2e-5, 14), 3e-5, "14 significant digits also strips the noise");
+    });
+});
 import {
     buildDetail,
     buildStatus,
@@ -9,13 +91,16 @@ import {
     formatReset,
     formatUsd,
     formatUsdOrNa,
+    formatUsdPrecise,
     KeyInfo,
     maskKey,
     nextUtcMidnight,
     nextUtcMonday,
     nextUtcMonthStart,
+    parseSessionTitle,
     resetBoundary,
     resetPeriodLabel,
+    roundSignificant,
     usedDaily,
     usedWeekly,
     usedMonthly,
@@ -896,6 +981,41 @@ suite("logic.resetPeriodLabel", () => {
     });
 });
 
+suite("logic.parseSessionTitle", () => {
+    // Captured verbatim from a real chatSessions/<id>.jsonl head.
+    const HEAD = [
+        '{"kind":0,"v":{"version":3,"creationDate":1790008162757,"initialLocation":"panel","sessionId":"0973027a-02a9-4d24-bbc0-2e9e1d53af12"}}',
+        '{"kind":1,"k":["customTitle"],"v":"Confirm work transfer to Windows"}',
+        '{"kind":2,"k":["requests"],"v":[]}',
+    ].join("\n");
+
+    test("reads the customTitle record from the file head", () => {
+        assert.strictEqual(parseSessionTitle(HEAD), "Confirm work transfer to Windows");
+    });
+
+    test("handles CRLF line endings", () => {
+        assert.strictEqual(parseSessionTitle(HEAD.replace(/\n/g, "\r\n")), "Confirm work transfer to Windows");
+    });
+
+    test("a session with no title yields undefined", () => {
+        assert.strictEqual(parseSessionTitle('{"kind":0,"v":{"sessionId":"x"}}'), undefined);
+        assert.strictEqual(parseSessionTitle(""), undefined);
+    });
+
+    test("a blank title is treated as no title", () => {
+        assert.strictEqual(parseSessionTitle('{"kind":1,"k":["customTitle"],"v":"   "}'), undefined);
+    });
+
+    test("a truncated final line does not break the read", () => {
+        assert.strictEqual(parseSessionTitle(`${HEAD}\n{"kind":2,"k":["reque`), "Confirm work transfer to Windows");
+    });
+
+    test("tolerates malformed lines elsewhere in the head", () => {
+        const raw = ['not json', '{"kind":1,"k":["customTitle"],"v":"Named chat"}'].join("\n");
+        assert.strictEqual(parseSessionTitle(raw), "Named chat");
+    });
+});
+
 suite("logic.used* helpers", () => {
     const mk = (overrides: Partial<KeyInfo>): KeyInfo => ({
         limit: null,
@@ -929,9 +1049,11 @@ suite("logic.maskKey", () => {
             "sk-or-v1-000...234");
     });
     test("scales the mask down for short secrets", () => {
-        assert.strictEqual(maskKey("abcd1234"), "ab...4");
-        assert.strictEqual(maskKey("abcdef"), "ab...f");
-        assert.strictEqual(maskKey("abcde"), "ab...e");
+        assert.strictEqual(maskKey("abcdefghij"), "a...");
+        assert.strictEqual(maskKey("abcdefghi"), "a...");
+    });
+    test("reveals no characters for a 5-character secret", () => {
+        assert.strictEqual(maskKey("abcde"), "****");
     });
     test("never reveals very short secrets", () => {
         assert.strictEqual(maskKey("abcd"), "****");
@@ -940,10 +1062,14 @@ suite("logic.maskKey", () => {
     test("revealed characters stay bounded for every length", () => {
         for (const len of [5, 6, 7, 8, 9, 11, 12, 15, 16, 23, 24, 31, 32, 40, 72, 73, 100, 200]) {
             const masked = maskKey("a".repeat(len));
-            assert.match(masked, /^a+\.\.\.a+$/);
+            if (len < 9) {
+                assert.strictEqual(masked, "****", `key len ${len} must reveal nothing`);
+                continue;
+            }
+            assert.match(masked, /^a+\.\.\.a*$/);
             const visible = masked.replace(/\./g, "").length;
             if (len < 16) {
-                assert.ok(visible <= 3, `short key len ${len} reveals ${visible} chars`);
+                assert.strictEqual(visible, 1, `short key len ${len} reveals ${visible} chars`);
             } else {
                 assert.ok(visible / len <= 0.25, `key len ${len} reveals ${visible}/${len}`);
             }

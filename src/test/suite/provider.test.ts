@@ -1,16 +1,32 @@
 import * as assert from "assert";
 import * as vscode from "vscode";
 import {
+    accumulateSessionCost,
     baseUrl,
     buildRequestBody,
+    buildUsagePart,
     flattenReasoningDetails,
+    getLastStreamProvider,
     getLastStreamUsage,
+    getSessionCost,
+    getSessionCosts,
+    hydrateSessionCosts,
+    MAX_TRACKED_SESSIONS,
+    resetParentAttributionForTesting,
+    resetSessionCostsForTesting,
+    resolveCostSession,
     mapResponseError,
     mapStreamedError,
+    onTurnCost,
     OpenRouterChatProvider,
+    sessionIdFor,
+    setPostTimeoutForTesting,
     setRetryDelayForTesting,
     stripTemplateComments,
     toOpenAI,
+    turnCostOf,
+    routeCostLine,
+    TurnCost,
 } from "../../provider";
 
 const runtimeThinkingPartCtor = (vscode as any).LanguageModelThinkingPart as
@@ -139,6 +155,20 @@ suite("toOpenAI", () => {
         assert.strictEqual(content[0].image_url.url, "data:image/png;base64,iVBORw==");
     });
 
+    test("mixed text and image content uses multipart objects for every item", () => {
+        const image = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+        const out = toOpenAI([
+            msg(vscode.LanguageModelChatMessageRole.User, [
+                new vscode.LanguageModelTextPart("Describe this image."),
+                vscode.LanguageModelDataPart.image(image, "image/png"),
+            ]),
+        ]);
+        assert.deepStrictEqual((out[0] as { content: unknown[] }).content, [
+            { type: "text", text: "Describe this image." },
+            { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw==" } },
+        ]);
+    });
+
     test("assistant thinking parts are echoed back as reasoning on the outgoing message", function () {
         if (!runtimeThinkingPartCtor) {
             this.skip();
@@ -234,7 +264,12 @@ suite("buildRequestBody", () => {
         assert.deepStrictEqual(body.provider, { quantizations: ["fp8"] });
     });
 
-    test("strips template model/messages/tools and forces stream and session_id", () => {
+    test("an explicit sessionId is sent verbatim", () => {
+        const body = buildRequestBody({}, "m", [], undefined, undefined, undefined, "copilot-chat:abc-123");
+        assert.strictEqual(body.session_id, "copilot-chat:abc-123");
+    });
+
+    test("strips template model/messages/tools and forces stream", () => {
         const body = buildRequestBody(
             { model: "other/model", messages: [{ role: "user", content: "old" }], tools: [], temperature: 0.2 },
             "live/model",
@@ -245,9 +280,14 @@ suite("buildRequestBody", () => {
         assert.strictEqual(body.model, "live/model");
         assert.deepStrictEqual(body.messages, [{ role: "user", content: "new" }]);
         assert.strictEqual(body.stream, true);
-        assert.strictEqual(typeof body.session_id, "string");
+        assert.ok(!("session_id" in body), "no session_id without a known parent");
         assert.strictEqual(body.temperature, 0.2);
         assert.strictEqual(body.tools, undefined);
+    });
+
+    test("a pasted template session_id is dropped when there is no derived one", () => {
+        const body = buildRequestBody({ session_id: "pasted" }, "m", [], undefined, undefined);
+        assert.ok(!("session_id" in body), "the enforced rule wins even with no derived id");
     });
 
     test("anthropic-family models get a top-level ephemeral cache_control", () => {
@@ -287,6 +327,18 @@ suite("buildRequestBody", () => {
         assert.deepStrictEqual(listed.reasoning, { exclude: true, effort: "high" });
     });
 
+    test("picker effort none drops a contradictory template effort without mutating the template", () => {
+        const template = { reasoning: { effort: "high", max_tokens: 5 } };
+        const body = buildRequestBody(template, "m", [], undefined, { reasoningEffort: "none" });
+        assert.deepStrictEqual(body.reasoning, { max_tokens: 5, enabled: false });
+        assert.ok(!("effort" in (body.reasoning as Record<string, unknown>)), "no contradictory effort survives");
+        assert.deepStrictEqual(
+            template,
+            { reasoning: { effort: "high", max_tokens: 5 } },
+            "the saved template object is never mutated"
+        );
+    });
+
     test("non-Anthropic models never get an auto cache_control", () => {
         for (const id of ["deepseek/deepseek-v4-flash-0731", "openai/gpt-5.6-luna", "qwen/qwen3-coder-plus", "google/gemini-3.7-flash", "m"]) {
             const body = buildRequestBody({}, id, [], undefined, undefined);
@@ -301,7 +353,7 @@ suite("buildRequestBody preset references", () => {
         assert.ok(!("provider" in body), "no provider object injected for preset references");
         assert.strictEqual(body.model, "@preset/faster-glm-flash");
         assert.strictEqual(body.stream, true);
-        assert.strictEqual(typeof body.session_id, "string");
+        assert.ok(!("session_id" in body), "no session_id without a known parent");
     });
 
     test("the combined model@preset/slug form is treated as a preset reference too", () => {
@@ -376,7 +428,7 @@ suite("picker preset isolation", () => {
         assert.ok(!("cache_control" in plainBody), "the preset's cache decision does not leak into the non-preset request");
         assert.deepStrictEqual(
             Object.keys(plainBody).sort(),
-            ["messages", "model", "session_id", "stream", "tools"],
+            ["messages", "model", "stream", "tools"],
             "the empty-template non-preset body carries only the enforced fields"
         );
     });
@@ -412,6 +464,235 @@ suite("flattenReasoningDetails", () => {
             flattenReasoningDetails([null, "junk", { type: "summary", summary: "ok" }]),
             { thinking: "ok", text: "" }
         );
+    });
+});
+
+suite("sessionIdFor", () => {
+    test("namespaces a Copilot conversation id so one chat session is one OpenRouter session", () => {
+        assert.strictEqual(sessionIdFor("9f1c4a2e-0d1b-4c33-9a77-2f4b6d8e0a11"), "copilot-chat:9f1c4a2e-0d1b-4c33-9a77-2f4b6d8e0a11");
+    });
+
+    test("is stable for the same conversation id and distinct across conversations", () => {
+        assert.strictEqual(sessionIdFor("session-a"), sessionIdFor("session-a"));
+        assert.notStrictEqual(sessionIdFor("session-a"), sessionIdFor("session-b"));
+    });
+
+    test("returns the per-window id when no conversation id is supplied", () => {
+        const fallback = sessionIdFor(undefined);
+        assert.strictEqual(fallback, sessionIdFor(null));
+        assert.strictEqual(fallback, sessionIdFor(""));
+        assert.strictEqual(fallback, sessionIdFor("   "));
+        assert.strictEqual(fallback, sessionIdFor(42));
+        assert.ok(!fallback.startsWith("copilot-chat:"), "the fallback is not namespaced");
+    });
+
+    test("buildRequestBody omits session_id unless one is supplied", () => {
+        assert.ok(!("session_id" in buildRequestBody({}, "m", [], undefined, undefined)));
+        assert.ok(!("session_id" in buildRequestBody({}, "m", [], undefined, undefined, undefined, "")));
+        assert.strictEqual(
+            buildRequestBody({}, "m", [], undefined, undefined, undefined, "copilot-chat:x").session_id,
+            "copilot-chat:x"
+        );
+    });
+
+    test("stays within OpenRouter's 256 character session_id limit", () => {
+        const sessionId = sessionIdFor("x".repeat(400));
+        assert.strictEqual(sessionId.length, 256);
+        assert.ok(sessionId.startsWith("copilot-chat:"));
+    });
+});
+
+suite("buildUsagePart", () => {
+    test("maps OpenRouter usage to the payload Copilot consumes", () => {
+        assert.deepStrictEqual(
+            buildUsagePart({
+                prompt_tokens: 194,
+                completion_tokens: 2,
+                total_tokens: 196,
+                prompt_tokens_details: { cached_tokens: 12, cache_write_tokens: 3 },
+                cost: 0.95,
+            }),
+            {
+                prompt_tokens: 194,
+                completion_tokens: 2,
+                total_tokens: 196,
+                prompt_tokens_details: { cached_tokens: 12, cache_write_tokens: 3 },
+                copilot_usage: { total_nano_aiu: 950_000_000 },
+            }
+        );
+    });
+
+    test("omits the credit slot when OpenRouter reports no cost", () => {
+        const part = buildUsagePart({ prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 });
+        assert.ok(part);
+        assert.ok(!("copilot_usage" in part), "no cost means no credit figure");
+        assert.deepStrictEqual(part.prompt_tokens_details, { cached_tokens: 0 });
+    });
+
+    test("a zero cost (the BYOK case) carries no credit figure at all", () => {
+        const part = buildUsagePart({ prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, cost: 0 });
+        assert.ok(part, "tokens are still reported");
+        assert.ok(!("copilot_usage" in part), "a zero charge must not surface as a 0.0 credit figure");
+    });
+
+    test("requires the three token counters and clamps negatives", () => {
+        assert.strictEqual(buildUsagePart(undefined), undefined);
+        assert.strictEqual(buildUsagePart(null), undefined);
+        assert.strictEqual(buildUsagePart("nope"), undefined);
+        assert.strictEqual(buildUsagePart([]), undefined);
+        assert.strictEqual(buildUsagePart({ prompt_tokens: 1, completion_tokens: 1 }), undefined);
+        assert.strictEqual(buildUsagePart({ prompt_tokens: 1, total_tokens: 2 }), undefined);
+        assert.deepStrictEqual(
+            buildUsagePart({
+                prompt_tokens: -1,
+                completion_tokens: -1,
+                total_tokens: -1,
+                prompt_tokens_details: { cached_tokens: -5 },
+                cost: -0.5,
+            }),
+            {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+                prompt_tokens_details: { cached_tokens: 0 },
+            }
+        );
+    });
+
+    test("drops a non-numeric prompt_tokens_details.cached_tokens", () => {
+        const part = buildUsagePart({
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+            prompt_tokens_details: { cached_tokens: "many" },
+        });
+        assert.deepStrictEqual(part?.prompt_tokens_details, { cached_tokens: 0 });
+    });
+});
+
+suite("turnCostOf", () => {
+    // Shape captured verbatim from a live Fireworks BYOK turn.
+    const BYOK_USAGE = {
+        prompt_tokens: 37,
+        completion_tokens: 8,
+        total_tokens: 45,
+        cost: 0,
+        is_byok: true,
+        prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 },
+        cost_details: {
+            upstream_inference_cost: 1.342e-5,
+            upstream_inference_prompt_cost: 8.14e-6,
+            upstream_inference_completions_cost: 5.28e-6,
+        },
+    };
+
+    test("a BYOK turn reports the upstream cost, not OpenRouter's zero", () => {
+        const cost = turnCostOf(BYOK_USAGE, "Fireworks");
+        assert.ok(cost);
+        assert.strictEqual(cost!.openRouter, 0, "OpenRouter charges nothing on a BYOK route");
+        assert.strictEqual(cost!.upstream, 1.342e-5, "the upstream cost is the payable figure");
+        assert.strictEqual(cost!.isByok, true);
+        assert.strictEqual(cost!.provider, "Fireworks");
+        assert.strictEqual(cost!.promptTokens, 37);
+        assert.strictEqual(cost!.completionTokens, 8);
+    });
+
+    test("a shared-pool turn reports OpenRouter's cost and no upstream figure", () => {
+        const cost = turnCostOf(
+            { prompt_tokens: 194, completion_tokens: 2, total_tokens: 196, cost: 0.0000291, cost_details: { upstream_inference_cost: 0 } },
+            "Morph"
+        );
+        assert.ok(cost);
+        assert.strictEqual(cost!.openRouter, 0.0000291);
+        assert.strictEqual(cost!.upstream, undefined, "a zero upstream figure is not payable");
+        assert.strictEqual(cost!.isByok, false);
+        assert.strictEqual(cost!.provider, "Morph");
+    });
+
+    test("is_byok is inferred when only an upstream cost is present", () => {
+        const cost = turnCostOf({ prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, cost: 0, cost_details: { upstream_inference_cost: 0.001 } });
+        assert.strictEqual(cost?.isByok, true);
+        assert.strictEqual(cost?.upstream, 0.001);
+    });
+
+    test("a negative upstream figure is ignored rather than reported", () => {
+        const cost = turnCostOf({ prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, cost: 0, cost_details: { upstream_inference_cost: -5 } });
+        assert.strictEqual(cost, undefined);
+    });
+
+    test("no payable cost anywhere reports nothing", () => {
+        assert.strictEqual(turnCostOf({ prompt_tokens: 5, completion_tokens: 5, total_tokens: 10 }, "X"), undefined);
+        assert.strictEqual(turnCostOf({ prompt_tokens: 5, completion_tokens: 5, total_tokens: 10, cost: 0 }, "X"), undefined);
+        assert.strictEqual(turnCostOf({ prompt_tokens: 5, completion_tokens: 5, total_tokens: 10, cost: 0, cost_details: { upstream_inference_cost: 0 } }, "X"), undefined);
+        assert.strictEqual(turnCostOf(undefined, "X"), undefined);
+        assert.strictEqual(turnCostOf([], "X"), undefined);
+    });
+
+    test("cache token counts are carried through", () => {
+        const cost = turnCostOf(
+            {
+                prompt_tokens: 1000,
+                completion_tokens: 12,
+                total_tokens: 1012,
+                cost: 0.002,
+                prompt_tokens_details: { cached_tokens: 900 },
+            },
+            "DeepInfra"
+        );
+        assert.strictEqual(cost?.cachedTokens, 900);
+    });
+
+    test("missing or bogus cache fields fall back to zero, never NaN", () => {
+        const noDetails = turnCostOf({ prompt_tokens: 10, completion_tokens: 1, total_tokens: 11, cost: 0.001 }, "X");
+        assert.strictEqual(noDetails?.cachedTokens, 0);
+        const junk = turnCostOf(
+            { prompt_tokens: 10, completion_tokens: 1, total_tokens: 11, cost: 0.001, prompt_tokens_details: { cached_tokens: "many" } },
+            "X"
+        );
+        assert.strictEqual(junk?.cachedTokens, 0);
+    });
+});
+
+suite("resolveCostSession", () => {
+    const CHAT = "copilot-chat:9ad83b3e-bc0a-470c-ab01-5e4f110d455a";
+
+    setup(() => {
+        resetParentAttributionForTesting();
+    });
+
+    test("a chat turn becomes the current session", () => {
+        assert.strictEqual(resolveCostSession(CHAT, true), CHAT);
+    });
+
+    test("an internal call is attributed to the chat that triggered it", () => {
+        resolveCostSession(CHAT, true);
+        assert.strictEqual(
+            resolveCostSession("3f2a9c11-0000-4000-8000-000000000001", false),
+            CHAT,
+            "a sub-agent call folds into its parent chat, not a session of its own"
+        );
+    });
+
+    test("a later chat turn moves the attribution target", () => {
+        const second = "copilot-chat:11111111-2222-3333-4444-555555555555";
+        resolveCostSession(CHAT, true);
+        resolveCostSession(second, true);
+        assert.strictEqual(resolveCostSession("unused", false), second, "the newest chat wins");
+    });
+
+    test("an internal call long after the last turn is not attributed", () => {
+        const t0 = 1_000_000;
+        resolveCostSession(CHAT, true, t0);
+        assert.strictEqual(resolveCostSession("x", false, t0 + 60_000), CHAT, "within the window");
+        assert.strictEqual(
+            resolveCostSession("x", false, t0 + 11 * 60 * 1000),
+            undefined,
+            "a stale attribution is dropped rather than blamed on an old chat"
+        );
+    });
+
+    test("with no chat yet, an internal call is dropped", () => {
+        assert.strictEqual(resolveCostSession("x", false), undefined);
     });
 });
 
@@ -497,7 +778,7 @@ suite("provideLanguageModelChatResponse (stubbed stream)", () => {
     const options = { tools: undefined, modelConfiguration: undefined } as unknown as vscode.ProvideLanguageModelChatResponseOptions;
     const token = {
         isCancellationRequested: false,
-        onCancellationRequested: () => ({ dispose: () => {} }),
+        onCancellationRequested: () => ({ dispose: () => { } }),
     } as unknown as vscode.CancellationToken;
 
     function streamResponse(body: string, status = 200, headers: Record<string, string> = {}): Response {
@@ -511,9 +792,30 @@ suite("provideLanguageModelChatResponse (stubbed stream)", () => {
         return chunks.map((c) => `data: ${JSON.stringify(c)}\n\n`).join("") + "data: [DONE]\n\n";
     }
 
+    const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+    function controlledSse(): {
+        response: Response;
+        push: (chunk: string) => void;
+        close: () => void;
+    } {
+        const encoder = new TextEncoder();
+        let controller!: ReadableStreamDefaultController<Uint8Array>;
+        const stream = new ReadableStream<Uint8Array>({
+            start(c) {
+                controller = c;
+            },
+        });
+        return {
+            response: new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } }),
+            push: (chunk: string) => controller.enqueue(encoder.encode(chunk)),
+            close: () => controller.close(),
+        };
+    }
+
     suiteSetup(() => {
         originalFetch = globalThis.fetch;
-        setRetryDelayForTesting(async () => {});
+        setRetryDelayForTesting(async () => { });
         globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
             fetchCalls.push({ url: String(input), init });
             const next = nextResponses.shift();
@@ -541,6 +843,16 @@ suite("provideLanguageModelChatResponse (stubbed stream)", () => {
         await provider.provideLanguageModelChatResponse(model, [], options, progress as never, token as never);
     }
 
+    async function runWith(requestOptions: unknown, provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState())): Promise<void> {
+        await provider.provideLanguageModelChatResponse(model, [], requestOptions as never, progress as never, token as never);
+    }
+
+    function sentBody(index: number): Record<string, unknown> {
+        const call = fetchCalls[index];
+        assert.ok(call, `expected fetch call ${index}`);
+        return JSON.parse(String(call.init?.body)) as Record<string, unknown>;
+    }
+
     function thinkingReported(): unknown[] {
         return runtimeThinkingPartCtor ? reported.filter((p) => p instanceof runtimeThinkingPartCtor) : [];
     }
@@ -548,6 +860,220 @@ suite("provideLanguageModelChatResponse (stubbed stream)", () => {
     function textReported(): unknown[] {
         return reported.filter((p) => p instanceof vscode.LanguageModelTextPart);
     }
+
+    function costLines(): string[] {
+        return textReported()
+            .map((p) => String((p as { value: string }).value))
+            .filter((v) => /^\n\n\$[0-9]/.test(v));
+    }
+
+    function usageChunk(provider: string, prompt: number, completion: number, upstream: number, cached = 0) {
+        return {
+            provider,
+            choices: [{ delta: {}, finish_reason: "stop" }],
+            usage: {
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+                total_tokens: prompt + completion,
+                cost: 0,
+                is_byok: true,
+                prompt_tokens_details: { cached_tokens: cached, cache_write_tokens: 0 },
+                cost_details: { upstream_inference_cost: upstream },
+            },
+        };
+    }
+
+    function usageParts(): vscode.LanguageModelDataPart[] {
+        return reported.filter(
+            (p): p is vscode.LanguageModelDataPart =>
+                p instanceof vscode.LanguageModelDataPart && p.mimeType === "usage"
+        );
+    }
+
+    function usagePayload(index = 0): Record<string, unknown> {
+        const parts = usageParts();
+        assert.strictEqual(parts.length, 1, "exactly one usage part per turn");
+        return JSON.parse(new TextDecoder().decode(parts[index].data));
+    }
+
+    test("a request carrying the Copilot conversation id sends it as session_id", async () => {
+        const okBody = () => sseBody([{ choices: [{ delta: {}, finish_reason: "stop" }], usage: { total_tokens: 1 } }]);
+        nextResponses.push(() => streamResponse(okBody()), () => streamResponse(okBody()));
+        const options = { tools: undefined, modelConfiguration: undefined, modelOptions: { _conversationId: "conv-42" } };
+        await runWith(options);
+        await runWith(options);
+        assert.strictEqual(sentBody(0).session_id, "copilot-chat:conv-42");
+        assert.strictEqual(sentBody(1).session_id, "copilot-chat:conv-42", "both turns share one OpenRouter session");
+    });
+
+    test("a fresh extension host keeps the same session_id for a restored conversation (window reload)", async () => {
+        const okBody = sseBody([{ choices: [{ delta: {}, finish_reason: "stop" }], usage: { total_tokens: 1 } }]);
+        nextResponses.push(() => streamResponse(okBody), () => streamResponse(okBody));
+        const conversationId = "3d1c9b0e-7c55-4a1f-9c22-8ab6f0d5e777";
+        // Two separate providers stand in for the extension host before and after a reload.
+        await runWith({ tools: undefined, modelConfiguration: undefined, modelOptions: { _conversationId: conversationId } });
+        const afterReload = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
+        await runWith(
+            { tools: undefined, modelConfiguration: undefined, modelOptions: { _conversationId: conversationId } },
+            afterReload
+        );
+        assert.strictEqual(sentBody(0).session_id, sentBody(1).session_id);
+    });
+
+    test("a request with no known parent sends no session_id at all", async () => {
+        // No chat has been seen yet, so there is no parent to inherit.
+        resetParentAttributionForTesting();
+        const okBody = sseBody([{ choices: [{ delta: {}, finish_reason: "stop" }], usage: { total_tokens: 1 } }]);
+        nextResponses.push(() => streamResponse(okBody), () => streamResponse(okBody));
+        await runWith({ tools: undefined, modelConfiguration: undefined });
+        await runWith({ tools: undefined, modelConfiguration: undefined, modelOptions: {} });
+        assert.ok(!("session_id" in sentBody(0)), "an unattributed call never mints an orphan session");
+        assert.ok(!("session_id" in sentBody(1)), "nor does a later one");
+    });
+
+    test("the last chat survives a reload so an internal call still joins its parent", async () => {
+        resetParentAttributionForTesting();
+        const state = fakeState();
+        const okBody = () => sseBody([{ choices: [{ delta: {}, finish_reason: "stop" }], usage: { total_tokens: 1 } }]);
+        nextResponses.push(() => streamResponse(okBody()), () => streamResponse(okBody()));
+        await runWith(
+            { tools: undefined, modelConfiguration: undefined, modelOptions: { _conversationId: "reload-parent" } },
+            new OpenRouterChatProvider(fakeSecrets("sk-test"), state)
+        );
+        // A new provider instance stands in for the extension host after a reload,
+        // sharing the same persisted state.
+        const afterReload = new OpenRouterChatProvider(fakeSecrets("sk-test"), state);
+        await runWith({ tools: undefined, modelConfiguration: undefined, modelOptions: {} }, afterReload);
+        assert.strictEqual(
+            sentBody(1).session_id,
+            "copilot-chat:reload-parent",
+            "the internal call rejoins its parent's OpenRouter session"
+        );
+    });
+
+    test("with no chat before a reload, an internal call still sends no session_id", async () => {
+        resetParentAttributionForTesting();
+        const state = fakeState();
+        const okBody = sseBody([{ choices: [{ delta: {}, finish_reason: "stop" }], usage: { total_tokens: 1 } }]);
+        nextResponses.push(() => streamResponse(okBody));
+        const afterReload = new OpenRouterChatProvider(fakeSecrets("sk-test"), state);
+        await runWith({ tools: undefined, modelConfiguration: undefined, modelOptions: {} }, afterReload);
+        assert.ok(!("session_id" in sentBody(0)), "no orphan session is minted across a reload");
+    });
+
+    test("an internal call inherits the parent chat's session_id, not the window one", async () => {
+        resetParentAttributionForTesting();
+        const okBody = () => sseBody([{ choices: [{ delta: {}, finish_reason: "stop" }], usage: { total_tokens: 1 } }]);
+        nextResponses.push(() => streamResponse(okBody()), () => streamResponse(okBody()));
+        await runWith({ tools: undefined, modelConfiguration: undefined, modelOptions: { _conversationId: "parent-chat" } });
+        // A sub-agent call: Copilot sends no `_conversationId`.
+        await runWith({ tools: undefined, modelConfiguration: undefined, modelOptions: {} });
+        assert.strictEqual(sentBody(0).session_id, "copilot-chat:parent-chat");
+        assert.strictEqual(
+            sentBody(1).session_id,
+            "copilot-chat:parent-chat",
+            "the internal call joins its parent's OpenRouter session instead of a separate one"
+        );
+    });
+
+    test("a pasted template session_id never overrides the derived one", async () => {
+        const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
+        const okBody = sseBody([{ choices: [{ delta: {}, finish_reason: "stop" }], usage: { total_tokens: 1 } }]);
+        nextResponses.push(() => streamResponse(okBody));
+        await provider.setTemplate('{ "session_id": "pasted", "temperature": 0.2 }');
+        await runWith({ tools: undefined, modelConfiguration: undefined, modelOptions: { _conversationId: "conv-1" } }, provider);
+        assert.strictEqual(sentBody(0).session_id, "copilot-chat:conv-1");
+        assert.strictEqual(sentBody(0).temperature, 0.2);
+    });
+
+    test("emits the turn cost with provider attribution and a portable payload", async () => {
+        const events: TurnCost[] = [];
+        const sub = onTurnCost((c) => events.push(c));
+        try {
+            const body = sseBody([
+                { provider: "Fireworks", choices: [{ delta: { content: "hi" } }] },
+                {
+                    provider: "Fireworks",
+                    choices: [{ delta: {}, finish_reason: "stop" }],
+                    usage: {
+                        prompt_tokens: 37,
+                        completion_tokens: 8,
+                        total_tokens: 45,
+                        cost: 0,
+                        is_byok: true,
+                        prompt_tokens_details: { cached_tokens: 0 },
+                        cost_details: { upstream_inference_cost: 1.342e-5 },
+                    },
+                },
+            ]);
+            nextResponses.push(() => streamResponse(body));
+            await run();
+            assert.strictEqual(events.length, 1, "one cost event per turn");
+            assert.strictEqual(events[0].openRouter, 0);
+            assert.strictEqual(events[0].upstream, 1.342e-5);
+            assert.strictEqual(events[0].provider, "Fireworks", "the serving provider is captured from the stream");
+            assert.strictEqual(getLastStreamProvider(), "Fireworks");
+            // The usage part still goes to Copilot, but with no bogus credit slot for a $0 turn.
+            assert.ok(!("copilot_usage" in usagePayload()), "OpenRouter charged nothing, so no credit figure");
+        } finally {
+            sub.dispose();
+        }
+    });
+
+    test("a shared-pool turn emits OpenRouter's cost, not the upstream one", async () => {
+        const events: TurnCost[] = [];
+        const sub = onTurnCost((c) => events.push(c));
+        try {
+            const body = sseBody([
+                {
+                    provider: "Morph",
+                    choices: [{ delta: {}, finish_reason: "stop" }],
+                    usage: {
+                        prompt_tokens: 194,
+                        completion_tokens: 2,
+                        total_tokens: 196,
+                        cost: 0.0000291,
+                        cost_details: { upstream_inference_cost: 0 },
+                    },
+                },
+            ]);
+            nextResponses.push(() => streamResponse(body));
+            await run();
+            assert.strictEqual(events.length, 1);
+            assert.strictEqual(events[0].openRouter, 0.0000291);
+            assert.strictEqual(events[0].upstream, undefined);
+            assert.strictEqual(events[0].isByok, false);
+            assert.strictEqual(events[0].provider, "Morph");
+            assert.deepStrictEqual(usagePayload().copilot_usage, { total_nano_aiu: 29100 });
+        } finally {
+            sub.dispose();
+        }
+    });
+
+    test("a turn with no cost data emits no cost event and resets the provider per request", async () => {
+        const events: TurnCost[] = [];
+        const sub = onTurnCost((c) => events.push(c));
+        try {
+            const withProvider = sseBody([
+                { provider: "Fireworks", choices: [{ delta: { content: "a" } }] },
+                { provider: "Fireworks", choices: [{ delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, cost: 0, cost_details: { upstream_inference_cost: 1e-6 } } },
+            ]);
+            nextResponses.push(() => streamResponse(withProvider));
+            await run();
+            assert.strictEqual(events.length, 1);
+
+            const noCost = sseBody([
+                { choices: [{ delta: { content: "b" } }] },
+                { choices: [{ delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } },
+            ]);
+            nextResponses.push(() => streamResponse(noCost));
+            await run();
+            assert.strictEqual(events.length, 1, "a turn with no payable cost emits nothing");
+            assert.strictEqual(getLastStreamProvider(), undefined, "the provider is reset per request");
+        } finally {
+            sub.dispose();
+        }
+    });
 
     test("reports text and reasoning parts and tolerates the automatic usage chunk", async () => {
         const body = sseBody([
@@ -584,12 +1110,287 @@ suite("provideLanguageModelChatResponse (stubbed stream)", () => {
         ]);
         nextResponses.push(() => streamResponse(body));
         await run();
-        assert.strictEqual(reported.length, 0, "no parts for a usage-only chunk");
+        assert.deepStrictEqual(textReported(), [], "no text parts for a usage-only chunk");
         assert.deepStrictEqual(getLastStreamUsage(), {
             prompt_tokens: 1,
             completion_tokens: 2,
             total_tokens: 3,
         });
+        assert.deepStrictEqual(usagePayload(), {
+            prompt_tokens: 1,
+            completion_tokens: 2,
+            total_tokens: 3,
+            prompt_tokens_details: { cached_tokens: 0 },
+        });
+    });
+
+    test("captures a usage chunk that carries an empty choices array", async () => {
+        const body = sseBody([
+            { choices: [{ delta: { content: "hi" } }] },
+            {
+                choices: [],
+                usage: {
+                    prompt_tokens: 11,
+                    completion_tokens: 22,
+                    total_tokens: 33,
+                    prompt_tokens_details: { cached_tokens: 7 },
+                    cost: 0.0042,
+                },
+            },
+        ]);
+        nextResponses.push(() => streamResponse(body));
+        await run();
+        assert.deepStrictEqual(usagePayload(), {
+            prompt_tokens: 11,
+            completion_tokens: 22,
+            total_tokens: 33,
+            prompt_tokens_details: { cached_tokens: 7 },
+            copilot_usage: { total_nano_aiu: 4_200_000 },
+        });
+    });
+
+    test("appends no cost line to the response any more (moved to the panel)", async () => {
+        const body = sseBody([
+            { provider: "Fireworks", choices: [{ delta: { content: "done" } }] },
+            usageChunk("Fireworks", 41821, 12, 0.00308, 41200),
+        ]);
+        nextResponses.push(() => streamResponse(body));
+        await run();
+        assert.deepStrictEqual(costLines(), [], "the chat text carries no cost footer");
+        assert.deepStrictEqual(
+            textReported().map((p) => (p as { value: string }).value),
+            ["done"],
+            "only the model's own text"
+        );
+    });
+
+    test("accumulates a tool-using turn across its separate model calls", async () => {
+        // Copilot drives a tool-using turn as one call per tool round, so the same
+        // session id arrives twice. Both must land in one session total.
+        const opts = { tools: undefined, modelConfiguration: undefined, modelOptions: { _conversationId: "conv-agg" } };
+        const first = sseBody([
+            { provider: "Fireworks", choices: [{ delta: { content: "calling" } }] },
+            usageChunk("Fireworks", 1000, 50, 0.001, 900),
+        ]);
+        const second = sseBody([
+            { provider: "Fireworks", choices: [{ delta: { content: "answer" } }] },
+            usageChunk("Fireworks", 2000, 20, 0.002, 1900),
+        ]);
+        nextResponses.push(() => streamResponse(first), () => streamResponse(second));
+        await runWith(opts);
+        await runWith(opts);
+
+        const session = getSessionCost("copilot-chat:conv-agg");
+        assert.ok(session, "the session was tracked");
+        assert.strictEqual(session!.calls, 2, "both model calls counted");
+        assert.strictEqual(session!.paid, 0.003, "the two calls are summed");
+        assert.strictEqual(session!.promptTokens, 3000);
+        assert.strictEqual(session!.completionTokens, 70);
+        assert.strictEqual(session!.cachedTokens, 2800);
+    });
+
+    test("keeps separate sessions apart and splits routes by provider and model", async () => {
+        const a = { tools: undefined, modelConfiguration: undefined, modelOptions: { _conversationId: "conv-a" } };
+        const b = { tools: undefined, modelConfiguration: undefined, modelOptions: { _conversationId: "conv-b" } };
+        const byok = sseBody([{ provider: "Fireworks", choices: [{ delta: { content: "x" } }] }, usageChunk("Fireworks", 100, 5, 0.001, 0)]);
+        const shared = sseBody([
+            { provider: "Morph", choices: [{ delta: { content: "y" } }] },
+            { provider: "Morph", choices: [{ delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 10, completion_tokens: 1, total_tokens: 11, cost: 0.0005, prompt_tokens_details: { cached_tokens: 0 } } },
+        ]);
+        nextResponses.push(() => streamResponse(byok), () => streamResponse(shared), () => streamResponse(byok));
+        await runWith(a);
+        await runWith(a);
+        await runWith(b);
+
+        const sessionA = getSessionCost("copilot-chat:conv-a")!;
+        const sessionB = getSessionCost("copilot-chat:conv-b")!;
+        assert.strictEqual(sessionA.calls, 2);
+        assert.strictEqual(sessionA.routes.length, 2, "a session can mix providers");
+        assert.ok(sessionA.paid > sessionB.paid, "session B holds only the cheaper turn");
+        assert.strictEqual(sessionB.calls, 1);
+        // The mixed session must separate BYOK from OpenRouter spend.
+        assert.ok(sessionA.byok, "the session used a BYOK route at some point");
+        assert.ok(sessionA.openRouter > 0, "and an OpenRouter-charged route");
+        assert.ok(sessionA.upstream > 0);
+    });
+
+    test("an internal call with no conversation id folds into the parent chat", async () => {
+        resetSessionCostsForTesting();
+        resetParentAttributionForTesting();
+        const chat = { tools: undefined, modelConfiguration: undefined, modelOptions: { _conversationId: "parent-chat" } };
+        // What a sub-agent call looks like to a provider: no `_conversationId`.
+        const subagent = { tools: undefined, modelConfiguration: undefined, modelOptions: {} };
+        const body = sseBody([{ provider: "Fireworks", choices: [{ delta: { content: "x" } }] }, usageChunk("Fireworks", 100, 5, 0.001, 0)]);
+        nextResponses.push(() => streamResponse(body), () => streamResponse(body));
+        await runWith(chat);
+        await runWith(subagent);
+
+        const sessions = getSessionCosts();
+        assert.strictEqual(sessions.length, 1, "no separate entry for the internal call");
+        assert.strictEqual(sessions[0].sessionId, "copilot-chat:parent-chat");
+        assert.strictEqual(sessions[0].calls, 2, "both calls counted on the parent");
+        assert.strictEqual(sessions[0].paid, 0.002, "and both costs");
+    });
+
+    test("a call with no payable cost adds nothing to the session", async () => {
+        const opts = { tools: undefined, modelConfiguration: undefined, modelOptions: { _conversationId: "conv-free" } };
+        const noCost = sseBody([
+            { choices: [{ delta: { content: "hi" } }] },
+            { choices: [{ delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 5, completion_tokens: 5, total_tokens: 10 } },
+        ]);
+        nextResponses.push(() => streamResponse(noCost));
+        await runWith(opts);
+        assert.strictEqual(getSessionCost("copilot-chat:conv-free"), undefined, "nothing is tracked for a costless turn");
+    });
+
+    test("getSessionCost returns a snapshot that cannot mutate the live session", () => {
+        resetSessionCostsForTesting();
+        accumulateSessionCost(
+            "copilot-chat:snap",
+            { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, cost: 0.001, prompt_tokens_details: { cached_tokens: 0 } },
+            "Morph",
+            "m"
+        );
+        const first = getSessionCost("copilot-chat:snap")!;
+        first.routes.length = 0;
+        first.paid = 999;
+        const second = getSessionCost("copilot-chat:snap")!;
+        assert.strictEqual(second.routes.length, 1, "clearing the returned routes array leaves the live one intact");
+        assert.notStrictEqual(second.paid, 999, "writing the returned total does not reach the live session");
+    });
+
+    test("keeps only the 10 most recent sessions, newest first", async () => {
+        resetSessionCostsForTesting();
+        const paid = { prompt_tokens: 10, completion_tokens: 1, total_tokens: 11, cost: 0, is_byok: true, prompt_tokens_details: { cached_tokens: 0 }, cost_details: { upstream_inference_cost: 0.001 } };
+        for (let i = 1; i <= 15; i++) {
+            accumulateSessionCost(`copilot-chat:s${i}`, paid, "Fireworks", "m");
+        }
+        const ids = getSessionCosts().map((s) => s.sessionId.replace("copilot-chat:", ""));
+        assert.strictEqual(ids.length, MAX_TRACKED_SESSIONS, "the cap is enforced");
+        assert.deepStrictEqual(ids, ["s15", "s14", "s13", "s12", "s11", "s10", "s9", "s8", "s7", "s6"]);
+        assert.ok(!ids.includes("s1") && !ids.includes("s5"), "the oldest are the ones dropped");
+    });
+
+    test("the cap still keeps the newest when sessions share a millisecond", () => {
+        resetSessionCostsForTesting();
+        const paid = { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, cost: 0, is_byok: true, prompt_tokens_details: { cached_tokens: 0 }, cost_details: { upstream_inference_cost: 0.001 } };
+        // Regression guard: with equal Date.now() values the ordering must still be
+        // total, otherwise eviction keeps stale sessions and drops fresh ones.
+        for (let i = 1; i <= 12; i++) {
+            accumulateSessionCost(`copilot-chat:t${i}`, paid, "Fireworks", "m");
+        }
+        const ids = getSessionCosts().map((s) => s.sessionId);
+        assert.ok(ids.includes("copilot-chat:t12"), "the newest survives");
+        assert.ok(!ids.includes("copilot-chat:t1"), "the oldest is evicted");
+    });
+
+    test("hydration restores persisted sessions and later calls add to them", () => {
+        resetSessionCostsForTesting();
+        hydrateSessionCosts([
+            { sessionId: "copilot-chat:restored", paid: 0.5, openRouter: 0.5, upstream: 0, promptTokens: 100, completionTokens: 10, cachedTokens: 0, calls: 2, byok: false, updatedAt: 1, routes: [] },
+        ]);
+        const restored = getSessionCost("copilot-chat:restored");
+        assert.ok(restored, "the persisted session is back");
+        assert.strictEqual(restored!.paid, 0.5);
+        assert.strictEqual(restored!.calls, 2);
+        accumulateSessionCost(
+            "copilot-chat:restored",
+            { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, cost: 0.25, prompt_tokens_details: { cached_tokens: 0 } },
+            "Morph",
+            "m"
+        );
+        assert.strictEqual(getSessionCost("copilot-chat:restored")!.paid, 0.75, "spend continues onto the restored total");
+    });
+
+    test("hydration ignores junk persisted entries", () => {
+        resetSessionCostsForTesting();
+        hydrateSessionCosts([
+            null as never,
+            { sessionId: "copilot-chat:ok", paid: 0.1, openRouter: 0.1, upstream: 0, promptTokens: 1, completionTokens: 1, cachedTokens: 0, calls: 1, byok: false, updatedAt: 1, routes: [] },
+            { sessionId: 42 as never, paid: 0.1 } as never,
+            { sessionId: "copilot-chat:bad", paid: Number.NaN } as never,
+        ]);
+        assert.deepStrictEqual(getSessionCosts().map((s) => s.sessionId), ["copilot-chat:ok"]);
+    });
+
+    test("hydration drops legacy entries for unidentified calls", () => {
+        resetSessionCostsForTesting();
+        hydrateSessionCosts([
+            // A bare per-window UUID as an earlier revision persisted it.
+            { sessionId: "e21ba4ca-bfcd-40f5-a5c5-02f19cd4a98d", paid: 0.0005, openRouter: 0, upstream: 0.0005, promptTokens: 1, completionTokens: 1, cachedTokens: 0, calls: 2, byok: true, updatedAt: 1, routes: [] },
+            { sessionId: "copilot-chat:real", paid: 0.25, openRouter: 0, upstream: 0.25, promptTokens: 1, completionTokens: 1, cachedTokens: 0, calls: 3, byok: true, updatedAt: 2, routes: [] },
+        ]);
+        assert.deepStrictEqual(
+            getSessionCosts().map((s) => s.sessionId),
+            ["copilot-chat:real"],
+            "stray non-chat entries are cleaned up on load"
+        );
+    });
+
+    test("a costless turn appends nothing and tracks nothing", async () => {
+        const body = sseBody([
+            { choices: [{ delta: { content: "text only" } }] },
+            { choices: [{ delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 5, completion_tokens: 5, total_tokens: 10 } },
+        ]);
+        nextResponses.push(() => streamResponse(body));
+        await run();
+        assert.deepStrictEqual(costLines(), [], "a costless turn appends nothing");
+        assert.deepStrictEqual(
+            textReported().map((p) => (p as { value: string }).value),
+            ["text only"]
+        );
+    });
+
+    test("a turn cancelled before any output appends neither a usage part nor a cost line", async () => {
+        const body = sseBody([
+            { provider: "Fireworks", choices: [{ delta: { content: "partial" } }] },
+            {
+                provider: "Fireworks",
+                choices: [{ delta: {}, finish_reason: "stop" }],
+                usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, cost: 0, cost_details: { upstream_inference_cost: 1e-5 } },
+            },
+        ]);
+        const cancelledToken = {
+            isCancellationRequested: true,
+            onCancellationRequested: () => ({ dispose: () => { } }),
+        } as unknown as vscode.CancellationToken;
+        nextResponses.push(() => streamResponse(body));
+        const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
+        let threw = false;
+        try {
+            await provider.provideLanguageModelChatResponse(model, [], options, progress as never, cancelledToken as never);
+        } catch {
+            threw = true;
+        }
+        assert.ok(threw, "an already-cancelled request raises CancellationError");
+        assert.deepStrictEqual(costLines(), [], "a cancelled turn shows no cost line");
+        assert.deepStrictEqual(usageParts(), [], "and no usage part");
+    });
+
+    test("reports the usage part at the end of a turn", async () => {
+        const body = sseBody([
+            { choices: [{ delta: { content: "a" } }] },
+            { choices: [{ delta: { content: "b" } }] },
+            {
+                choices: [{ delta: {}, finish_reason: "stop" }],
+                usage: { prompt_tokens: 5, completion_tokens: 6, total_tokens: 11, cost: 0.5 },
+            },
+        ]);
+        nextResponses.push(() => streamResponse(body));
+        await run();
+        assert.deepStrictEqual(
+            textReported().map((p) => (p as { value: string }).value),
+            ["a", "b"],
+            "the response text is the model's own output only"
+        );
+        assert.strictEqual(usageParts().length, 1);
+    });
+
+    test("sends no usage part when the stream carried no recognizable usage chunk", async () => {
+        const body = sseBody([{ choices: [{ delta: { content: "only text" } }] }]);
+        nextResponses.push(() => streamResponse(body));
+        await run();
+        assert.deepStrictEqual(usageParts(), [], "no usage part without a usage chunk");
     });
 
     test("flattens delta.reasoning_details: summary to thinking, response.output_text to text", async () => {
@@ -680,7 +1481,7 @@ suite("provideLanguageModelChatResponse (stubbed stream)", () => {
     test("a request cancelled up front makes no network calls", async () => {
         const cancelledToken = {
             isCancellationRequested: true,
-            onCancellationRequested: () => ({ dispose: () => {} }),
+            onCancellationRequested: () => ({ dispose: () => { } }),
         } as unknown as vscode.CancellationToken;
         const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
         let calls = 0;
@@ -702,7 +1503,7 @@ suite("provideLanguageModelChatResponse (stubbed stream)", () => {
     test("catalog fetch does not retry when cancellation lands during backoff", async () => {
         const token = {
             isCancellationRequested: false,
-            onCancellationRequested: () => ({ dispose: () => {} }),
+            onCancellationRequested: () => ({ dispose: () => { } }),
         } as unknown as vscode.CancellationToken;
         const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
         let calls = 0;
@@ -720,7 +1521,7 @@ suite("provideLanguageModelChatResponse (stubbed stream)", () => {
             );
         } finally {
             globalThis.fetch = original;
-            setRetryDelayForTesting(async () => {});
+            setRetryDelayForTesting(async () => { });
         }
         assert.strictEqual(calls, 1, "no retry after the token was cancelled during backoff");
     });
@@ -831,12 +1632,120 @@ suite("provideLanguageModelChatResponse (stubbed stream)", () => {
         assert.strictEqual(call.name, "get_info");
         assert.deepStrictEqual(call.input, { q: "x" });
     });
+
+    test("two overlapping calls report their own usage and cost (per-call stream state)", async () => {
+        resetSessionCostsForTesting();
+        resetParentAttributionForTesting();
+        const a = controlledSse();
+        const b = controlledSse();
+        nextResponses.push(() => a.response, () => b.response);
+        const aParts: unknown[] = [];
+        const bParts: unknown[] = [];
+        const progressA = { report: (p: unknown) => { aParts.push(p); } };
+        const progressB = { report: (p: unknown) => { bParts.push(p); } };
+        const events: TurnCost[] = [];
+        const sub = onTurnCost((c) => events.push(c));
+        try {
+            const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
+            const optsA = { tools: undefined, modelConfiguration: undefined, modelOptions: { _conversationId: "conv-a" } };
+            const optsB = { tools: undefined, modelConfiguration: undefined, modelOptions: { _conversationId: "conv-b" } };
+            const runA = provider.provideLanguageModelChatResponse(model, [], optsA as never, progressA as never, token as never);
+            await tick();
+            const runB = provider.provideLanguageModelChatResponse(model, [], optsB as never, progressB as never, token as never);
+            let guard = 0;
+            while (fetchCalls.length < 2 && guard++ < 100) {
+                await tick();
+            }
+            assert.strictEqual(fetchCalls.length, 2, "both calls are in flight together");
+            // B finishes first: with module-global state its usage would clobber A's report.
+            b.push(`data: ${JSON.stringify({ provider: "Morph", choices: [{ delta: { content: "b" } }], usage: { prompt_tokens: 200, completion_tokens: 2, total_tokens: 202, cost: 0.002 } })}\n\n`);
+            b.push("data: [DONE]\n\n");
+            b.close();
+            await runB;
+            a.push(`data: ${JSON.stringify({ provider: "Fireworks", choices: [{ delta: { content: "a" } }], usage: { prompt_tokens: 10, completion_tokens: 1, total_tokens: 11, cost: 0, is_byok: true, cost_details: { upstream_inference_cost: 1e-5 } } })}\n\n`);
+            a.push("data: [DONE]\n\n");
+            a.close();
+            await runA;
+
+            const usageOf = (parts: unknown[]): Record<string, unknown> =>
+                JSON.parse(
+                    new TextDecoder().decode(
+                        (parts.filter(
+                            (p): p is vscode.LanguageModelDataPart =>
+                                p instanceof vscode.LanguageModelDataPart && p.mimeType === "usage"
+                        )[0]).data
+                    )
+                );
+            assert.strictEqual(usageOf(aParts).prompt_tokens, 10, "call A reports its own usage, not B's");
+            assert.strictEqual(usageOf(bParts).prompt_tokens, 200, "call B reports its own usage");
+            assert.strictEqual(getSessionCost("copilot-chat:conv-a")!.paid, 1e-5, "A's session gets A's provider cost");
+            assert.strictEqual(getSessionCost("copilot-chat:conv-b")!.paid, 0.002);
+            assert.deepStrictEqual(
+                events.map((e) => e.provider).sort(),
+                ["Fireworks", "Morph"],
+                "each cost event carries its own serving provider"
+            );
+        } finally {
+            sub.dispose();
+            resetSessionCostsForTesting();
+            resetParentAttributionForTesting();
+        }
+    });
+
+    test("a POST that never responds times out with a friendly error and is attempted once", async () => {
+        const original = globalThis.fetch;
+        let calls = 0;
+        globalThis.fetch = ((_input: unknown, init?: RequestInit) => {
+            calls++;
+            return new Promise<Response>((_resolve, reject) => {
+                init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+            });
+        }) as typeof fetch;
+        setPostTimeoutForTesting(20);
+        try {
+            const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
+            await assert.rejects(
+                provider.provideLanguageModelChatResponse(model, [], options, progress as never, token as never),
+                (err: Error) => /did not respond within/.test(err.message)
+            );
+            assert.strictEqual(calls, 1, "a timeout abort is never retried");
+        } finally {
+            globalThis.fetch = original;
+            setPostTimeoutForTesting(60_000);
+        }
+    });
+
+    test("cancellation landing between reads rejects with CancellationError", async () => {
+        const ctrl = controlledSse();
+        nextResponses.push(() => ctrl.response);
+        const mutableToken = {
+            isCancellationRequested: false,
+            onCancellationRequested: () => ({ dispose: () => { } }),
+        };
+        const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
+        const run = provider.provideLanguageModelChatResponse(
+            model,
+            [],
+            options,
+            progress as never,
+            mutableToken as unknown as vscode.CancellationToken
+        );
+        let guard = 0;
+        while (fetchCalls.length < 1 && guard++ < 100) {
+            await tick();
+        }
+        ctrl.push(`data: ${JSON.stringify({ choices: [{ delta: { content: "first" } }] })}\n\n`);
+        await tick();
+        mutableToken.isCancellationRequested = true;
+        ctrl.push(`data: ${JSON.stringify({ choices: [{ delta: { content: "second" } }] })}\n\n`);
+        await assert.rejects(run, (err: unknown) => err instanceof vscode.CancellationError);
+    });
 });
 
 suite("provideTokenCount", () => {
     const token = {
         isCancellationRequested: false,
-        onCancellationRequested: () => ({ dispose: () => {} }),
+        onCancellationRequested: () => ({ dispose: () => { } }),
     } as unknown as vscode.CancellationToken;
     const model = { id: "m" } as unknown as vscode.LanguageModelChatInformation;
 
@@ -860,7 +1769,7 @@ suite("provideTokenCount", () => {
 suite("preset model entries (catalog + presets)", () => {
     const token = {
         isCancellationRequested: false,
-        onCancellationRequested: () => ({ dispose: () => {} }),
+        onCancellationRequested: () => ({ dispose: () => { } }),
     } as unknown as vscode.CancellationToken;
 
     function jsonResponse(body: unknown, status = 200): Response {
@@ -970,7 +1879,7 @@ suite("preset model entries (catalog + presets)", () => {
             );
             assert.ok(info.some((m) => m.id === "z-ai/glm-5.3-flash"), "catalog entries still listed");
             assert.deepStrictEqual(
-                (await provider.getPresets()).map((p) => [p.slug, p.model]),
+                (await provider.getPresets())!.map((p) => [p.slug, p.model]),
                 [
                     ["faster-glm-flash", "z-ai/glm-5.3-flash-20260826"],
                     ["faster-deepseek-flash", "deepseek/deepseek-v4-flash-20260731"],
@@ -995,7 +1904,11 @@ suite("preset model entries (catalog + presets)", () => {
                 const info = await provider.provideLanguageModelChatInformation({ silent: true } as never, token as never);
                 assert.strictEqual(info.length, 1);
                 assert.strictEqual(info[0].id, "z-ai/glm-5.3-flash");
-                assert.deepStrictEqual(await provider.getPresets(), []);
+                assert.strictEqual(
+                    await provider.getPresets(),
+                    undefined,
+                    "a failed sweep reports undefined, not an empty list"
+                );
             }
         );
     });
@@ -1020,7 +1933,7 @@ suite("preset model entries (catalog + presets)", () => {
                 throw new Error(`unexpected fetch: ${url}`);
             },
             async () => {
-                const presets = await provider.getPresets();
+                const presets = (await provider.getPresets())!;
                 assert.deepStrictEqual(presets.map((p) => p.slug), ["faster-glm-flash"]);
                 const again = await provider.getPresets();
                 assert.strictEqual(again, presets, "the second call reuses the cache");
@@ -1147,7 +2060,7 @@ suite("preset model entries (catalog + presets)", () => {
                 throw new Error(`unexpected fetch: ${url}`);
             },
             async () => {
-                const presets = await provider.getPresets();
+                const presets = (await provider.getPresets())!;
                 assert.strictEqual(presets.length, 30, "all active presets stay visible to the panel");
                 const info = await provider.provideLanguageModelChatInformation({ silent: true } as never, token as never);
                 const entries = info.filter((m) => m.id.startsWith("@preset/"));
@@ -1159,6 +2072,18 @@ suite("preset model entries (catalog + presets)", () => {
                 assert.ok(
                     presets.slice(25).every((p) => p.model === undefined),
                     "presets beyond the cap keep no resolved model"
+                );
+                assert.ok(
+                    presets.slice(25).every((p) => p.lookupSkipped === true),
+                    "presets beyond the cap are flagged as lookup-skipped"
+                );
+                assert.ok(
+                    presets.slice(0, 25).every((p) => p.lookupSkipped === undefined),
+                    "resolved presets are never flagged lookup-skipped"
+                );
+                assert.ok(
+                    presets.every((p) => !(p.lookupSkipped === true && p.model !== undefined)),
+                    "a resolved preset is never also marked skipped"
                 );
             }
         );
@@ -1198,7 +2123,7 @@ suite("preset model entries (catalog + presets)", () => {
     test("a transient presets failure is not cached as an empty list", async () => {
         const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
         let healthy = false;
-        setRetryDelayForTesting(async () => {});
+        setRetryDelayForTesting(async () => { });
         await withFetch(
             (url) => {
                 if (url.endsWith("/models")) {
@@ -1219,10 +2144,14 @@ suite("preset model entries (catalog + presets)", () => {
             },
             async () => {
                 try {
-                    assert.deepStrictEqual(await provider.getPresets(), [], "the failed sweep reports no presets");
+                    assert.strictEqual(
+                        await provider.getPresets(),
+                        undefined,
+                        "the failed sweep reports undefined, not an empty list"
+                    );
                     healthy = true;
                     const presets = await provider.getPresets();
-                    assert.deepStrictEqual(presets.map((p) => p.slug), ["faster-glm-flash"], "a later call retries and succeeds");
+                    assert.deepStrictEqual(presets!.map((p) => p.slug), ["faster-glm-flash"], "a later call retries and succeeds");
                 } finally {
                     setRetryDelayForTesting((ms) => new Promise((r) => setTimeout(r, ms)));
                 }
@@ -1250,6 +2179,32 @@ suite("preset model entries (catalog + presets)", () => {
                 const [a, b] = await Promise.all([provider.getPresets(), provider.getPresets()]);
                 assert.strictEqual(a, b, "both callers receive the same sweep result");
                 assert.strictEqual(listRequests, 1, "the list request is not duplicated across concurrent callers");
+            }
+        );
+    });
+
+    test("concurrent catalog calls share one /models fetch", async () => {
+        const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
+        let modelRequests = 0;
+        await withFetch(
+            (url) => {
+                if (url.endsWith("/models")) {
+                    modelRequests++;
+                    return jsonResponse({ data: [{ id: "z-ai/glm-5.3-flash" }] });
+                }
+                if (url.includes("/presets?")) {
+                    return jsonResponse({ data: [] });
+                }
+                throw new Error(`unexpected fetch: ${url}`);
+            },
+            async () => {
+                const [a, b] = await Promise.all([
+                    provider.provideLanguageModelChatInformation({ silent: true } as never, token as never),
+                    provider.provideLanguageModelChatInformation({ silent: true } as never, token as never),
+                ]);
+                assert.strictEqual(modelRequests, 1, "concurrent callers share one in-flight catalog fetch");
+                assert.deepStrictEqual(a.map((m) => m.id), ["z-ai/glm-5.3-flash"]);
+                assert.deepStrictEqual(b.map((m) => m.id), ["z-ai/glm-5.3-flash"]);
             }
         );
     });
@@ -1322,5 +2277,39 @@ suite("stripTemplateComments and setTemplate", () => {
 
         const bad = await provider.setTemplate('// {"a": 1}\nnot json');
         assert.deepStrictEqual(bad, { ok: false, error: "The pasted text is not valid JSON." });
+    });
+});
+
+suite("routeCostLine", () => {
+    const route = (over: Partial<Parameters<typeof routeCostLine>[0]> = {}) => ({
+        provider: "Fireworks",
+        model: "deepseek/deepseek-v4.1-flash",
+        byok: true,
+        paid: 0.4957,
+        openRouter: 0,
+        upstream: 0.4957,
+        promptTokens: 10,
+        completionTokens: 2,
+        cachedTokens: 0,
+        calls: 175,
+        updatedAt: 1,
+        ...over,
+    });
+
+    test("a BYOK route names the provider once, marked (BYOK)", () => {
+        assert.strictEqual(
+            routeCostLine(route()),
+            "$0.4957 \u00b7 Fireworks (BYOK) \u00b7 deepseek/deepseek-v4.1-flash \u00b7 175 call(s)"
+        );
+    });
+
+    test("an OpenRouter-charged route carries no marker", () => {
+        const line = routeCostLine(route({ provider: "Morph", model: "z-ai/glm-5.3-flash", byok: false, paid: 0.0000291, openRouter: 0.0000291, upstream: 0, calls: 1 }));
+        assert.strictEqual(line, "$0.00002910 \u00b7 Morph \u00b7 z-ai/glm-5.3-flash \u00b7 1 call(s)");
+        assert.ok(!line.includes("(BYOK)"), "no marker on a shared-pool route");
+    });
+
+    test("a route with no model name still reads cleanly", () => {
+        assert.strictEqual(routeCostLine(route({ model: "" })), "$0.4957 \u00b7 Fireworks (BYOK) \u00b7 175 call(s)");
     });
 });

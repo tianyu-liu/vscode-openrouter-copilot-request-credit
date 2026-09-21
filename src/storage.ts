@@ -4,6 +4,12 @@ export const KEY_SECRET = 'openrouterApiKey';
 const LEGACY_KEY_SECRET = 'openrouterCopilot.apiKey';
 const SECRET_TIMEOUT_MS = 10000;
 
+let overrideSecrets: vscode.SecretStorage | undefined;
+
+export function setSecretStorageForTesting(s: vscode.SecretStorage | undefined): void {
+    overrideSecrets = s;
+}
+
 async function readSecret(secrets: vscode.SecretStorage, key: string): Promise<string | undefined> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const value = await Promise.race([
@@ -17,14 +23,15 @@ async function readSecret(secrets: vscode.SecretStorage, key: string): Promise<s
 }
 
 export async function readKey(secrets: vscode.SecretStorage): Promise<string | undefined> {
-    const value = await readSecret(secrets, KEY_SECRET);
+    const store = overrideSecrets ?? secrets;
+    const value = await readSecret(store, KEY_SECRET);
     if (value) {
         return value;
     }
-    const legacy = await readSecret(secrets, LEGACY_KEY_SECRET);
+    const legacy = await readSecret(store, LEGACY_KEY_SECRET);
     if (legacy) {
-        await secrets.store(KEY_SECRET, legacy);
-        await secrets.delete(LEGACY_KEY_SECRET);
+        await store.store(KEY_SECRET, legacy);
+        await store.delete(LEGACY_KEY_SECRET);
     }
     return legacy;
 }

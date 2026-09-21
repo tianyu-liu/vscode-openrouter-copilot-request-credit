@@ -1,7 +1,19 @@
 import * as assert from "assert";
 import * as vscode from "vscode";
-import { createPanelDeps, doRefresh, getStatusText, refresh, stopRefreshTimerForTesting } from "../../extension";
+import { promises as fsp } from "fs";
+import * as os from "os";
+import * as path from "path";
+import {
+    chatSessionsDir,
+    createPanelDeps,
+    doRefresh,
+    getStatusText,
+    readSessionTitleFromDisk,
+    refresh,
+    stopRefreshTimerForTesting,
+} from "../../extension";
 import { handlePanelMessage } from "../../panel";
+import { setSecretStorageForTesting } from "../../storage";
 
 const EXTENSION_ID = "tianyu-liu.openrouter-copilot-request-credit";
 const KEY_STORAGE = "openrouterApiKey";
@@ -23,7 +35,7 @@ const CREDITS_DATA = { total_credits: 100, total_usage: 10 };
 function stubProvider(secrets: vscode.SecretStorage) {
     return {
         setTemplate: async () => ({ ok: true }),
-        clearTemplate: async () => {},
+        clearTemplate: async () => { },
         setKey: async (value: string) => {
             await secrets.store(KEY_STORAGE, value);
         },
@@ -37,7 +49,6 @@ let fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
 let fetchMode: "auto" | "manual" = "auto";
 let creditsShouldFail = false;
 const pending: Array<{ url: string; resolve: (r: Response) => void; reject: (e: Error) => void }> = [];
-let originalFetch: typeof fetch;
 
 function canned(body: unknown, ok = true): Response {
     return new Response(JSON.stringify(body), { status: ok ? 200 : 404 });
@@ -55,7 +66,6 @@ function route(url: string): Response {
 }
 
 function installFetchStub(): void {
-    originalFetch = globalThis.fetch;
     globalThis.fetch = ((input: unknown, init?: RequestInit) => {
         const url = String(input);
         fetchCalls.push({ url, init });
@@ -111,16 +121,16 @@ function fakeSecrets(stored?: string): vscode.SecretStorage {
     } as unknown as vscode.SecretStorage;
 }
 
-suiteSetup(() => {
+function installFetchSuite(): void {
     installFetchStub();
-});
+}
 
-suiteTeardown(() => {
+function teardownFetchSuite(): void {
     stopRefreshTimerForTesting();
     globalThis.fetch = ((input: unknown) => {
         throw new Error(`test run fetched after teardown: ${String(input)}`);
     }) as typeof fetch;
-});
+}
 
 suite("extension manifest", () => {
     test("contributes the provider and its commands", async () => {
@@ -176,6 +186,16 @@ suite("extension manifest", () => {
 });
 
 suite("extension behavior without a key", () => {
+    suiteSetup(() => {
+        installFetchSuite();
+        setSecretStorageForTesting(fakeSecrets());
+    });
+
+    suiteTeardown(() => {
+        setSecretStorageForTesting(undefined);
+        teardownFetchSuite();
+    });
+
     test("activate completes without a key", async () => {
         const ext = vscode.extensions.getExtension(EXTENSION_ID);
         assert.ok(ext, `Extension '${EXTENSION_ID}' should be present`);
@@ -188,6 +208,9 @@ suite("extension behavior without a key", () => {
 });
 
 suite("network isolation (stubbed fetch)", () => {
+    suiteSetup(installFetchSuite);
+    suiteTeardown(teardownFetchSuite);
+
     test("every API request is https and stays on openrouter.ai", async () => {
         await settle();
         const before = fetchCalls.length;
@@ -296,5 +319,45 @@ suite("network isolation (stubbed fetch)", () => {
             await cfg.update("creditLimit", 0, vscode.ConfigurationTarget.Global);
             await settle();
         }
+    });
+});
+
+suite("chat session titles", () => {
+    const storage = vscode.Uri.from({
+        scheme: "file",
+        path: "/c:/Users/tt/AppData/Roaming/Code/User/workspaceStorage/hash/tianyu-liu.openrouter-copilot-request-credit",
+    });
+
+    test("chatSessionsDir resolves the sibling chatSessions folder", () => {
+        const dir = chatSessionsDir(storage);
+        assert.ok(dir, "a dir is derived");
+        assert.ok(dir!.path.endsWith("/workspaceStorage/hash/chatSessions"), dir!.path);
+    });
+
+    test("chatSessionsDir is undefined without workspace storage", () => {
+        assert.strictEqual(chatSessionsDir(undefined), undefined);
+    });
+
+    test("reads the chat title from a session file head", async () => {
+        const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "chatsess-"));
+        try {
+            const file = path.join(dir, "abc.jsonl");
+            await fsp.writeFile(
+                file,
+                [
+                    '{"kind":0,"v":{"sessionId":"abc"}}',
+                    '{"kind":1,"k":["customTitle"],"v":"Named chat"}',
+                    '{"kind":2,"k":["requests"],"v":[]}',
+                ].join("\n")
+            );
+            assert.strictEqual(await readSessionTitleFromDisk(vscode.Uri.file(file)), "Named chat");
+        } finally {
+            await fsp.rm(dir, { recursive: true, force: true });
+        }
+    });
+
+    test("a missing session file yields undefined rather than throwing", async () => {
+        const missing = vscode.Uri.file(path.join(os.tmpdir(), "openrouter-no-such-session-xyz.jsonl"));
+        assert.strictEqual(await readSessionTitleFromDisk(missing), undefined);
     });
 });

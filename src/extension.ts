@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
-import { buildStatus, KeyInfo, maskKey, AccountCredits } from './logic';
+import { promises as fsp } from 'fs';
+import { buildStatus, KeyInfo, maskKey, AccountCredits, parseSessionTitle } from './logic';
 import {
     apiBaseUrl,
     getConfig,
@@ -11,7 +12,7 @@ import {
     templatePresetSlug,
 } from './panel';
 import { readKey } from './storage';
-import { OpenRouterChatProvider } from './provider';
+import { getSessionCosts, onTurnCost, OpenRouterChatProvider, type SessionCost } from './provider';
 
 export { apiBaseUrl, readConfig } from './panel';
 
@@ -22,6 +23,52 @@ let statusBarItem: vscode.StatusBarItem | undefined;
 let refreshTimer: ReturnType<typeof setInterval> | undefined;
 let panel: vscode.WebviewPanel | undefined;
 let provider: OpenRouterChatProvider | undefined;
+let sessionTitleDir: vscode.Uri | undefined;
+
+const SESSION_ID_PREFIX = 'copilot-chat:';
+const CHAT_SESSIONS_DIR = 'chatSessions';
+const SESSION_TITLE_MAX_BYTES = 64 * 1024;
+const SESSION_FILE_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
+
+export function chatSessionsDir(storageUri: vscode.Uri | undefined): vscode.Uri | undefined {
+    if (!storageUri) return undefined;
+    const parts = storageUri.path.split('/');
+    parts.pop();
+    parts.push(CHAT_SESSIONS_DIR);
+    return storageUri.with({ path: parts.join('/') });
+}
+
+export async function readSessionTitleFromDisk(file: vscode.Uri): Promise<string | undefined> {
+    let handle;
+    try {
+        handle = await fsp.open(file.fsPath, 'r');
+    } catch {
+        return undefined;
+    }
+    try {
+        const buffer = Buffer.alloc(SESSION_TITLE_MAX_BYTES);
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+        return parseSessionTitle(buffer.subarray(0, bytesRead).toString('utf8'));
+    } catch {
+        return undefined;
+    } finally {
+        await handle.close();
+    }
+}
+
+async function withSessionTitles(sessions: SessionCost[]): Promise<SessionCost[]> {
+    const dir = sessionTitleDir;
+    if (!dir) return sessions;
+    return Promise.all(
+        sessions.map(async (session) => {
+            if (session.title || !session.sessionId.startsWith(SESSION_ID_PREFIX)) return session;
+            const id = session.sessionId.slice(SESSION_ID_PREFIX.length);
+            if (!SESSION_FILE_ID_PATTERN.test(id)) return session;
+            const title = await readSessionTitleFromDisk(vscode.Uri.joinPath(dir, `${id}.jsonl`));
+            return title ? { ...session, title } : session;
+        })
+    );
+}
 
 let lastInfo: KeyInfo | undefined;
 let lastFetchAt: Date | undefined;
@@ -127,6 +174,8 @@ async function updatePanel(
     const presetSlug = templatePresetSlug(template);
     const presetConfig = presetSlug && provider ? await provider.getPresetConfig(presetSlug) : undefined;
     if (stale()) return;
+    const sessions = await withSessionTitles(getSessionCosts());
+    if (stale()) return;
     panel.webview.html = renderPanelHtml(
         info,
         limit,
@@ -139,7 +188,8 @@ async function updatePanel(
         lastErrorMessage,
         template,
         presets,
-        presetConfig
+        presetConfig,
+        sessions
     );
 }
 
@@ -264,10 +314,14 @@ export function refresh(secrets: vscode.SecretStorage): Promise<KeyInfo | undefi
 
 export function activate(context: vscode.ExtensionContext): void {
     provider = new OpenRouterChatProvider(context.secrets, context.globalState);
+    sessionTitleDir = chatSessionsDir(context.storageUri);
 
     context.subscriptions.push(
         vscode.lm.registerLanguageModelChatProvider('openrouter-copilot-request-credit', provider)
     );
+
+    // Keep an open panel's session-spend list current as turns finish.
+    context.subscriptions.push(onTurnCost(() => void updatePanel(context.secrets, lastInfo).catch(() => undefined)));
 
     statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
     context.subscriptions.push(statusBarItem);
@@ -329,5 +383,6 @@ export function deactivate(): void {
     statusBarItem = undefined;
     panel?.dispose();
     panel = undefined;
+    provider?.dispose();
     provider = undefined;
 }

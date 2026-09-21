@@ -1,11 +1,17 @@
 import * as vscode from 'vscode';
 import { randomBytes } from 'crypto';
-import { presetSlugFromPickerValue, stripTemplateComments } from './provider';
+import {
+    presetSlugFromPickerValue,
+    stripTemplateComments,
+    routeCostLine,
+    MAX_TRACKED_SESSIONS,
+    type SessionCost,
+} from './provider';
 import {
     buildDetail,
     formatReset,
+    formatUsdPrecise,
     KeyInfo,
-    maskKey,
     ResetPeriod,
     resetPeriodLabel,
     AccountCredits,
@@ -82,6 +88,51 @@ export interface PresetRow {
     slug: string;
     name: string;
     model?: string;
+    lookupSkipped?: boolean;
+}
+
+/**
+ * Render the window's spend as a list of collapsible sessions. Only one session
+ * is expanded at a time (the newest with spend), and each expanded session lists
+ * its per-provider/model routes, since one session can mix a BYOK host with an
+ * OpenRouter-hosted model.
+ *
+ * The markup is `<details>`, so expansion works without any script and survives
+ * the panel being re-rendered on every message.
+ */
+export function renderSessionCosts(sessions: SessionCost[] | undefined): string {
+    const withSpend = (sessions ?? []).filter(s => s.paid > 0);
+    if (withSpend.length === 0) {
+        return '<p class="muted">No OpenRouter spend recorded yet. Totals appear here once a turn reports a cost.</p>';
+    }
+    const rows = withSpend
+        .map((session, index) => {
+            const short = session.sessionId.replace(/^copilot-chat:/, '');
+            const label = session.title ?? `${short.slice(0, 8)}${short.length > 8 ? '\u2026' : ''}`;
+            const open = index === 0 ? ' open' : '';
+            const routeRows = session.routes
+                .map(r => `<li class="route">${esc(routeCostLine(r))}</li>`)
+                .join('');
+            const cacheShare = session.promptTokens > 0
+                ? ` \u00b7 ${((session.cachedTokens / session.promptTokens) * 100).toFixed(1)}% cached`
+                : '';
+            const updated = session.updatedAt >= 1e12 ? formatReset(new Date(session.updatedAt), true) : undefined;
+            return `<details class="session"${open}>
+                        <summary>
+                            <span class="sessioncost">${esc(formatUsdPrecise(session.paid))}</span>
+                            <span class="sessionname">${esc(label)}</span>
+                            <span class="muted">${esc(String(session.calls))} call(s)${esc(cacheShare)}</span>
+                            ${updated ? `<span class="muted sessiontime">${esc(updated)}</span>` : ''}
+                        </summary>
+                        <div class="sessionbody">
+                            <ul class="routes">${routeRows}</ul>
+                            <p class="muted">OpenRouter session <code>${esc(session.sessionId)}</code></p>
+                        </div>
+                    </details>`;
+        })
+        .join('');
+    return `${rows}
+        <p class="muted">One entry per Copilot chat session (<code>session_id</code>), newest first, up to the ${MAX_TRACKED_SESSIONS} most recent. Named from the chat title when VS Code has one, otherwise the id; times are local. Stored locally and kept across window reloads.</p>`;
 }
 
 export function renderPanelHtml(
@@ -96,7 +147,8 @@ export function renderPanelHtml(
     errorMessage?: string,
     template?: Record<string, unknown>,
     presets?: PresetRow[],
-    presetConfig?: Record<string, unknown>
+    presetConfig?: Record<string, unknown>,
+    sessions?: SessionCost[]
 ): string {
     const nonce = randomBytes(16).toString('hex');
     const detail = info ? buildDetail(info, limit, resetPeriod, includeByok, accountCredits) : undefined;
@@ -151,6 +203,7 @@ export function renderPanelHtml(
                 <label class="optlabel"><input type="checkbox" id="includeByok" ${byokChecked ? 'checked' : ''} ${controlsEnabled ? '' : 'disabled'} /> BYOK included</label>
            </div>`
         : '';
+    const sessionCostHtml = renderSessionCosts(sessions);
     const updatedLine = `<div class="keyline updatedline">
             <label class="optlabel">Auto-refresh (min)</label>
             <input type="number" id="refreshInterval" min="1" step="1" value="${esc(String(refreshIntervalMinutes))}" class="intervalinput" />
@@ -161,15 +214,15 @@ export function renderPanelHtml(
     const selectedPreset = templatePresetSlug(template) ?? '';
     const presetComment = template && presetConfig && selectedPreset !== ''
         ? JSON.stringify(presetConfig, null, 2)
-              .split('\n')
-              .map((line) => `// ${line}`)
-              .join('\n')
+            .split('\n')
+            .map((line) => `// ${line}`)
+            .join('\n')
         : '';
     const templateJson = JSON.stringify(presetComment ? `${templateValue}\n${presetComment}` : templateValue).replace(/</g, '\\u003c');
     const currentPreset = selectedPreset;
     const presetOptions: Array<{ slug: string; label: string }> = (presets ?? []).map(p => ({
         slug: p.slug,
-        label: `${p.name}${p.model ? ` \u2192 ${p.model}` : ' (routing profile)'}`,
+        label: `${p.name}${p.model ? ` \u2192 ${p.model}` : p.lookupSkipped ? ' (lookup skipped)' : ' (routing profile)'}`,
     }));
     if (currentPreset !== '' && !presetOptions.some(p => p.slug === currentPreset)) {
         presetOptions.push({ slug: currentPreset, label: `${currentPreset} (not in list)` });
@@ -177,17 +230,19 @@ export function renderPanelHtml(
     const presetSelectHtml = `<select id="presetSelect">
             <option value="" ${currentPreset === '' ? 'selected' : ''}>No preset loaded</option>
             ${presetOptions
-                .map(
-                    (p) => `<option value="${esc(p.slug)}" ${p.slug === currentPreset ? 'selected' : ''}>${esc(p.label)}</option>`
-                )
-                .join('')}
+            .map(
+                (p) => `<option value="${esc(p.slug)}" ${p.slug === currentPreset ? 'selected' : ''}>${esc(p.label)}</option>`
+            )
+            .join('')}
         </select>`;
-    const presetsHint = presets !== undefined && presets.length === 0
-        ? '<p class="muted">No presets found for this key.</p>'
-        : '';
+    const presetsHint = presets === undefined
+        ? '<p class="muted">Presets could not be loaded for this key.</p>'
+        : presets.length === 0
+            ? '<p class="muted">No presets found for this key.</p>'
+            : '';
     const footnoteRows: Array<[string, string]> = [
         ['fn-1', '<code>stream</code> \u2014 always on; responses stream token-by-token.'],
-        ['fn-2', '<code>session_id</code> \u2014 a per-window random ID is always sent, so OpenRouter keeps your prompt cache warm and groups your requests in Activity.'],
+        ['fn-2', '<code>session_id</code> \u2014 one OpenRouter session per Copilot chat session: the chat session\u2019s own id (which VS Code persists) is sent, so your prompt cache stays warm and every turn of that chat, reload or restart included, stays under one session in OpenRouter\u2019s Logs \u2192 Sessions view. When Copilot sends no chat-session id (an internal sub-agent call), the most recently active chat\u2019s id is used instead; if no chat is known, no <code>session_id</code> is sent at all \u2014 there is no per-window random ID.'],
         ['fn-3', 'Applied to every Copilot Chat request to OpenRouter until cleared; each turn the live conversation and tools are merged in, so any pasted <code>messages</code>/<code>prompt</code>/<code>model</code> fields are ignored.'],
         ['fn-4', 'Reasoning effort / enabled \u2014 taken from the model picker\u2019s Thinking Effort selector and spread into the template\u2019s <code>reasoning</code> object (overwrites <code>effort</code>/<code>enabled</code> only; other keys like <code>max_tokens</code>/<code>exclude</code> survive).'],
         ['fn-5', 'No built-in defaults \u2014 everything you paste, including a <code>provider</code> object, is sent verbatim to every request, with no separate UI for it.'],
@@ -195,6 +250,7 @@ export function renderPanelHtml(
         ['fn-7', 'Key storage (SecretStorage) and the https-only base URL are not configurable.'],
         ['fn-8', 'Anthropic-family models (<code>anthropic/*</code>) get a top-level <code>cache_control</code> (a 5-minute ephemeral breakpoint that advances with the conversation) unless your template sets its own <code>cache_control</code>.'],
         ['fn-9', 'Presets \u2014 selecting a preset in the Presets section sends <code>"preset": "&lt;slug&gt;"</code> with every request; model presets also appear in the model picker as <code>@preset/&lt;slug&gt;</code>. Picker preset entries only affect turns on that entry \u2014 other models are untouched while the custom request is empty. If both are set, the picker entry wins as the preset reference (a different <code>preset</code> in the custom request is dropped for that turn) and the custom request\u2019s other fields still apply on top. Preset requests keep the preset\u2019s own provider routing: the extension adds no default <code>provider</code>, so the preset\u2019s routing applies unless a pasted <code>provider</code> overrides it.'],
+        ['fn-10', 'Per-turn usage \u2014 every turn forwards OpenRouter\u2019s own <code>usage</code> chunk (prompt/completion tokens, cache reads) back to Copilot, so the context-usage ring shows used / max tokens. Cost is accumulated per chat session in the <b>Session spend</b> section above, broken down by provider and model: OpenRouter\u2019s <code>cost</code> when OpenRouter charges you, or \u2014 on a BYOK route, where OpenRouter reports <code>cost: 0</code> because the upstream provider bills you \u2014 the upstream cost it reports in <code>cost_details.upstream_inference_cost</code>. Costs are never written into the chat transcript, and Copilot\u2019s own response footer is not reachable by an extension-provided model.'],
     ];
     const footnotesHtml = footnoteRows
         .map(([id, text]) => `<p class="tmplnote"><a id="${id}">${id.slice(3)}.</a> ${text}</p>`)
@@ -268,6 +324,18 @@ export function renderPanelHtml(
     .muted { color: var(--vscode-descriptionForeground, #888); font-style: italic; }
     .tmplnote { font-size: 11px; color: var(--vscode-descriptionForeground, #888); margin: 4px 0 0; }
     .footnotes { margin-top: 10px; }
+    .sessiontotal { font-weight: 600; }
+    .sessioncost { font-family: var(--vscode-editor-font-family, monospace); font-weight: 600; }
+    details.session { border: 1px solid var(--vscode-panel-border, rgba(0,0,0,0.1));
+                      border-radius: 4px; margin: 6px 0; padding: 2px 8px; }
+    details.session summary { cursor: pointer; padding: 6px 0; display: flex; gap: 8px; align-items: baseline; }
+    details.session summary::marker { color: var(--vscode-descriptionForeground, #888); }
+    .sessionname { flex: 1; font-family: var(--vscode-editor-font-family, monospace); font-size: 12px; }
+    .sessiontime { white-space: nowrap; font-size: 11px; }
+    .sessionbody { padding: 0 0 4px 18px; }
+    .sessionbody p { margin: 0; }
+    ul.routes { margin: 0 0 6px; padding-left: 18px; }
+    li.route { font-size: 12px; font-family: var(--vscode-editor-font-family, monospace); margin: 2px 0; }
 
 </style>
 </head>
@@ -289,6 +357,11 @@ export function renderPanelHtml(
         <div class="section-title">Key credit info</div>
         ${detail ? `${limitLine}${modeLine}${usageTable}${freeTierLine}${remainingLine}` : `<p class="muted">No key info yet. Save your API key to fetch usage.</p>`}
         ${updatedLine}
+    </div>
+
+    <div class="section divider">
+        <div class="section-title">Session spend</div>
+        ${sessionCostHtml}
     </div>
 
     <div class="section divider">
@@ -490,6 +563,7 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Pr
                 return;
             }
             deps.syncPresetSelection(presetSlugOf(raw));
+            await deps.doRefresh();
             deps.info('Custom request saved.');
             return;
         }
