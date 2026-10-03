@@ -982,19 +982,19 @@ suite("logic.resetPeriodLabel", () => {
 });
 
 suite("logic.parseSessionTitle", () => {
-    // Captured verbatim from a real chatSessions/<id>.jsonl head.
+    // A representative chatSessions/<id>.jsonl head.
     const HEAD = [
         '{"kind":0,"v":{"version":3,"creationDate":1790008162757,"initialLocation":"panel","sessionId":"0973027a-02a9-4d24-bbc0-2e9e1d53af12"}}',
-        '{"kind":1,"k":["customTitle"],"v":"Confirm work transfer to Windows"}',
+        '{"kind":1,"k":["customTitle"],"v":"Test chat title"}',
         '{"kind":2,"k":["requests"],"v":[]}',
     ].join("\n");
 
     test("reads the customTitle record from the file head", () => {
-        assert.strictEqual(parseSessionTitle(HEAD), "Confirm work transfer to Windows");
+        assert.strictEqual(parseSessionTitle(HEAD), "Test chat title");
     });
 
     test("handles CRLF line endings", () => {
-        assert.strictEqual(parseSessionTitle(HEAD.replace(/\n/g, "\r\n")), "Confirm work transfer to Windows");
+        assert.strictEqual(parseSessionTitle(HEAD.replace(/\n/g, "\r\n")), "Test chat title");
     });
 
     test("a session with no title yields undefined", () => {
@@ -1007,7 +1007,7 @@ suite("logic.parseSessionTitle", () => {
     });
 
     test("a truncated final line does not break the read", () => {
-        assert.strictEqual(parseSessionTitle(`${HEAD}\n{"kind":2,"k":["reque`), "Confirm work transfer to Windows");
+        assert.strictEqual(parseSessionTitle(`${HEAD}\n{"kind":2,"k":["reque`), "Test chat title");
     });
 
     test("tolerates malformed lines elsewhere in the head", () => {

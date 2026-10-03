@@ -6,7 +6,7 @@ A VS Code extension that registers a **customizable OpenRouter provider** in Cop
 
 - Adds an **"OpenRouter: RC"** group to the Copilot Chat model picker with the full OpenRouter catalog (nothing is model-restricted client-side).
 - Lets you **paste a request body** from the [OpenRouter Request Builder](https://openrouter.ai/request-builder) into one panel; its settings — `provider` routing, sampling params, `response_format`, `plugins`, `transforms`, `cache_control`, etc. — apply verbatim to every request until you clear or replace it.
-- **Presets**: pick a preset in the panel to send `"preset": "<slug>"` on every request; presets that pin a model also appear in the picker as `@preset/<slug>` entries (up to the first 25). Picker preset entries affect only turns on that entry.
+- **Presets**: pick a preset from your OpenRouter account in the panel and its routing applies to every request; a preset that pins a model is also offered as an `@preset/<slug>` picker entry.
 - Reasoning models get VS Code's native **Thinking Effort** selector (or a simple on/off toggle); reasoning traces render in chat.
 - Anthropic-family models (`anthropic/*`) automatically get a top-level `cache_control` (unless your pasted body sets its own).
 - Model picker entries show estimated blended price per 1M tokens, context window, max output, and capabilities — and, where OpenRouter charges more above a long-context threshold (e.g. OpenAI GPT above 272K tokens), the base vs stepped price and the input cap that keeps you in the cheaper tier.
@@ -51,25 +51,17 @@ All seven settings are application-scoped: workspace settings cannot change thes
 
 ## Session spend, in the panel
 
-The panel's **Session spend** section shows what each Copilot chat session has cost (persisted across reloads and restarts):
-
-```
-▾ $0.001656  Confirm work transfer to Windows   4 call(s) · 85.7% cached   2026/09/22 01:30:05
-      Cost        Provider          Model                           Calls  Cached
-      $0.001627   Fireworks (BYOK)  deepseek/deepseek-v4.1-flash    3      92.0%
-      $0.00002910 Morph             z-ai/glm-5.3-flash              1      66.8%
-▸ $0.004200  bbbb9999…   1 call(s) · 99.2% cached   2026/09/22 00:58:12
-```
+The panel's **Session spend** section shows what each Copilot chat session has cost (persisted across reloads and restarts). Each session is one collapsible row; expanding it shows a `Cost | Provider | Model | Calls | Cached` row per provider/model route.
 
 - **One entry per chat session** (its OpenRouter `session_id`), newest first, newest expanded. Click to collapse/expand — implemented with `<details>`, so it needs no script.
 - **Named like Copilot names it.** A row is labelled with the Copilot chat **title** when VS Code has one (read locally from VS Code's own chat-session store — nothing is sent to OpenRouter), otherwise a short id; each row also shows the session's **last-update time**.
 - **The 10 most recent sessions** are kept; older ones are dropped as new ones appear.
 - **Internal calls are folded into their chat.** A tool-using turn makes extra model calls for sub-agents and summarization; those are attributed to the chat that triggered them, so their cost lands on the right session instead of creating an entry of its own.
-- **One row per provider/model route** inside a session, because a single session can mix hosts — e.g. most turns on a Fireworks BYOK route plus one turn on an OpenRouter-hosted model. Routes are sorted by cost, highest first.
-- The route label marks `(BYOK)` when your own upstream key is billed (e.g. `Fireworks (BYOK)`); an OpenRouter-charged route carries no marker (e.g. `Morph`).
+- **One row per provider/model route** inside a session, because a single session can mix routes — e.g. most turns on a BYOK route plus one turn on an OpenRouter-hosted model. Routes are sorted by cost, highest first.
+- The route label marks `(BYOK)` when your own upstream key is billed; an OpenRouter-charged route carries no marker.
 - No window-wide total: each session shows its own figure.
 
-**Which figure is reported:** OpenRouter's `usage.cost` when OpenRouter charges you (a shared-pool route). On a **BYOK route OpenRouter reports `cost: 0`** because the upstream provider bills you instead, so the extension falls back to the upstream cost OpenRouter reports for that turn (`usage.cost_details.upstream_inference_cost`) — verified live on Fireworks.
+**Which figure is reported:** OpenRouter's `usage.cost` when OpenRouter charges you (a shared-pool route). On a **BYOK route OpenRouter reports `cost: 0`** because the upstream provider bills you instead, so the extension falls back to the upstream cost OpenRouter reports for that turn (`usage.cost_details.upstream_inference_cost`).
 
 Two properties worth knowing: totals survive across the separate model calls of a tool-using turn (Copilot makes one call per tool round), and they are **stored in your VS Code global state**, so they survive a window reload and a full restart. Costs are micro-dollars in practice, so figures are printed at working precision and never collapse to `$0.00`.
 

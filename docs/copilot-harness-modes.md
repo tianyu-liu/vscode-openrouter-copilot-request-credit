@@ -29,16 +29,16 @@ this file keeps the evidence, the mode inventory and the mode × function matrix
 | Same folder: `dist/copilotCLIShim.js` (~18 KB) | The in-VS-Code Copilot CLI launcher (child process + readline + NLS). Touches no `lm` surface. |
 | VS Code core: `<VS Code install root>/resources/app/out/vs/workbench/api/node/extensionHostProcess.js` and `.../api/worker/extensionHostWorkerMain.js` | The **single** extHost funnel for every provider call, the `modelOptions` pass-through, the progress-part mapping, the public role enum, and the `System`-role rewrite (see §3e). |
 | VS Code core: `.../out/vs/workbench/workbench.desktop.main.js` and `.../out/vs/sessions/sessions.desktop.main.js` | The desktop workbench services — including the agent-host BYOK language-model bridge that can hand our provider to an agent-host session (§2 row P). |
-| `node_modules/@types/vscode/index.d.ts` (1.134.0) | The public contract: `modelOptions?: { [name: string]: any }` is an open bag, so nothing in a mode can be "unsupported" by the API. |
+| `node_modules/@types/vscode/index.d.ts` | The public contract: `modelOptions?: { [name: string]: any }` is an open bag, so nothing in a mode can be "unsupported" by the API. |
 | [`AGENTS.md`](../AGENTS.md) | The list of behaviors to test each mode against. |
 
 **Provenance of the inspected build** (recorded so a later reader can tell whether a re-check is
-against the same host): **VS Code 1.140.0** stable, commit `07f806f999227108933c2e30515b26eecc1fda74`
-(2026-09-30), bundling **`github.copilot-chat` 0.68.0** (`engines.vscode: ^1.140.0`). The built-in
-extension install folder is named after that commit's first 10 characters — so the folder name *does*
-identify the build; it just does not spell out the release version. This repository's own engine pin
-and `@types/vscode` are 1.134.0, i.e. **the host inspected here is newer than the API surface the
-extension compiles against** — which is exactly why §3e exists.
+against the same host): the stable VS Code build installed at audit time and its bundled Copilot
+Chat. This repository's own engine pin and its vendored `@types/vscode` target an API surface that
+lags the installed host, i.e. **the host inspected here is newer than the API surface the extension
+compiles against** — which is exactly why §3e exists. The gap is structural (a released host is
+normally ahead of the types a published extension pins), not a property of one particular version,
+so it should be re-checked against whatever host is installed rather than assumed settled.
 
 Built-in extensions live under a **version-hashed** install folder, so no path in this file is
 quoted from one machine; see the snippet below to locate them locally.
@@ -177,10 +177,10 @@ that a harness mode can take into this extension.
 | J | Harness's own local LMS server (`agentLMServer`) | yes | SSE writer (`event:`/`data:`), `stream:!1`, `location:7`, **no** `conversationId`. |
 | K | Any other extension or SDK client via `vscode.lm` | yes | `requestInitiator` = that extension rather than `"core"`. |
 | L | Heal / apply-patch / string-replace, code mapper, branch naming, speculative edits | yes | Further `makeChatRequest2` call sites, all through the same funnel. |
-| M | In-editor Copilot CLI / agent-host session | **no**, *except* via row P | Its model list comes from the Copilot CLI SDK catalog (`copilotCLISDK.getAvailableModels()`), not `vscode.lm`; the `copilotcli` vendor entry is `"when": "false"` with a no-op response. |
+| M | In-editor Copilot CLI / agent-host session | **no**, *except* via row P | Its model list comes from the Copilot CLI SDK catalog (`copilotCLISDK.getAvailableModels()`), not `vscode.lm`; the `copilotcli` vendor entry is `"when": "false"` with a no-op response. That catalog is also BYOK-gated: it lists us only when the agent host's **own** root config carries `byokModelsEnabled`, which a remote host never receives (§3e item 6). |
 | N | Standalone `copilot` CLI process | **no** | Separate process; never loads a VS Code extension. |
 | O | GitHub cloud coding agent | **no** | Runs remotely; no path to a locally installed provider. |
-| P | Agent-host **client BYOK** bridge (`AgentHostByokLmHandler` behind `AgentHostClientByokLmChannel`) | yes, when `clientByokEnabled` is on | The only non-`vscode.lm` route into this provider: it enumerates `vscode.lm` models and drives `sendChatRequest` on them. Its request bag carries no chat identifier at all, so it never sends a `session_id` and its spend is collected under **Unattributed** (§3e, §3f). |
+| P | Agent-host **client BYOK** bridge (`AgentHostByokLmHandler` behind `AgentHostClientByokLmChannel`) | yes, when `clientByokEnabled` is on **and** the agent host's own `byokModelsEnabled` is `true` | The only non-`vscode.lm` route into this provider: it enumerates `vscode.lm` models and drives `sendChatRequest` on them. Its request bag carries no chat identifier at all, so it never sends a `session_id` and its spend is collected under **Unattributed** (§3e, §3f). **Availability:** the second gate is a `scope:"local"` agent-host root-config key, so a **remote** workspace (WSL, Dev Container, SSH) never gets it — see §3e item 6. |
 
 ## 3. Matrix — extension function × harness mode
 
@@ -236,9 +236,9 @@ behaves the same in every mode, including modes the harness marks as background.
 | BYOK classification | Our vendor makes `_hasByokModels = models.some(m => m.vendor !== "copilot")` true. That is the precondition for the `chat.byokUtilityModelDefault` setting to matter — i.e. the utility-flow orphan-session risk (§2 row I) follows directly from this extension existing. |
 | Harness-emitted cache breakpoints | Not ours: the harness only emits them for vendors in a fixed set (`anthropic`, `gemini`, the built-in `openrouter`) — our vendor id is **not** in it. So the P6 top-level marker is the only cache signal that ever leaves this extension, in every mode. |
 
-### 3e. Runtime capabilities of the host that the 1.134 type surface does not describe
+### 3e. Runtime capabilities of the host that the published type surface does not describe
 
-Everything here was found by reading the 1.140 bundles rather than the API types, and two of the four
+Everything here was found by reading the installed Copilot bundle rather than the API types, and two of the four
 items were **real gaps that this extension closed**. Recorded because a future host build could move
 any of them.
 
@@ -247,7 +247,9 @@ any of them.
 `AgentHostClientByokLmChannel` over `chat` / `models` messages) is the one route that reaches this
 provider without going through core's extHost funnel. It is gated on
 `chat.clientByokEnabled`; when on, it lists the `vscode.lm` models and calls `sendChatRequest` on the
-selected one. Note what it does *not* put on the request: any chat/session identifier (§3f, row P). What it puts on the request:
+selected one. That is only the *client-side* gate — the agent host must also have received
+`byokModelsEnabled` in its own root config, which a remote workspace never does (item 6 below). Note
+what it does *not* put on the request: any chat/session identifier (§3f, row P). What it puts on the request:
 
 | Input | Value | Consequence for this extension |
 | --- | --- | --- |
@@ -272,15 +274,15 @@ BYOK). Fixed: `completion_tokens_details` is now forwarded when it is present an
 omitted otherwise.
 
 **4. Gap closed — a genuine system-role message was downgraded to `user`.** The core runtime's
-`LanguageModelChatMessageRole` has `System = 3` in 1.140 (the enum is exported as the public
-`LanguageModelChatMessageRole`), while `@types/vscode` 1.134 declares only `User = 1` /
-`Assistant = 2` — hence the long-standing "no System member" note in this repo. The harness's own
+`LanguageModelChatMessageRole` has `System = 3` at runtime (the enum is exported as the public
+`LanguageModelChatMessageRole`), while the published type surface this repo compiles against declares
+only `User = 1` / `Assistant = 2` — hence the long-standing "no System member" note in this repo. The harness's own
 transcript enum numbers roles completely differently (`System = 0`, `User = 1`, `Assistant = 2`,
 `Tool = 3`), and core's raw→public rewrite maps raw `0 → 3` before the message reaches a provider. So
 `role: "system"` messages are real in this host, and `toOpenAI` was folding them into `user` (its old
 "everything non-assistant is user" rule). Fixed: a runtime-aware helper maps the `System` role to
 `role: "system"`, resolving the member defensively through a cast so the code still compiles and runs
-against the 1.134 type surface where the member does not exist.
+against a type surface where the member does not exist.
 
 **5. The internal alias budget is now fully explained.** When the harness synthesizes an internal
 alias entry it reports `maxInputTokens = modelMaxPromptTokens − baseCount − 3`. `baseCount` is a
@@ -288,6 +290,78 @@ per-model, per-extension-version cached token count of that model's base prompt 
 use); `3` is a fixed reserve. This is harness-internal bookkeeping and does not change the caps
 reported by this extension — it is recorded only so the §3d context-budget row has no unexplained
 term.
+
+**6. The agent-host BYOK route has a second gate, and that one is local-only.** `chat.clientByokEnabled`
+(§3e item 1) is the *client's* permission. The agent host itself only populates its BYOK model list
+when its **own** root config says so:
+
+```js
+function zw(r){let i=r===!0;return{enabled:i,trace:`enabled: ${i} (root config: ${r??"unset"})`}}
+```
+
+— a **strict** boolean `true`, read from the agent host's root config **file**, never from
+`settings.json`. The declaration carries `agentHost:{key:"byokModelsEnabled",scope:"local"}`, and the
+key is written by the Agent Host settings editor, which is hard-wired to the local identity:
+`var dYe="agent-host-settings",qbo="local"; function $bo(){return f.from({scheme:dYe,authority:qbo,path:"/settings.jsonc"})}`
+(`workbench.action.chat.openAgentHostSettings`, “Open Host Settings”).
+
+The decisive part is the **mirroring filter**. Agent-host settings are mirrored to a host's root
+config only when their declared scope admits that host's kind:
+
+```js
+function Uto(s){return s===YM?0:s.startsWith(`${X.vscodeRemote}://`)?1:2}
+function ubr(s,o){switch(s??"all"){case"all":return!0;case"local":return o===0;case"ambient":return o===0||o===1}}
+```
+
+with `var YM=Symbol("localAgentHostResourceIdentity")`. So `scope:"local"` settings reach **only** kind
+`0` — and a WSL / Dev Container / SSH agent host is a `vscode-remote://` resource, kind `1`. It
+therefore never receives `byokModelsEnabled` (nor `defaultShell`, `runtimePath`, `skillCharBudget`,
+the other three `scope:"local"` agent-host keys). Measured on a WSL-window machine: the remote
+`~/.vscode-server/data/User/globalStorage/agent-host-config.json` holds **53** keys with
+`byokModelsEnabled` **absent**, while the Windows
+`%APPDATA%/Code/User/globalStorage/agent-host-config.json` holds **57** with it `"true"` — the
+difference is exactly those four local-scope keys.
+
+The node entry always asks for the renderer-backed bridge (`byok:{kind:"renderer",bridgeRegistry:R}`);
+an unsupported topology falls back to a stub:
+
+```js
+r.set(BT,i.byok.kind==="renderer"?new De(Sh):new WT)
+var WT=class{start(){return Promise.reject(new Error("BYOK is not supported in this agent host"))}dispose(){}}
+```
+
+**A third gate stacks on top even locally.** The sessions/Agents window refuses any extension that has
+code: `canExecuteOnSessionsWindow` first consults the user setting
+`extensions.supportAgentsWindow`, otherwise (with `extensions.experimental.enableAgentsWindowCapability`)
+`capabilities.agentsWindow.supported` + the `agentsWindowActivation` proposal, and then applies the rule
+*“In the sessions window only extensions that have no code are currently allowed to run”* —
+`if (manifest.main || manifest.browser) return false` — followed by an allow-list check against
+`SESSIONS_WINDOW_ALLOWED_CONTRIBUTION_POINTS` (`themes`, `iconThemes`, `productIconThemes`, `colors`,
+`keybindings`, `jsonValidation`, `jsonValidationRegistry`, `localizations`, `grammars`, `languages`).
+This extension has `main` **and** contributes `languageModelChatProviders`, so it is refused there
+regardless of the model list. (Recorded, not acted on: opting in would only help the *local* case and
+would add a proposed-API dependency.)
+
+**This is an upstream limitation affecting every BYOK/custom-endpoint provider**, not a defect in this
+extension: microsoft/vscode#332085 (“Agents window: BYOK custom-endpoint model not selectable for WSL
+workspaces”, OPEN, labels `bug` + `model-byok`, milestone **Backlog**; vritant24: *“a remote path is
+used to communicate with the agent host in WSL scenarios, and so currently that is not supported …
+Support for WSL is added to the backlog.”*), #339228 (same symptom from a
+`contributes.languageModelChatProviders` extension, closed as a duplicate of #332085), #325738
+(roblourens: *“BYOK is not supported in remote AH yet”*), #329815 (closed with the same maintainer
+statement), #333016 (also reproduces in a **Dev Container**). Related PRs: #338944
+(merged — register late BYOK models on live sessions), #338229 (draft — refresh sessions when BYOK
+models appear). The peer extension `mfenderov/opencode-copilot-sync` documents the identical
+limitation under “Known limitation: Agents window under Remote-WSL” and links #332085.
+
+**Contrast with extension assets (`_customizationRead`).** Skill/instruction customization is handed
+to the agent host as a **list** — `skillDirectories`, `skillReadRoots`, `selectedCapabilityRoots` with
+`location:{type:"environment",environmentId:"local"}` — assembled per environment, whereas the BYOK
+model list hangs off one per-host root-config boolean that the local-scope filter withholds from a
+remote host. That asymmetry is why a WSL-window agent host is observed to see skills from both the
+WSL-side and the Windows-side locations while it still cannot see our models. (The observation is the
+user's, on a test setup; the *mechanism* is code-traced, the environment aggregation itself is
+not.)
 
 ### 3f. Session identity (P11) and spend attribution (P12/P13) per mode
 
@@ -311,7 +385,7 @@ Every row below is decided by the same three questions the extension already key
    to put it on the wire as a `session_id`.
 
 | Mode / entry point | Top-level `conversationId`? | `session_id` sent | Spend bucket | Notes |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | Chat panel, editor, quick chat, agent mode (A–D) | yes — main agent loop (`conversationId: conversation.sessionId`) | own `copilot-chat:<id>` | own entry | Panel label is the chat title read from VS Code's chat-session store; the id itself is restored with the conversation, so OpenRouter Sessions stay continuous across a reload/restart. |
 | Agent rounds inside one turn (B, repeated) | yes — the same loop runs once per tool round (`iterationNumber`) | same own id | same own entry | This is exactly why the store is session-keyed rather than per-invocation: one tool-using turn is many provider calls, and per-call state can never see the whole turn. |
 | Inline chat (E, `location === 4`) | yes — the same agent-loop handler | own inline conversation id | own entry | The driver is shared with chat; only `location` differs. If no chat-session file exists for that conversation, the panel falls back to the truncated id. |
@@ -393,10 +467,8 @@ what closed them, so a future read does not re-open a settled question.
 - **The internal alias-budget reserve is now exact — closed.** `maxInputTokens =
   modelMaxPromptTokens − baseCount − 3`, where `baseCount` is the per-model cached base-prompt token
   count and `3` is the fixed reserve (3e item 5).
-- **Build provenance — closed.** The inspected install was VS Code **1.140.0** stable, commit
-  `07f806f999227108933c2e30515b26eecc1fda74`, shipping `github.copilot-chat` **0.68.0** (engine
-  `^1.140.0`); the install folder name is that commit's prefix. Note this is **newer** than the
-  `^1.134.0` surface this repo targets — see 3e, which exists precisely because of that gap.
+- **Build provenance — closed.** The install inspected was a stable VS Code build newer than the
+  type surface this repo targets — see 3e, which exists precisely because of that gap.
 
 Genuinely residual (do not treat as settled):
 

@@ -10,6 +10,7 @@ import {
     formatUsd,
     longContextTier,
     parsePrice,
+    supportsToolCalling,
     type ModelCatalogEntry,
 } from "../../modelInfo";
 
@@ -108,6 +109,56 @@ suite("long-context pricing", () => {
     test("a model without a tier reports its accurate input budget", () => {
         const info = buildModelInfo({ id: "x/y", context_length: 131072, top_provider: { max_completion_tokens: 16384 } });
         assert.strictEqual(info.maxInputTokens, 114688);
+    });
+
+    test("the auto cap is described as a cap and marked on the detail line", () => {
+        const info = buildModelInfo(OPENAI_LONG_CONTEXT);
+        assert.ok(
+            info.tooltip.includes("Input capped at 272,000 tokens to stay in the base tier"),
+            "the cap in effect is stated"
+        );
+        assert.ok(!info.tooltip.includes("Full window in use"), "not described as the full window");
+        assert.match(info.detail ?? "", / \u00b7 \u2264272K$/, "cap marker on the detail line");
+    });
+
+    test("full policy states the rate boundary instead of a cap", () => {
+        const info = buildModelInfo(OPENAI_LONG_CONTEXT, { policy: "full" });
+        assert.ok(
+            info.tooltip.includes(
+                "Full window in use \u2014 above 272,000 prompt tokens the long-context rate applies."
+            )
+        );
+        assert.ok(!info.tooltip.includes("Input capped at"));
+        assert.ok(!(info.detail ?? "").includes("\u2264"));
+    });
+
+    test("a Custom cap above the threshold states the boundary without claiming the full window", () => {
+        const info = buildModelInfo(OPENAI_LONG_CONTEXT, { overrideTokens: 500000 });
+        assert.ok(info.tooltip.includes("- Above 272,000 prompt tokens the long-context rate applies."));
+        assert.ok(!info.tooltip.includes("Full window in use"));
+        assert.ok(!(info.detail ?? "").includes("\u2264"));
+    });
+
+    test("a budget already below the threshold says the step is out of reach", () => {
+        const m: ModelCatalogEntry = {
+            id: "x-ai/grok-4.5",
+            context_length: 500_000,
+            pricing: {
+                prompt: "0.0000002",
+                completion: "0.0000006",
+                overrides: [{ min_prompt_tokens: 200000, prompt: "0.0000004", completion: "0.0000012" }],
+            },
+            top_provider: { max_completion_tokens: 450_000 },
+        };
+        const info = buildModelInfo(m);
+        assert.strictEqual(info.maxInputTokens, 50_000);
+        assert.ok(
+            info.tooltip.includes(
+                "The long-context rate starts above 200,000 prompt tokens, past this model's reported 50,000-token input budget."
+            )
+        );
+        assert.ok(!info.tooltip.includes("Input capped at"));
+        assert.ok(!(info.detail ?? "").includes("\u2264"));
     });
 });
 
@@ -268,6 +319,29 @@ suite("model info", () => {
         const info = buildModelInfo(m);
         assert.ok(info.tooltip.includes("image input"));
         assert.ok(info.tooltip.includes("no tool calling"));
+    });
+
+    test("tool calling follows the live supported_parameters array", () => {
+        assert.strictEqual(
+            supportsToolCalling({ id: "a/tools", supported_parameters: ["tools", "temperature"] }),
+            true
+        );
+        assert.strictEqual(
+            supportsToolCalling({ id: "a/no-tools", supported_parameters: ["temperature"] }),
+            false
+        );
+        const noTools = buildModelInfo({
+            id: "a/no-tools",
+            supported_parameters: ["temperature"],
+            architecture: { input_modalities: ["text"] },
+        });
+        assert.ok(noTools.tooltip.includes("no tool calling"), "a model without 'tools' is marked text-tool-less");
+    });
+
+    test("tool calling falls back to the legacy boolean when supported_parameters is absent", () => {
+        assert.strictEqual(supportsToolCalling({ id: "a/legacy-yes", supports_tool_parameters: true }), true);
+        assert.strictEqual(supportsToolCalling({ id: "a/legacy-no", supports_tool_parameters: false }), false);
+        assert.strictEqual(supportsToolCalling({ id: "a/unknown" }), true, "absence means assume capable");
     });
 
     test("buildReasoningSchema emits a navigation-grouped Thinking Effort property", () => {

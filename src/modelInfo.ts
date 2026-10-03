@@ -31,12 +31,26 @@ export interface ModelReasoning {
 export interface ModelCatalogEntry {
     id: string;
     name?: string;
+    supported_parameters?: string[];
     supports_tool_parameters?: boolean;
     context_length?: number;
     architecture?: { input_modalities?: string[] };
     pricing?: ModelPricing;
     reasoning?: ModelReasoning;
     top_provider?: { context_length?: number; max_completion_tokens?: number; is_moderated?: boolean };
+}
+
+/**
+ * Whether the catalog says a model can take tools. OpenRouter now publishes the
+ * `supported_parameters` array (with `"tools"` for tool-capable models) and no
+ * longer sends `supports_tool_parameters`; the boolean is kept as a fallback for
+ * older catalogs and fixtures, where absence means "assume capable".
+ */
+export function supportsToolCalling(m: ModelCatalogEntry): boolean {
+    if (Array.isArray(m.supported_parameters)) {
+        return m.supported_parameters.includes('tools');
+    }
+    return m.supports_tool_parameters !== false;
 }
 
 export interface ModelInfo {
@@ -280,7 +294,10 @@ export interface ContextBudgetOptions {
  * The input budget Copilot packs prompts against: the accurate
  * `context_length - max_output_tokens`, or the long-context threshold on
  * `auto`. Per-model Custom caps are applied as stored. No percentage fudge by
- * default; Copilot's own auto-compaction acts on this number.
+ * default; Copilot's own auto-compaction acts on this number. The catalog's
+ * full `max_output_tokens` is reserved rather than Copilot's own
+ * `min(max_output, 15% of window)` rule, so the reported budget never claims
+ * window the output reserve needs.
  */
 export function effectiveMaxInputTokens(m: ModelCatalogEntry, opts: ContextBudgetOptions = {}): number {
     const hasContext = m.context_length != null || m.top_provider?.context_length != null;
@@ -327,7 +344,7 @@ export function buildModelInfo(m: ModelCatalogEntry, opts: ContextBudgetOptions 
         : 0;
 
     const capabilities = [
-        m.supports_tool_parameters !== false ? 'tool calling' : 'no tool calling',
+        supportsToolCalling(m) ? 'tool calling' : 'no tool calling',
         (m.architecture?.input_modalities ?? []).includes('image') ? 'image input' : 'text-only',
     ];
 
@@ -372,7 +389,10 @@ export function buildModelInfo(m: ModelCatalogEntry, opts: ContextBudgetOptions 
     blocks.push(infoLines.join('\n\n'));
 
     const tier = longContextTier(m);
-    const cappedToBase = tier !== undefined && maxInputTokens < tier.threshold;
+    const uncappedBudget = hasContextLength
+        ? Math.max(1, Math.floor((contextWindow ?? ASSUMED_CONTEXT_TOKENS) - maxOutputTokens))
+        : maxInputTokens;
+    const cappedToBase = tier !== undefined && maxInputTokens <= tier.threshold && maxInputTokens < uncappedBudget;
     if (tier && hasPricing) {
         const tierAvgM =
             (T_IN * tier.prompt +
@@ -383,14 +403,22 @@ export function buildModelInfo(m: ModelCatalogEntry, opts: ContextBudgetOptions 
             totalTokens *
             1_000_000;
         const threshold = formatThousands(tier.threshold);
+        let note: string;
+        if (cappedToBase) {
+            note = `- Input capped at ${formatThousands(maxInputTokens)} tokens to stay in the base tier. Change it in the panel's **Context limits**, or set \`openrouterCopilot.contextWindowPolicy\` to \`full\`.`;
+        } else if (maxInputTokens < tier.threshold) {
+            note = `- The long-context rate starts above ${threshold} prompt tokens, past this model's reported ${formatThousands(maxInputTokens)}-token input budget.`;
+        } else if (maxInputTokens >= uncappedBudget) {
+            note = `- Full window in use \u2014 above ${threshold} prompt tokens the long-context rate applies.`;
+        } else {
+            note = `- Above ${threshold} prompt tokens the long-context rate applies.`;
+        }
         blocks.push(
             [
                 '**Long-context pricing**',
                 `- up to ${threshold} prompt tokens: ~${formatPricePerM(pAvgM)} / 1M`,
                 `- above ${threshold} prompt tokens: ~${formatPricePerM(tierAvgM)} / 1M`,
-                cappedToBase
-                    ? `- Input capped at ${formatThousands(maxInputTokens)} tokens to stay in the base tier. Change it in the panel's **Context limits**, or set \`openrouterCopilot.contextWindowPolicy\` to \`full\`.`
-                    : '- Full window in use \u2014 the long-context surcharge applies above the threshold.',
+                note,
             ].join('\n')
         );
     }

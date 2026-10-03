@@ -321,7 +321,7 @@ suite("network isolation (stubbed fetch)", () => {
 suite("chat session titles", () => {
     const storage = vscode.Uri.from({
         scheme: "file",
-        path: "/c:/Users/tt/AppData/Roaming/Code/User/workspaceStorage/hash/tianyu-liu.openrouter-copilot-request-credit",
+        path: "/c:/Users/test/AppData/Roaming/Code/User/workspaceStorage/hash/tianyu-liu.openrouter-copilot-request-credit",
     });
 
     test("chatSessionsDir resolves the sibling chatSessions folder", () => {

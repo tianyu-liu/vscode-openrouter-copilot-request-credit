@@ -12,6 +12,7 @@ import {
     enabledFromModelConfiguration,
     longContextTier,
     parsePrice,
+    supportsToolCalling,
     type ContextBudgetOptions,
     type ModelCatalogEntry,
 } from './modelInfo';
@@ -1647,7 +1648,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             detail: baseInfo?.detail ? `preset · ${baseInfo.detail}` : 'preset',
             tooltip,
             capabilities: {
-                toolCalling: base?.supports_tool_parameters !== false,
+                toolCalling: base ? supportsToolCalling(base) : true,
                 imageInput: (base?.architecture?.input_modalities ?? []).includes('image'),
             },
         };
@@ -1671,7 +1672,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             detail,
             tooltip,
             capabilities: {
-                toolCalling: m.supports_tool_parameters !== false,
+                toolCalling: supportsToolCalling(m),
                 imageInput: (m.architecture?.input_modalities ?? []).includes('image'),
             },
         };

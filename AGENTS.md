@@ -73,14 +73,21 @@ npm run package      # vsce package → openrouter-copilot-request-credit-<ver>.
 No lint setup exists for this TypeScript project; `tsc --strict` is the gate.
 Run `npm run compile` (and `npm test` when behavior changed) before committing.
 
+**Request-dump debug hook.** Setting `OPENROUTER_RC_DEBUG=1` makes `dumpRequestBody` append every
+outgoing `/chat/completions` body as one JSONL line to `<workspaceFolder ?? cwd>/tmp/openrouter-requests.jsonl`
+(the write is inside a swallowing `try/catch`, so a bad path never fails a turn). It runs on the real
+request path, so the file holds verbatim prompt and tool content — `tmp/` is gitignored, never commit
+it, and it works under `npm test` too (cwd fallback), which is how the request-shape claims in this
+file can be re-verified on the wire rather than by reading code.
+
 ## Architecture
 
 - `src/extension.ts` — activation: registers the provider (`vscode.lm.registerLanguageModelChatProvider('openrouter-copilot-request-credit', …)`, vendor id must match `contributes.languageModelChatProviders[].vendor`), the status bar item (credit), the refresh lifecycle (single-flight `refresh`/abort-supersede `doRefresh`), the unified webview panel, the config-change listener and the auto-refresh timer. Commands: `openrouterCopilot.manage` and `openrouterCopilot.pasteTemplate` both open the panel; `openrouterCopilot.clearTemplate` clears the template. Exports for tests: `refresh`, `doRefresh`, `getStatusText`, `createPanelDeps`, `stopRefreshTimerForTesting`, and `readConfig`.
-- `src/panel.ts` — the **single control panel** (webview): `renderPanelHtml`, `handlePanelMessage`, `PanelDeps`, `readConfig`. Four tabs: **Key Info** (key save, credit usage and credit settings), **Session Spend** (per-chat spend), **Request** (preset dropdown and custom request JSON; selecting a preset replaces the saved request, selecting the default clears it), and **Context** (window budget, long-context pricing and per-model caps). Every contributed user setting has an editable control in this panel, even when no API key/account details are available; all configuration updates use application/global scope. The active tab is retained in VS Code webview state across rerenders. Short explanatory notes are placed with the controls they describe. Presets are fetched with the panel render; the dropdown re-syncs whenever the template is saved or cleared (the sync adds a `<slug> (not in list)` option when the saved slug is absent from the rendered list). `readConfig` reads global scope only and validates/clamps numeric, boolean and reset-period settings. Message handling and rendering are unit-testable (no live webview needed).
+- `src/panel.ts` — the **single control panel** (webview): `renderPanelHtml`, `handlePanelMessage`, `PanelDeps`, `readConfig`. Four tabs: **Key Info** (key save, credit usage and credit settings), **Session Spend** (per-chat spend), **Request** (preset dropdown and custom request JSON; selecting a preset replaces the saved request, selecting the default clears it), and **Context** (window budget, long-context pricing and per-model caps). Every contributed user setting has an editable control in this panel, even when no API key/account details are available; all configuration updates use application/global scope. The active tab is retained in VS Code webview state across rerenders. Short explanatory notes are placed with the controls they describe. The preset list is fetched when the panel renders, and the dropdown re-syncs whenever the template is saved or cleared. `readConfig` reads global scope only and validates/clamps numeric, boolean and reset-period settings. Message handling and rendering are unit-testable (no live webview needed).
 - `src/provider.ts` — the `LanguageModelChatProvider`:
-  - `provideLanguageModelChatInformation` — fetches `GET /models` with the user's key (via `fetchWithRetry`; a non-OK catalog response now surfaces a mapped error instead of `[]`, and a 200 with a non-JSON body surfaces a mapped error too), maps to `LanguageModelChatInformation` (family = slug prefix, version = slug, token caps from `context_length`), attaches a `detail`/`tooltip` rendered by `modelInfo.ts` (price info in the model picker), and a `configurationSchema` so reasoning models expose **VS Code's native Thinking Effort selector** in the picker (proposed `chatProvider` API, `enabledApiProposals` in `package.json`, vendored types in `typings/`). It also fetches presets (`GET /presets`, then `GET /presets/{slug}` for the designated `designated_version.config.model`, capped at 25 lookups, fetched with bounded concurrency after the active-status filter — inactive presets never consume the lookup budget, and the full active list stays visible in the panel dropdown regardless of the cap) and appends a picker entry `@preset/<slug>` (family `preset`) for each **model-pinned** preset within the lookup cap, with caps/capabilities/pricing resolved from the underlying catalog entry (assumed defaults when the model is absent from it); model-less presets get no picker entry. The presets sweep is **single-flight and background**: the picker gets the models immediately, and the sweep (shared by `getPresets()` via one in-flight promise) attaches `@preset/*` entries when it resolves, firing `onDidChangeLanguageModelChatInformation`; a warm preset cache from a panel render is reused, not re-fetched. A failed sweep leaves the preset cache **cold** (never cached as an empty list) so a later render or query retries it. The presets fetch is **best-effort**: any failure degrades to the models-only catalog. `getPresets()` fetches on first use (also on panel render) and caches; `getPresetConfig(slug)` resolves and caches the full designated config (shared with the list fetch) so the panel can prefill the textarea with the resolved preset configuration as full-line `//` comments above the JSON when a preset is selected. A pinned model that is not in the catalog under its exact slug (e.g. datestamped `z-ai/glm-5.3-flash-20260826`) resolves against the catalog by stripping a trailing datestamp (`-YYYYMMDD`, then a plausible `-MMDD`) so reasoning schema, caps, and pricing still load; truly unknown models get assumed defaults and no reasoning selector. `setTemplate` strips full-line `//` comments before validating, so commented text saves cleanly. Changing `openrouterCopilot.baseUrl` calls `resetCatalogCache()` so the picker re-fetches from the new host.
-  - `provideLanguageModelChatResponse(model, messages, options, progress, token)` — builds the body via `buildRequestBody` (saved template spread over the live model/messages/tools, `stream: true` — every forwarded tool carries a `parameters` object (`tool.inputSchema` ?? `{type:"object",properties:{}}`), an empty `tools` array and a legacy template `prompt` are dropped, and Copilot's `toolMode === Required` is mapped to `tool_choice:"required"` unless the template sets its own `tool_choice` — `session_id` = `sessionIdFor(options.modelOptions._conversationId)` — see "Session identity" — verbatim `provider` passthrough — no default `provider` is ever injected, preset reference or not, so preset routing survives; picker effort/enabled merged into the template's `reasoning`, with a picker effort of `none` sent as `reasoning.enabled: false` rather than `effort: "none"`; a preset-reference model id (`@preset/*` or combined `*@preset/*`) drops a template `preset` key so the picker entry is the only preset reference; `@preset/*` requests take the P6 `cache_control` decision from the preset's resolved underlying model), POSTs `/chat/completions` through `fetchWithRetry` (mid-stream and mid-read cancellation surfaces as `vscode.CancellationError`; retried responses have their bodies cancelled before backoff), parses SSE with a bounded line buffer, emits parts via `progress.report(...)`. Emits `LanguageModelThinkingPart` from `delta.reasoning` (fallback: flatten `delta.reasoning_details` via `flattenReasoningDetails`) plus text and tool-call parts. Throws mapped errors on HTTP statuses and mid-stream `data:{"error":…}` events (`mapResponseError`/`mapStreamedError`), appending the `X-Generation-Id` header. Tolerates and captures the automatic final `usage` chunk (`getLastStreamUsage`, reset per request). **Returns `Thenable<void>`; parts go through the progress callback, not a returned stream.**
-  - `toOpenAI` — converts messages to OpenAI chat format. VS Code's `LanguageModelChatMessageRole` in the 1.134 type surface has no `System` value, but the **runtime** enum on VS Code 1.140 does (`System = 3`), and core's raw→public role rewrite does map a genuine system-role transcript message onto it; a defensive helper (`openAIRoleOf`, resolving the member through a cast) therefore sends `role:"system"` for it. Copilot-supplied prompt context still arrives in `user`-role messages, so user-role messages stay `user` regardless of position rather than guessing which text is scaffolding. Assistant text, prior `LanguageModelThinkingPart`s echoed back as a `reasoning` (string) field (DeepSeek thinking-mode echo rule; an assistant message with **no** thinking trace instead carries `reasoning_content: ""`, matching the native provider), tool calls/results as `tool_calls` / `role:"tool"`, images as `data:` URL `image_url`s, and a message `name` forwarded when Copilot sets one. Non-text tool results are decoded rather than JSON-stringified: `LanguageModelDataPart` text/JSON → text, an image → a following user `image_url` message (never a numeric-key blob), and `LanguageModelPromptTsxPart` → its `value` as JSON without the class wrapper.
+  - `provideLanguageModelChatInformation` — fetches `GET /models` with the user's key (via `fetchWithRetry`; a non-OK catalog response now surfaces a mapped error instead of `[]`, and a 200 with a non-JSON body surfaces a mapped error too), maps to `LanguageModelChatInformation` (family = slug prefix, version = slug, token caps from `context_length`, `toolCalling` from `supported_parameters` containing `"tools"` — `modelInfo.ts`'s `supportsToolCalling`, with the legacy `supports_tool_parameters` boolean as a fallback for older catalogs and "assume capable" when both are absent — and `imageInput` from `architecture.input_modalities`), attaches a `detail`/`tooltip` rendered by `modelInfo.ts` (price info in the model picker), and a `configurationSchema` so reasoning models expose **VS Code's native Thinking Effort selector** in the picker (proposed `chatProvider` API, `enabledApiProposals` in `package.json`, vendored types in `typings/`). It also fetches the account's presets (`GET /presets` and the designated config per preset) and appends a picker entry `@preset/<slug>` for each model-pinned preset; model-less presets get no picker entry. `setTemplate` strips full-line `//` comments before validating, so commented text saves cleanly. Changing `openrouterCopilot.baseUrl` calls `resetCatalogCache()` so the picker re-fetches from the new host.
+  - `provideLanguageModelChatResponse(model, messages, options, progress, token)` — builds the body via `buildRequestBody` (saved template spread over the live model/messages/tools, `stream: true` — every forwarded tool carries a `parameters` object (`tool.inputSchema` ?? `{type:"object",properties:{}}`), an empty `tools` array and a legacy template `prompt` are dropped, and Copilot's `toolMode === Required` is mapped to `tool_choice:"required"` unless the template sets its own `tool_choice` — `session_id` = `sessionIdFor(options.modelOptions._conversationId)` — see "Session identity" — verbatim `provider` passthrough — no default `provider` is ever injected; picker effort/enabled merged into the template's `reasoning`, with a picker effort of `none` sent as `reasoning.enabled: false` rather than `effort: "none"`; the P6 `cache_control` decision is made from the model), POSTs `/chat/completions` through `fetchWithRetry` (mid-stream and mid-read cancellation surfaces as `vscode.CancellationError`; retried responses have their bodies cancelled before backoff), parses SSE with a bounded line buffer, emits parts via `progress.report(...)`. Emits `LanguageModelThinkingPart` from `delta.reasoning` (fallback: flatten `delta.reasoning_details` via `flattenReasoningDetails`) plus text and tool-call parts. Throws mapped errors on HTTP statuses and mid-stream `data:{"error":…}` events (`mapResponseError`/`mapStreamedError`), appending the `X-Generation-Id` header. Tolerates and captures the automatic final `usage` chunk (`getLastStreamUsage`, reset per request). **Returns `Thenable<void>`; parts go through the progress callback, not a returned stream.**
+  - `toOpenAI` — converts messages to OpenAI chat format. VS Code's `LanguageModelChatMessageRole` in the **published type surface** has no `System` value, but the **runtime** enum does (`System = 3`), and core's raw→public role rewrite does map a genuine system-role transcript message onto it; a defensive helper (`openAIRoleOf`, resolving the member through a cast) therefore sends `role:"system"` for it. Copilot-supplied prompt context still arrives in `user`-role messages, so user-role messages stay `user` regardless of position rather than guessing which text is scaffolding. Assistant text, prior `LanguageModelThinkingPart`s echoed back as a `reasoning` (string) field (DeepSeek thinking-mode echo rule; an assistant message with **no** thinking trace instead carries `reasoning_content: ""`, matching the native provider), tool calls/results as `tool_calls` / `role:"tool"`, images as `data:` URL `image_url`s, and a message `name` forwarded when Copilot sets one. Non-text tool results are decoded rather than JSON-stringified: `LanguageModelDataPart` text/JSON → text, an image → a following user `image_url` message (never a numeric-key blob), and `LanguageModelPromptTsxPart` → its `value` as JSON without the class wrapper.
   - **Per-turn usage report (P10)** — when the stream ends (`[DONE]`, or the read loop finishing), the captured usage chunk is reported back as `progress.report(new vscode.LanguageModelDataPart(bytes, 'usage'))` with `{ prompt_tokens, completion_tokens, total_tokens, prompt_tokens_details: { cached_tokens, … }, completion_tokens_details?, copilot_usage? }`. `completion_tokens_details` is forwarded verbatim when present and object-shaped, because the harness reads `completion_tokens_details.reasoning_tokens` for its reasoning-token accounting and drops the number when the key is absent — while its decode step spreads the rest of the payload, so extra keys are tolerated. Copilot parses exactly this payload into its `APIUsage`, which is what feeds the **context-usage ring** numerator. `usage` capture happens **before** the `choices[0]` check, because OpenRouter's final chunk carries `choices: []`. `copilot_usage.total_nano_aiu` is set only when `cost > 0` (a zero charge must not render as a misleading `0.0 credits`). Only `buildUsagePart` decides the payload (pure, exported for tests) and it returns `undefined` (no part at all) unless the three token counters are numeric.
     **Correction (do not re-introduce):** an earlier version of this file claimed this payload also puts the turn's cost in the Copilot **response footer**. That is **false for a local chat session**. The local footer string is built in the copilot extension from `this._chatQuotaService.getCreditsForTurn(turn.id)`, and that map is populated *only* by the CAPI fetch path (`setLastCopilotUsage` on a `ChatMLSuccess` `usage.copilot_usage.total_nano_aiu`) — never by an extension-contributed provider's progress part — the endpoint class for extension-contributed models overrides `makeChatRequest2` and **never calls `super`**, so the CAPI fetcher (`fetchMany` → `setLastCopilotUsage`) is not on our request path at all, in any harness mode. `ExtensionContributedChatEndpoint` returns `response.usage`, which feeds the ring but not the footer. The `copilotCredits` → `cY()` → `Model • N credits` chain exists only on the **agent-host** path (`toResponseDetails`) plus session-cost and subagent hovers. Even if it existed, Copilot formats with one decimal (`Heu`: `toFixed(1)`), so a micro-dollar turn would render `0.0`.
     **But the footer is not the only Copilot-side consumer of our part (code-traced, not yet observed live):** the copilot extension's agent loop folds `K$e(be.usage.copilot_usage?.total_nano_aiu)` into `this._accumulatedCopilotCredits` and reports it on the chat progress participant (`ge.usage({copilotCredits: …})`), and the `runSubagent` tool accumulates that item and calls `response.setSubagentCopilotCredits(callId, …)`, which sums sub-agent credits into the parent request's usage. Because `K$e` divides by `1e9` and our `NANO_AIU_PER_CREDIT` multiplies by `1e9`, the figure Copilot shows equals OpenRouter's dollar cost, not a rescaled one. That is a genuinely working Copilot-side surface for this provider — unlike the response footer — and it exists only where Copilot itself renders accumulated credits (sub-agent and session-cost UI), never in the local chat footer.
@@ -88,7 +95,7 @@ Run `npm run compile` (and `npm test` when behavior changed) before committing.
 Ordering uses a **monotonic `stamp()`**, not raw `Date.now()`: several sessions can land in the same millisecond, and equal stamps made the cap's sort fall back to insertion order, evicting the newest and keeping stale entries. `onTurnCost` remains as the change signal.    **Spend that has no chat (P12b):** a call that reached this provider **without going through the Copilot harness at all** has no chat to be charged to, so it is collected under the synthetic key `UNATTRIBUTED_SESSION_ID = 'unattributed'` and rendered by the panel as a single trailing entry labelled **`Unattributed (no chat id)`** (with a note explaining that an agent-host/SDK session talks to the provider through a client-BYOK bridge that carries no chat id). The sentinel is deliberately **not** `copilot-chat:`-prefixed so it can never be mistaken for a chat — `withSessionTitles` skips it (no title lookup), and it is **never used as an outgoing `session_id`** (the wire value is dropped for it, so no orphan OpenRouter session is minted). `trimToCap` **reserves the bucket's slot**: the chat entries share `MAX_TRACKED_SESSIONS − 1` slots while the bucket is present, so unidentified spend is never evicted by chat churn (and the bucket never simply *adds* an 11th entry).
     **Which session a call belongs to (P13):** `resolveCostSession(sessionId, hasConversationId, now, harnessOwned)` — a call carrying Copilot's conversation id *is* a chat turn and becomes the current session; a call **without** one that *did* come through the Copilot harness is internal (sub-agent or summarization) and is attributed to the most recently active chat rather than creating an entry of its own; a call that did **not** come through the harness at all is **never blamed on a chat** — it goes to the unattributed bucket (**P12b**) and sends no `session_id`. `resolveCostSession` therefore never returns `undefined`; the caller separately decides whether the returned key may be a wire `session_id` (it may not, for the sentinel). The conversation id can only be read off the **top-level** `conversationId` of `makeChatRequest2` — `ExtensionContributedChatEndpoint` (the harness class `Ok`) copies exactly that key into `modelOptions._conversationId`, and everything else the caller puts in `telemetryProperties` is unreachable (only `telemetryProperties.turnIndex` survives, collapsed to the numeric `_telemetryTurn`). Which driver supplies it therefore decides the mode's fidelity, and drivers split into two families: the **agent loop** passes it top-level (`conversationId: this.options.conversation.sessionId`), so the main chat turn, every tool round of it, inline chat's main turn, `summarizeConversationHistory`, and — importantly — a **generic `runSubagent` child agent loop** (core builds the child invocation from the *parent's* `sessionResource`) are exact, and a sub-agent's spend folds into its parent chat's entry; the **tool-style sub-agents and utility flows** implement their own `fetch` and pass the id *only* inside `telemetryProperties`, so harness `execution_subagent`/`search_subagent` (edit-agent and semantic search), the inline-chat intent loop, and title/progress/branch-name/NES calls have no id and fall to the most-recently-active heuristic, bounded by `PARENT_ATTRIBUTION_WINDOW_MS` (10 min) so a stale attribution is not blamed on a long-finished chat; past that window, and for any call that did not come through the harness at all (an **agent-host / SDK client-BYOK session**, §Harness boundary — which has no id *and* never enters the harness), the call is recorded in the **unattributed bucket** (**P12b**) instead of being dropped. Because the heuristic can only ever *reuse* a real `copilot-chat:`-prefixed id, a harness-owned internal call can never mint a bogus session key — nothing internal is ever stored under its own key, so the 10-entry cap cannot be polluted or evicted by one; the unattributed bucket holds one reserved slot of the 10 and is exempt from churn eviction.
 The same rule drives `session_id`: it is sent only when the cost key is a real chat id — a chat's own id, or its known parent's — and **none is sent** whenever the call resolves to the unattributed bucket (harness-less, or a harness-owned internal call with no parent inside the window), so the cost panel and OpenRouter's Sessions view agree and no orphan session appears (P15). The parent is persisted to `globalState` (`parentSession`) so attribution survives a reload. The payable figure is `cost` when OpenRouter charges, otherwise `cost_details.upstream_inference_cost` — on a BYOK route OpenRouter reports `cost: 0` because the upstream provider bills the user (verified live: a Fireworks BYOK turn reported `cost: 0`, `is_byok: true`, `upstream_inference_cost: 1.342e-5`). `is_byok` is `true` either when the flag is set or when only an upstream figure exists. The serving provider name comes from the streamed chunk's `provider` field (reset per request; `getLastStreamProvider` is a test seam). Amounts are micro-dollars, so `formatUsdPrecise` scales decimals (and never prints `$0.00` for a real cost) and `roundSignificant` (default **15** significant digits = working precision) is applied to every accumulation and at the display boundary, so binary-float artifacts (`1e-5 + 2e-5 = 3.0000000000000004e-5`) cannot reach a total or a hover. **Do not lower that digit count to "hide" drift cheaply** — measured over 100k accumulated micro-dollar turns: plain float drift 5.8e-13 relative (invisible), whole-nano quantization 2.7e-5 relative bias, and 6-digit rounding a **5.3%** error. Rounding harder injects bias rather than removing noise; there is a regression test asserting this. Both helpers live in the pure `logic.ts`.    **How a harness-less call is recognized (P13b):** the presence of `_capturingTokenCorrelationId` in `modelOptions` ≡ "this call came through the Copilot harness", because the harness bag builder `Ok.makeChatRequest2` is the **only** construction site in the copilot bundle and always sets that key unconditionally (`_otelTraceContext` likewise). A bag lacking it therefore cannot have been produced by the harness — the agent-host BYOK bridge (`AgentHostByokLmHandler.chat`, in core's `sessions.desktop.main.js`) forwards the caller's `modelOptions` **verbatim** and passes `void 0` where a session-ish argument would go, so no identifier exists on that path *by construction* (there is no better id to discover — this is not a client-side fixable gap). `isHarnessOwnedModelOptions` implements exactly that test, and a harness-less call resolves to the unattributed bucket (**P12b**) instead of the parent heuristic. **Compat note:** the marker is a harness-internal key with no public constant, so read it defensively (existence only, never its value) — as with `_conversationId`.
-    **Session label & last-update time (P14):** the panel labels a session with the **Copilot chat title** when it can get one, and always shows the session's **last-update time** beside the call count. Both are display-only enrichments — neither is persisted, so no chat content is written by the extension. The title is **not available through any API** and is never sent to a provider (`ExtensionContributedChatEndpoint` puts only `_capturingTokenCorrelationId`/`_otelTraceContext`/`_telemetryTurn` (a numeric turn index)/`_enableThinking`/`_conversationId` into `modelOptions`, and **omits** the `_conversationId` key rather than sending `undefined`; Copilot's `sessionTitle` exists only in VS Code core's OTel export/import path). It is instead read best-effort from VS Code's own chat-session store — `workspaceStorage/<hash>/chatSessions/<conversationId>.jsonl`, which sits beside the extension's `context.storageUri` (`chatSessionsDir` derives the dir; `SessionCost.title` is filled at panel-render time by `withSessionTitles`). Only the first 64 KB are read (`readSessionTitleFromDisk`), and and the pure `parseSessionTitle` (in `logic.ts`) understands **both** title shapes — the rename mutation `{"kind":1,"k":["customTitle"],"v":"…"}` (a later rename wins) and the **nested** `v.customTitle` on the `kind:0` initial-state record, which is the *only* carrier for a never-renamed session. The `kind:0` line embeds the whole transcript, so a long session outgrows the 64 KB head read and the line arrives **cut mid-object** (it no longer `JSON.parse`s at all — the shape that broke the `0ef97316…` session); `titleFromRawHead` then recovers the field from the raw text with an escape-aware scan, so the cap can stay bounded instead of growing with the session. A missing dir, missing file, malformed `HEAD`, a title cut off mid-string, or an absent/blank title all fall back to the truncated id. The chat title is generated by Copilot **after the first turn**, so the earliest render may still show the id. `updatedAt` is the monotonic `stamp()` (ms since epoch); the panel renders it via `formatReset` only when it is a plausible clock value (`>= 1e12`), so legacy/`1`-fixture stamps are omitted rather than shown as 1970.
+    **Session label & last-update time (P14):** the panel labels a session with the **Copilot chat title** when it can get one, and always shows the session's **last-update time** beside the call count. Both are display-only enrichments — neither is persisted, so no chat content is written by the extension. The title is **not available through any API** and is never sent to a provider (`ExtensionContributedChatEndpoint` puts only `_capturingTokenCorrelationId`/`_otelTraceContext`/`_telemetryTurn` (a numeric turn index)/`_enableThinking`/`_conversationId` into `modelOptions`, and **omits** the `_conversationId` key rather than sending `undefined`; Copilot's `sessionTitle` exists only in VS Code core's OTel export/import path). It is instead read best-effort from VS Code's own chat-session store — `workspaceStorage/<hash>/chatSessions/<conversationId>.jsonl`, which sits beside the extension's `context.storageUri` (`chatSessionsDir` derives the dir; `SessionCost.title` is filled at panel-render time by `withSessionTitles`). Only the first 64 KB are read (`readSessionTitleFromDisk`), and and the pure `parseSessionTitle` (in `logic.ts`) understands **both** title shapes — the rename mutation `{"kind":1,"k":["customTitle"],"v":"…"}` (a later rename wins) and the **nested** `v.customTitle` on the `kind:0` initial-state record, which is the *only* carrier for a never-renamed session. The `kind:0` line embeds the whole transcript, so a long session outgrows the 64 KB head read and the line arrives **cut mid-object** (it no longer `JSON.parse`s at all — the shape that broke a long session); `titleFromRawHead` then recovers the field from the raw text with an escape-aware scan, so the cap can stay bounded instead of growing with the session. A missing dir, missing file, malformed `HEAD`, a title cut off mid-string, or an absent/blank title all fall back to the truncated id. The chat title is generated by Copilot **after the first turn**, so the earliest render may still show the id. `updatedAt` is the monotonic `stamp()` (ms since epoch); the panel renders it via `formatReset` only when it is a plausible clock value (`>= 1e12`), so legacy/`1`-fixture stamps are omitted rather than shown as 1970.
   - `provideTokenCount` — rough `chars/4` estimate (must be async per the current API).
   - OpenRouter requests use the fixed `https://openrouter.ai/api/v1` API endpoint. Test seams: `setRetryDelayForTesting`, `getLastStreamUsage`, `buildUsagePart`, `sessionIdFor`.
 
@@ -157,10 +164,11 @@ through `vscode.lm`, and the progress parts are mapped back to Copilot's part ty
 Modes that can reach us: VS Code chat (ask/agent/plan), the edit/notebook/terminal participants,
 inline chat, NES, every agent-mode tool round, history compaction (`summarizeConversationHistory`),
 sub-agents, Copilot's utility flows, the harness's own `agentLMServer` SSE endpoint, an agent-host
-session's **client BYOK** bridge (gated on the host's `clientByokEnabled` policy; same catalog, same
-request path, plus `includeEncryptedThinking: true` and `configuration.reasoningEffort`, which
-`effortFromModelConfiguration` already reads), and any other extension or SDK client going through
-`vscode.lm`. What differs between them is only content: messages/tools, which `modelOptions` keys are
+session's **client BYOK** bridge (gated on the host's `clientByokEnabled` policy **and** on
+`chat.agentHost.byokModels.enabled` reaching that host's own root config — see "Agent-host BYOK
+visibility" below; same catalog, same request path, plus `includeEncryptedThinking: true` and
+`configuration.reasoningEffort`, which `effortFromModelConfiguration` already reads), and any other
+extension or SDK client going through `vscode.lm`. What differs between them is only content: messages/tools, which `modelOptions` keys are
 present, `requestInitiator`, where the reply is routed, and who consumes the `usage` part — **not
 `toolMode`**, which the harness's extension-contributed endpoint never sets (core's
 `options.toolMode ?? 1` default therefore always yields Auto). The mode-dependent gaps that matter are
@@ -191,17 +199,68 @@ Three harness details worth knowing (none of them a defect in this extension):
   comes from the Copilot CLI SDK catalog (`copilotCLISDK.getAvailableModels()`), not from
   `vscode.lm`, so this extension cannot be selected there — and no out-of-VS-Code harness can be
   handed a local extension provider in the first place.
-- **Two host capabilities the 1.134 type surface does not describe are handled** (runtime-only,
-  verified on 1.140): `LanguageModelChatMessageRole.System = 3` (resolved by cast, mapped to
+- **Two host capabilities the published type surface does not describe are handled** (runtime-only,
+  verified at runtime): `LanguageModelChatMessageRole.System = 3` (resolved by cast, mapped to
   `role:"system"`) and `completion_tokens_details` on the streamed usage chunk (forwarded when
   present). Both were silent losses before; see `docs/copilot-harness-modes.md` §3e.
+
+### Agent-host BYOK visibility (Agents window / Copilot SDK) — local-only gate
+
+Getting `OpenRouter: RC` into the agent-host / Agents-window / Copilot-SDK model list needs **two**
+gates, and the second is unreachable from a remote workspace. Code-traced in the installed Copilot bundle; the
+full evidence sits in [`docs/copilot-harness-modes.md`](docs/copilot-harness-modes.md) §3e item 6.
+
+1. **Client permission** — `chat.clientByokEnabled` (§3e item 1 of the doc). Necessary, not
+   sufficient.
+2. **Agent-host root config** — the node side populates its BYOK model list only when `byokModelsEnabled`
+   is **strictly `true`** (`function zw(r){let i=r===!0; …}`) in the agent host's **own** root config
+   file (`globalStorage/agent-host-config.json`), never in `settings.json`. The declaration carries
+   `agentHost:{key:'byokModelsEnabled',scope:'local'}` and is written by the Agent Host settings
+   editor, which is hard-wired to the local identity
+   (`agent-host-settings://local/settings.jsonc`, `workbench.action.chat.openAgentHostSettings`).
+3. **The mirroring filter withholds `scope:'local'` from remote hosts** — `Uto(resource)` maps the
+   local identity to kind `0`, any `vscode-remote://` resource to `1`; `ubr(scope, kind)` admits
+   `local` only for `0`. A WSL / Dev Container / SSH agent host is kind `1`, so it never receives
+   `byokModelsEnabled` (nor `defaultShell`, `runtimePath`, `skillCharBudget` — the four local-scope
+   agent-host keys). Measured: remote `agent-host-config.json` = **53** keys, key absent; Windows =
+   **57** keys, key `true`.
+4. The node entry always asks for the renderer-backed bridge
+   (`byok:{kind:'renderer',bridgeRegistry}`); an unsupported topology falls back to a stub whose
+   `start()` rejects with `"BYOK is not supported in this agent host"`.
+
+A **third** gate stacks on top even locally: the sessions/Agents window loads only extensions whose
+manifest has **no code** (`canExecuteOnSessionsWindow`: `if (manifest.main || manifest.browser) return
+false`) and whose contribution points are all in `SESSIONS_WINDOW_ALLOWED_CONTRIBUTION_POINTS`
+(`themes`, `iconThemes`, `productIconThemes`, `colors`, `keybindings`, `jsonValidation`,
+`jsonValidationRegistry`, `localizations`, `grammars`, `languages`) — bypassable via the user setting
+`extensions.supportAgentsWindow`, or (with `extensions.experimental.enableAgentsWindowCapability`)
+`capabilities.agentsWindow.supported` + the `agentsWindowActivation` proposal. This extension has
+`main` and contributes `languageModelChatProviders`, so it is refused there. **Do not add either opt-in
+unless the user asks** — it addresses only the local case and adds a proposed-API dependency.
+
+**Upstream, not our defect:** microsoft/vscode#332085 (primary; OPEN, milestone Backlog), #339228
+(closed as its duplicate), #325738, #329815, #333016 (also reproduces in a Dev Container). Peer
+extension `mfenderov/opencode-copilot-sync` documents the same limitation and links #332085. It
+affects **every** BYOK/custom-endpoint provider, because the bridge — not the provider — is what is
+unavailable on the remote path.
+
+**What still works:** regular Copilot Chat in a WSL window reaches this provider normally; the panel,
+session spend and `session_id` behaviour are unaffected. Only the agent-host/SDK model list is short
+of it. Working route today: a **local Windows** window, `chat.agentHost.byokModels.enabled` on, then a
+full restart.
+
+**Contrast (why assets look more consistent than models):** customization is handed to the agent host
+as a **list** — `skillDirectories`, `skillReadRoots`, `selectedCapabilityRoots` keyed by
+`environmentId` — so a WSL-window agent host is observed to see skills from **both** the WSL-side
+and the Windows-side locations, while BYOK **models** hang off one per-host root-config boolean that
+the local-scope filter withholds from a remote host. (Observation: the user's, on a test setup.
+Mechanism: code-traced. Environment aggregation itself: not verified.)
 
 ## Paste-apply semantics
 
 - The pasted body's **`messages`/`prompt` fields are ignored** — Copilot supplies the live conversation and tools each turn; they are merged with the saved template.
 - The template applies to every request until cleared/replaced. Default when nothing is pasted: no `provider` object — OpenRouter's own routing applies and nothing is assumed.
-- A template `provider` object is sent **verbatim**: no default is merged in and none is added, so routing comes entirely from the preset (`preset` field or `@preset/<slug>` picker entry) or the pasted `provider`. A pasted `provider` overrides a preset's routing. No separate setting exists (the former P7 floor and its merge are gone).
-- A model-picker `@preset/<slug>` entry lives only in the per-request model id — it writes nothing to the template or shared state, so with an empty custom request other (non-preset) models are completely unaffected. If the custom request sets a **different** `preset`, the picker entry wins for that turn: the template's `preset` key is dropped (two preset references in one body would be ambiguous server-side) and the template's other fields still apply on top (OpenRouter shallow-merges request fields over the preset's config, request fields taking priority). A template `preset` with a non-preset model is preserved (the panel-dropdown form).
+- A template `provider` object is sent **verbatim**: no default is merged in and none is added, so routing comes entirely from the pasted `provider`. No separate setting exists (the former P7 floor and its merge are gone).
 - `reasoning.effort`/`reasoning.enabled` always come from the picker's Thinking Effort selector and are spread into the template's `reasoning` object — they overwrite only `effort`/`enabled`; other keys like `max_tokens`/`exclude` survive.
 - Validate the pasted JSON before saving: bad input is rejected with a clear error, never partially applied.
 
@@ -220,9 +279,7 @@ cannot round-trip through Copilot's flattened ThinkingPart — string echo is th
 never accumulate raw blocks for echo. P6 (`cache_control` for Claude) is applied:
 anthropic-family models (`anthropic/*`, incl. `~anthropic/*`) get a top-level
 `cache_control: {type:"ephemeral"}` in `buildRequestBody` unless the template already sets
-its own `cache_control` (a template value wins, incl. an opt-out via `null`). A
-`@preset/<slug>` request takes the decision from the preset's resolved underlying model.
-It is a
+its own `cache_control` (a template value wins, incl. an opt-out via `null`). It is a
 5-minute ephemeral breakpoint that advances with the conversation; a template can extend it
 (e.g. `"ttl": "1h"`). Per-block markers for Qwen/Gemini stay deferred until a suitable entry
 is piloted ( OpenRouter outputs `cache_control` ↔ `prompt_cache_breakpoint` translation
@@ -250,15 +307,13 @@ the last) **no `session_id` is sent at all**, so no orphan OpenRouter session is
   resolves to Auto; the mapping stays live only for another `vscode.lm` caller that
   sets the option explicitly.
 - No default `provider` object is ever added; a template `provider` passes through verbatim
-  in every case (preset reference or not), so routing is decided by the preset or the pasted
-  `provider`, never by a built-in default (the former P7 floor is gone; P9's verbatim rule now
-  applies to all requests).
+  in every case, so routing is decided by the pasted `provider`, never by a built-in default
+  (the former P7 floor is gone).
 - Reasoning effort/enabled from the picker, merged over the template's `reasoning`; a picker
   effort of `none` is sent as `reasoning.enabled: false`.
 - Anthropic-family models (`anthropic/*`, `~anthropic/*`) get a top-level `cache_control`
-  (5-min ephemeral, advancing) unless the template sets its own `cache_control` (P6); a
-  `@preset/<slug>` request takes the decision from the preset's resolved underlying model.
-- Attribution headers `HTTP-Referer`/`X-Title` hardcoded, and sent only on `/chat/completions` (not on `/models` or `/presets`).
+  (5-min ephemeral, advancing) unless the template sets its own `cache_control` (P6).
+- Attribution headers `HTTP-Referer`/`X-Title` hardcoded, and sent only on `/chat/completions` (not on `/models`).
 - https-only `baseUrl` (provider) and `creditBaseUrl`, both read from global scope only.
 - Key in SecretStorage only, never settings.json.
 - Template applies to every request until cleared (the picker's model switch back to a
@@ -276,29 +331,37 @@ the last) **no `session_id` is sent at all**, so no orphan OpenRouter session is
 
 `maxInputTokens` is reported as the accurate input budget `context_length − max_output_tokens`
 (never a percentage of it), so Copilot's own auto-compaction acts at the right point. OpenRouter's
-`/models` publishes `pricing.overrides` — a stepped price above `min_prompt_tokens` (77/465 models,
-notably OpenAI GPT above 272K) — and `longContextTier` (in `modelInfo.ts`, pure) detects it: a numeric
+`/models` publishes `pricing.overrides` — a stepped price above `min_prompt_tokens` (mostly
+large-window OpenAI models above 272K) — and `longContextTier` (in `modelInfo.ts`, pure) detects it: a numeric
 threshold below the window on a genuine surcharge; time-of-day overrides and discounts are ignored.
 With `openrouterCopilot.contextWindowPolicy: auto` (default) the budget is capped at the
-cheapest threshold; `full` ignores the cap.
+cheapest threshold; `full` ignores the cap. The catalog's full `max_output_tokens` is reserved
+(`context_length - max_output_tokens`), not Copilot's own `min(max_output, 15% of window)` rule:
+that formula reports an input budget the window cannot actually afford alongside the output it
+reserves, and OpenRouter — not Copilot — caps output against the remaining context.
 `openrouterCopilot.contextSafetyMarginPercent` (0–50, default 0) rescales every saved numeric per-model
 Custom cap in place, including models whose Custom selection is not currently active. The provider tracks the prior applied margin in global state and uses a ratio when adjusting values, so changing the margin back does not compound rounding/shrinkage. Auto and Full selections are unchanged. Per-model Auto/Full/custom overrides live in
 `globalState.contextCaps`; saving one fires
 `onDidChangeLanguageModelChatInformation`, and context setting changes refresh model information
-without discarding the catalog. The picker tooltip shows base vs stepped `$/1M` and the cap, with a `· ≤262K`
-marker on the detail line when capped.
+without discarding the catalog. The picker tooltip shows base vs stepped `$/1M` and the cap, with a
+`· ≤{threshold}` marker on the detail line — rendered whenever the reported budget sits **inside
+the base tier and below the model's own window-minus-output budget**, i.e. whenever a cap is
+actually in effect (the default `auto` cap lands exactly on the threshold, so a strict
+"below the threshold" test would never fire for it). The note under it follows the same split: a
+cap in effect says so, a budget above the threshold states the rate boundary, and a model whose
+window-minus-output budget already sits below the threshold says the step is out of reach.
 
-#### Compaction field observation (2026-10-03; tentative)
+#### Compaction at the reported input budget (confirmed working, 2026-10-03)
 
-During a long Copilot Chat debugging session, the conversation resumed with a generated summary of earlier
-context; the user then reported increasing the limit and suspected compaction had occurred. This sequence is a
-**likely symptom** of automatic compaction/summarization and is useful as a field-test lead, not a verified
-extension compaction result. The inspected persisted transcript and debug log for session
-`45e209a5-0b42-4753-819f-656f2aeca48d` contained no explicit compaction marker, token count, or configured
-limit; the debug log only showed `session_start`. It is therefore unknown whether Copilot compacted because
-the extension-reported input budget was reached, whether a separate host summarization occurred, or whether
-the changed limit affected that event. For future debugging, record the model, effective `maxInputTokens`,
-before/after user-visible evidence, and timestamps; classify summary handoffs alone as **likely, unconfirmed**.
+Automatic compaction/summarization at the extension-reported `maxInputTokens` budget is **confirmed
+working**: a long Copilot Chat session handed off a generated summary of earlier context once the
+reported budget was approached. This is Copilot-side behavior by design — the extension only reports
+the accurate input budget (`context_length − max_output_tokens`, P16) so the host's own auto-compaction
+fires at the right point and otherwise stays out of the compaction mechanism — so an extension-visible
+compaction marker is **not** expected in the persisted transcript; an earlier revision read the absence
+of a marker as unresolved, but the absence is normal. For
+future debugging, still record the model, the effective `maxInputTokens`, before/after user-visible
+evidence, and timestamps.
 
 ### Base64 guardrail retry (P17)
 
@@ -325,9 +388,7 @@ so a host with a throwing getter degrades to "reasoning not displayed" rather th
 - Power-user variants: `{ "provider": { "order": ["deepinfra"], "allow_fallbacks": false } }`
   (hard pin), or a `response_format` json_schema from the Request Builder, or an Anthropic
   cache TTL extension: `{ "cache_control": { "type": "ephemeral", "ttl": "1h" } }`.
-- Preset: `{ "preset": "faster-glm-flash" }` — the panel's Presets dropdown saves
-  exactly this; the preset's own routing then applies (no default `provider` is ever added),
-  and model-pinned presets are also pickable directly as `@preset/<slug>` entries.
+- Preset: `{ "preset": "<slug>" }` — a slug from the account's own preset list (the panel's Presets dropdown saves this); the preset's routing then applies (no default `provider` is added), and model-pinned presets are also pickable as `@preset/<slug>` entries.
 
 ## API contract — read the types, don't guess
 
@@ -338,10 +399,10 @@ emits via `progress.report(new vscode.LanguageModelTextPart(...))` /
 `LanguageModelChatInformation` requires `family`, `version`, `maxInputTokens`,
 `maxOutputTokens`, `capabilities`. `LanguageModelError` is built via static
 factories (`NoPermissions`, `Blocked`, `NotFound`). Tool parts use `callId`
-(not `toolCallId`). `LanguageModelChatMessageRole` has **no `System` member** in the 1.134
-type surface, so Copilot sends harness and other prompt context in `user`-role messages; the
+(not `toolCallId`). `LanguageModelChatMessageRole` has **no `System` member** in the
+published type surface, so Copilot sends harness and other prompt context in `user`-role messages; the
 extension preserves that role rather than inferring system provenance from position. The
-**runtime** enum on VS Code 1.140 does define `System = 3` and core maps a genuine system-role
+**runtime** enum does define `System = 3` and core maps a genuine system-role
 transcript message onto it, so the role is resolved defensively (a cast, never a direct member
 access) and such a message is sent as `role:"system"` — see `openAIRoleOf`. Reasoning traces use the proposed
 `LanguageModelThinkingPart`
@@ -349,8 +410,9 @@ access) and such a message is sent as `role:"system"` — see `openAIRoleOf`. Re
 `languageModelThinkingPart` proposal id — guard runtime access through
 `thinkingPartCtor` in `provider.ts` (stable VS Code exposes the class but the type
 contract is proposed). Before changing API usage, check
-`node_modules/@types/vscode/index.d.ts` (installed 1.134.0; engine `^1.134.0`) — it
-is the authoritative source.
+`node_modules/@types/vscode/index.d.ts` — it is the authoritative source for the
+contract this repo compiles against (the running host is usually **newer**, which is why
+runtime-only capabilities are probed defensively rather than assumed).
 
 ## Conventions
 
@@ -369,18 +431,36 @@ is the authoritative source.
 
 ## What is verified vs. still to pilot
 
-Verified: compiles (`tsc --strict`), full test suite passes (**364 tests** in the latest full run; `npm test` is the source of truth for the current count — it also passes on the Windows development host, and on this
+Verified: compiles (`tsc --strict`), the full test suite passes (`npm test` is the source of truth for
+the current count — it also passes on the Windows development host, and on this
 WSL host with `libnss3`/`libnspr4`/`libasound2t64` installed so the Electron test host
-launches), packages to a VSIX, API usage matches the installed `@types/vscode` 1.134
-(engine `^1.134.0`) plus the vendored proposal typings, and the runtime
-`LanguageModelThinkingPart` class exists on the stable test host (VS Code 1.135) despite
+launches), packages to a VSIX, API usage matches `node_modules/@types/vscode`
+plus the vendored proposal typings, and the runtime
+`LanguageModelThinkingPart` class exists on the stable test host despite
 the proposed-API warning. The P10 usage-reporting and P11/P12 session-id and per-turn
-cost behavior were verified against the installed VS Code **1.140.0** copilot bundle
-(`github.copilot-chat` 0.68.0; see the
+cost behavior were verified against the installed VS Code Copilot bundle
+(see the
 provider bullets) plus a stubbed-`vscode` Node harness for the stream loop; the live
 **display** sides (context-usage ring, Session spend panel section) still need the pilot run below.
 
 Still to pilot end-to-end (required before rollout):
+
+The automated suite (canned SSE + stubbed `fetch`) already proves the request-body and
+stream-loop mechanics behind items **2** (an attached image, and an image tool result, reach the wire as
+`data:`-URL `image_url` parts — the tool-result one as a following user image message — while the P17
+guardrail strips only prompt text; catalog `imageInput` gating is asserted both ways), **3, 5, 6, 7, 8,
+14** (the emitted `cache_control`), **16** (panel derivation) and **17** (`sessionIdFor` + the
+window-reload case). The remaining checks below are the rollout gate and need a
+live VS Code + key, because they depend on the host UI, real OpenRouter routing/billing, or the
+OpenRouter Activity/Sessions views.
+
+A headless live pilot against the OpenRouter API (temporary key, since revoked) additionally
+confirmed item **3** (a tool-calling follow-up turn carrying a prior reasoning trace returns 200),
+items **5/6** (the streamed `usage` chunk carries `prompt_tokens`/`completion_tokens`/`total_tokens`
+plus `cost`, `is_byok`, `cost_details` and `prompt_tokens_details`), item **14** (an `anthropic/*`
+request keeps the top-level `cache_control` and reports `cached_tokens > 0` on prefix reuse), and
+that the account's `GET /presets` shape matches and the preset path sends no injected `provider`.
+The UI-only items still need a live VS Code session.
 
 1. Install the VSIX, open the panel, paste a key.
 2. Paste a Request Builder body and confirm the request to OpenRouter carries the
@@ -417,26 +497,18 @@ Still to pilot end-to-end (required before rollout):
     model shows `cached_tokens > 0` when the prompt exceeds the model's cache minimum,or the
     request errors if the host rejects the marker (record which host).
 
-15. Preset proof (P9): a member key's `GET /presets` lists the org presets; selecting a preset
-    in the panel sends `"preset":"<slug>"` and **no `provider` key**; a turn on a
-    `@preset/<slug>` picker entry is served in Activity from the preset's pinned provider
-    order (e.g. baseten → makora for `faster-glm-flash`), proving the extension did not add
-    a default `provider` over the preset routing. Also confirm a model-less preset shows no picker entry and is still
-    selectable in the dropdown as the template for any picked model.
-
-16. **Context-usage ring proof (P10):** on a normal turn the context-usage ring shows
+15. **Context-usage ring proof (P10):** on a normal turn the context-usage ring shows
     `used / max tokens` (non-zero, agreeing with the ring's percentage). Note the Copilot
     response footer is **not** a cost surface for this provider — do not treat a missing
     footer figure as a failure.
-17. **Session spend proof (P12):** open the panel → **Session spend**. The chat you have been
+16. **Session spend proof (P12):** open the panel → **Session spend**. The chat you have been
     using should appear as one collapsible entry with a total, and expanding it should list one
-    route row per provider/model in the `Cost | Provider | Model | Calls | Cached` table (e.g.
-    `$0.001627 | Fireworks (BYOK) | deepseek/deepseek-v4.1-flash | 3 | 92.0%`). Confirm: the total
+    route row per provider/model in the `Cost | Provider | Model | Calls | Cached` table. Confirm: the total
     covers **all** model calls of a
     tool-using turn (not just the last round); a second chat appears as a **separate** entry; the
     entry **survives a window reload and a full restart**; and a chat with only costless turns does
     not appear. There is deliberately no window-wide total. On a **BYOK** turn
-    (BYOK — e.g. Fireworks) the figure is the `cost_details.upstream_inference_cost` value,
+    the figure is the `cost_details.upstream_inference_cost` value,
     because OpenRouter reports `cost: 0` there; on a shared-pool turn the route reads `OpenRouter`
     and the figure is OpenRouter's `cost`. Cross-check one figure against the **upstream provider's**
     billing page on BYOK (OpenRouter's `cost` is 0 there by design — correct, not a bug). Also
@@ -444,7 +516,7 @@ Still to pilot end-to-end (required before rollout):
     session** is expected to appear as an **Unattributed (no chat id)** entry rather than under its
     own chat (**P12b**) — the entry exists once such spend has occurred, even when the 10-entry
     cap is full, and it is the one entry that never looks up a chat title.
-18. **Session-continuity proof (P11):** in OpenRouter's Logs → Sessions view, one Copilot chat
+17. **Session-continuity proof (P11):** in OpenRouter's Logs → Sessions view, one Copilot chat
     session appears as one session *after a window reload and after a full restart* — i.e. the
     turns following the reload carry the same `session_id` (`copilot-chat:<chat-session id>`) as
     the turns before it, and the transcript + thinking parts are still there. Distinguish it from a
@@ -452,6 +524,13 @@ Still to pilot end-to-end (required before rollout):
 
 ## Known upstream limitations (no client-side fix; for the README when publishing)
 
+- **Agents window / Copilot SDK under WSL (and Dev Containers)**: this provider never appears in the
+  agent-host model list there. The BYOK model bridge is unavailable on the remote path because
+  `chat.agentHost.byokModels.enabled` is a `scope:"local"` agent-host root-config key that is never
+  mirrored to a `vscode-remote://` host, and the sessions window additionally refuses any extension
+  with a `main` entry point. Affects **every** BYOK/custom-endpoint provider, not just this one
+  (microsoft/vscode#332085, #325738, #333016). Regular Copilot Chat in the same WSL window is
+  unaffected; a local Windows window works. See "Agent-host BYOK visibility" above.
 - **Gemini via OpenRouter**: prompt caching is broken (0% hits through the OpenAI→Gemini
   translation layer, microsoft/vscode#332772), and Gemini 3.1 agent mode 400s on a stripped
   `thought_signature` (microsoft/vscode#296713). Avoid Gemini in agent mode via OpenRouter.

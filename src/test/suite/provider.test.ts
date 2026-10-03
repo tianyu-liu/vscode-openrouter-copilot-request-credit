@@ -1072,6 +1072,18 @@ suite("provideLanguageModelChatResponse (stubbed stream)", () => {
         await provider.provideLanguageModelChatResponse(model, [], requestOptions as never, progress as never, token as never);
     }
 
+    async function runMessages(
+        messages: readonly vscode.LanguageModelChatRequestMessage[],
+        requestOptions: unknown = options,
+        provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState())
+    ): Promise<void> {
+        await provider.provideLanguageModelChatResponse(model, messages, requestOptions as never, progress as never, token as never);
+    }
+
+    function okStream(): () => Response {
+        return () => streamResponse(sseBody([{ choices: [{ delta: {}, finish_reason: "stop" }], usage: { total_tokens: 1 } }]));
+    }
+
     function sentBody(index: number): Record<string, unknown> {
         const call = fetchCalls[index];
         assert.ok(call, `expected fetch call ${index}`);
@@ -1129,6 +1141,49 @@ suite("provideLanguageModelChatResponse (stubbed stream)", () => {
         await runWith(options);
         assert.strictEqual(sentBody(0).session_id, "copilot-chat:conv-42");
         assert.strictEqual(sentBody(1).session_id, "copilot-chat:conv-42", "both turns share one OpenRouter session");
+    });
+
+    test("an attached image reaches the wire as an image_url data URL and survives the base64 guardrail", async () => {
+        nextResponses.push(okStream());
+        const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+        const longRun = "A".repeat(300);
+        await runMessages([
+            msg(vscode.LanguageModelChatMessageRole.User, [
+                new vscode.LanguageModelTextPart(`Describe this image. blobby ${longRun}`),
+                vscode.LanguageModelDataPart.image(png, "image/png"),
+            ]),
+        ]);
+        const messages = sentBody(0).messages as Array<{ role: string; content: unknown }>;
+        assert.strictEqual(messages.length, 1, "one user message");
+        assert.strictEqual(messages[0].role, "user");
+        const parts = messages[0].content as Array<Record<string, unknown>>;
+        assert.deepStrictEqual(
+            parts[1],
+            { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw==" } },
+            "the attached image is a data-URL image_url part"
+        );
+        assert.ok(
+            !JSON.stringify(parts[0]).includes(longRun),
+            "the long base64 run in prompt text is still stripped"
+        );
+    });
+
+    test("an image tool result reaches the wire as a following user image message", async () => {
+        nextResponses.push(okStream());
+        const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+        await runMessages([
+            msg(vscode.LanguageModelChatMessageRole.User, [
+                new vscode.LanguageModelToolResultPart("call-1", [vscode.LanguageModelDataPart.image(png, "image/png")]),
+            ]),
+        ]);
+        const messages = sentBody(0).messages as Array<{ role: string; content: unknown }>;
+        assert.strictEqual(messages.length, 2, "tool result plus a following user image message");
+        assert.strictEqual(messages[0].role, "tool");
+        assert.strictEqual(messages[1].role, "user");
+        assert.deepStrictEqual((messages[1].content as unknown[])[0], {
+            type: "image_url",
+            image_url: { url: "data:image/png;base64,iVBORw==" },
+        });
     });
 
     test("every forwarded tool carries a parameters object even without an input schema", async () => {
@@ -2125,9 +2180,14 @@ suite("preset model entries (catalog + presets)", () => {
                             context_length: 131072,
                             pricing: { prompt: "0.000001", completion: "0.000003" },
                             architecture: { input_modalities: ["text", "image"] },
+                            supported_parameters: ["tools", "temperature"],
                             reasoning: { supported_efforts: ["max", "high", "low"], default_effort: "high" },
                         },
-                        { id: "deepseek/deepseek-v4-flash", context_length: 163840 },
+                        {
+                            id: "deepseek/deepseek-v4-flash",
+                            context_length: 163840,
+                            architecture: { input_modalities: ["text"] },
+                        },
                         { id: "deepseek/deepseek-v4-flash-0731", context_length: 163840 },
                     ],
                 });
@@ -2201,6 +2261,17 @@ suite("preset model entries (catalog + presets)", () => {
             assert.strictEqual(glm.name, "faster-glm-flash");
             assert.strictEqual(glm.maxInputTokens, 114688, "input budget resolved from the underlying catalog entry");
             assert.strictEqual(glm.capabilities.imageInput, true);
+            assert.strictEqual(glm.capabilities.toolCalling, true, "supported_parameters with tools enables tool calling");
+            assert.strictEqual(
+                info.find((m) => m.id === "deepseek/deepseek-v4-flash")?.capabilities.imageInput,
+                false,
+                "an explicit text-only modality reports imageInput false, so Copilot does not attempt the image turn"
+            );
+            assert.strictEqual(
+                info.find((m) => m.id === "deepseek/deepseek-v4-flash-0731")?.capabilities.imageInput,
+                false,
+                "a catalog entry with no architecture at all is treated conservatively as text-only"
+            );
             assert.ok(
                 (glm.configurationSchema as { properties?: Record<string, unknown> } | undefined)?.properties?.reasoningEffort,
                 "the datestamped preset model resolves via alias to the catalog entry and exposes the Thinking Effort selector"
