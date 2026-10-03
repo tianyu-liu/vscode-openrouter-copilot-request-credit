@@ -2,7 +2,6 @@ import * as vscode from 'vscode';
 import { promises as fsp } from 'fs';
 import { buildStatus, KeyInfo, maskKey, AccountCredits, parseSessionTitle } from './logic';
 import {
-    apiBaseUrl,
     getConfig,
     handlePanelMessage,
     PanelDeps,
@@ -14,7 +13,7 @@ import {
 import { readKey } from './storage';
 import { getSessionCosts, onTurnCost, OpenRouterChatProvider, type SessionCost } from './provider';
 
-export { apiBaseUrl, readConfig } from './panel';
+export { readConfig } from './panel';
 
 const MAX_ERROR_LENGTH = 300;
 const APP_PREFIX = 'OpenRouter: ';
@@ -149,7 +148,7 @@ function asDataObject(json: unknown, endpoint: string): Record<string, unknown> 
 }
 
 async function fetchApi<T>(apiKey: string, resource: string, signal?: AbortSignal): Promise<T> {
-    const json = await getJson(`${apiBaseUrl()}/api/v1/${resource}`, apiKey, signal);
+    const json = await getJson(`https://openrouter.ai/api/v1/${resource}`, apiKey, signal);
     return asDataObject(json, `/api/v1/${resource}`) as unknown as T;
 }
 
@@ -164,7 +163,15 @@ async function updatePanel(
     if (!panel) return;
     const render = ++panelRenderSeq;
     const stale = (): boolean => render !== panelRenderSeq || (signal?.aborted ?? false) || !panel;
-    const { limit, resetPeriod, includeByok, refreshIntervalMinutes } = readConfig();
+    const {
+        limit,
+        resetPeriod,
+        includeByok,
+        refreshIntervalMinutes,
+        contextPolicy,
+        contextMarginPercent,
+        sanitizeBase64Content,
+    } = readConfig();
     const key = storedKey !== undefined ? storedKey : await readKey(secrets);
     if (stale()) return;
     const template = provider ? await provider.getTemplate() : undefined;
@@ -175,6 +182,8 @@ async function updatePanel(
     const presetConfig = presetSlug && provider ? await provider.getPresetConfig(presetSlug) : undefined;
     if (stale()) return;
     const sessions = await withSessionTitles(getSessionCosts());
+    if (stale()) return;
+    const contextTiers = provider ? provider.contextTierRows() : undefined;
     if (stale()) return;
     panel.webview.html = renderPanelHtml(
         info,
@@ -189,13 +198,20 @@ async function updatePanel(
         template,
         presets,
         presetConfig,
-        sessions
+        sessions,
+        contextPolicy,
+        contextMarginPercent,
+        contextTiers,
+        { sanitizeBase64Content }
     );
 }
 
 export function createPanelDeps(
     secrets: vscode.SecretStorage,
-    prov: Pick<OpenRouterChatProvider, 'setTemplate' | 'clearTemplate' | 'setKey' | 'clearKey'>
+    prov: Pick<
+        OpenRouterChatProvider,
+        'setTemplate' | 'clearTemplate' | 'setKey' | 'clearKey' | 'setContextCap'
+    >
 ): PanelDeps {
     return {
         updateConfig: (key, value) => getConfig().update(key, value, vscode.ConfigurationTarget.Global),
@@ -209,6 +225,7 @@ export function createPanelDeps(
         clearKey: () => prov.clearKey(),
         syncPresetSelection: (slug) =>
             void panel?.webview.postMessage({ type: 'presetSelection', value: slug ?? '' }),
+        setContextCap: (modelId, value) => prov.setContextCap(modelId, value),
     };
 }
 
@@ -357,14 +374,26 @@ export function activate(context: vscode.ExtensionContext): void {
         vscode.workspace.onDidChangeConfiguration((e) => {
             if (!e.affectsConfiguration('openrouterCopilot')) return;
             applyConfig();
-            if (e.affectsConfiguration('openrouterCopilot.baseUrl')) {
-                provider?.resetCatalogCache();
+            if (
+                e.affectsConfiguration('openrouterCopilot.contextWindowPolicy') ||
+                e.affectsConfiguration('openrouterCopilot.contextSafetyMarginPercent')
+            ) {
+                const refreshContext = async (): Promise<void> => {
+                    if (e.affectsConfiguration('openrouterCopilot.contextSafetyMarginPercent')) {
+                        const margin = vscode.workspace.getConfiguration('openrouterCopilot')
+                            .get<number>('contextSafetyMarginPercent', 0);
+                        await provider?.setContextMargin(margin);
+                    } else {
+                        provider?.refreshContextConfiguration();
+                    }
+                    await updatePanel(context.secrets, lastInfo);
+                };
+                refreshContext().catch(() => undefined);
             }
             if (
                 e.affectsConfiguration('openrouterCopilot.creditLimit') ||
                 e.affectsConfiguration('openrouterCopilot.creditResetPeriod') ||
-                e.affectsConfiguration('openrouterCopilot.creditIncludeByok') ||
-                e.affectsConfiguration('openrouterCopilot.creditBaseUrl')
+                e.affectsConfiguration('openrouterCopilot.creditIncludeByok')
             ) {
                 doRefresh(context.secrets).catch(() => undefined);
             }

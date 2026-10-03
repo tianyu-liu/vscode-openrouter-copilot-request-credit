@@ -5,7 +5,10 @@ import {
     stripTemplateComments,
     routeCostCells,
     cacheShareSuffix,
+    UNATTRIBUTED_SESSION_ID,
     MAX_TRACKED_SESSIONS,
+    type ContextCapValue,
+    type ContextTierRow,
     type SessionCost,
 } from './provider';
 import {
@@ -17,11 +20,14 @@ import {
     resetPeriodLabel,
     AccountCredits,
 } from './logic';
+import { formatPricePerM, MAX_CONTEXT_MARGIN_PERCENT } from './modelInfo';
 
-
-const DEFAULT_BASE_URL = 'https://openrouter.ai';
 const MAX_REFRESH_INTERVAL_MINUTES = 1440;
 const RESET_PERIODS: readonly ResetPeriod[] = ['daily', 'weekly', 'monthly', 'never'];
+
+export interface PanelSettings {
+    sanitizeBase64Content: boolean;
+}
 
 export function isResetPeriod(value: string): value is ResetPeriod {
     return (RESET_PERIODS as readonly string[]).includes(value);
@@ -36,37 +42,14 @@ function globalSetting<T>(cfg: vscode.WorkspaceConfiguration, key: string, fallb
     return (inspected?.globalValue ?? inspected?.defaultValue ?? fallback) as T;
 }
 
-let warnedBadBaseUrl = false;
-
-function rejectBaseUrl(raw: unknown): void {
-    if (warnedBadBaseUrl) return;
-    warnedBadBaseUrl = true;
-    vscode.window.showWarningMessage(
-        `OpenRouter: ignoring baseUrl "${String(raw)}" — must be an https:// URL set in user (global) settings.`
-    );
-}
-
-export function apiBaseUrl(cfg: vscode.WorkspaceConfiguration = getConfig()): string {
-    const raw = globalSetting<string>(cfg, 'creditBaseUrl', DEFAULT_BASE_URL);
-    let parsed: URL | undefined;
-    try {
-        parsed = new URL(raw);
-    } catch {
-        parsed = undefined;
-    }
-    if (!parsed || parsed.protocol !== 'https:' || !parsed.host) {
-        rejectBaseUrl(raw);
-        return DEFAULT_BASE_URL;
-    }
-    warnedBadBaseUrl = false;
-    return parsed.href.replace(/\/+$/, '');
-}
-
 export interface ConfigSnapshot {
     limit: number;
     resetPeriod: ResetPeriod;
     includeByok: boolean;
     refreshIntervalMinutes: number;
+    contextPolicy: 'auto' | 'full';
+    contextMarginPercent: number;
+    sanitizeBase64Content: boolean;
 }
 
 export function readConfig(cfg: vscode.WorkspaceConfiguration = getConfig()): ConfigSnapshot {
@@ -82,7 +65,23 @@ export function readConfig(cfg: vscode.WorkspaceConfiguration = getConfig()): Co
         Number.isFinite(rawInterval) && rounded >= 1
             ? Math.min(rounded, MAX_REFRESH_INTERVAL_MINUTES)
             : 5;
-    return { limit, resetPeriod, includeByok, refreshIntervalMinutes };
+    const rawPolicy = globalSetting<string>(cfg, 'contextWindowPolicy', 'auto');
+    const contextPolicy: 'auto' | 'full' = rawPolicy === 'full' ? 'full' : 'auto';
+    const rawMargin = globalSetting<number>(cfg, 'contextSafetyMarginPercent', 0);
+    const contextMarginPercent = Number.isFinite(rawMargin)
+        ? Math.min(MAX_CONTEXT_MARGIN_PERCENT, Math.max(0, Math.round(rawMargin)))
+        : 0;
+    const rawSanitize = globalSetting<boolean>(cfg, 'sanitizeBase64Content', true);
+    const sanitizeBase64Content = typeof rawSanitize === 'boolean' ? rawSanitize : true;
+    return {
+        limit,
+        resetPeriod,
+        includeByok,
+        refreshIntervalMinutes,
+        contextPolicy,
+        contextMarginPercent,
+        sanitizeBase64Content,
+    };
 }
 
 export interface PresetRow {
@@ -98,34 +97,57 @@ export interface PresetRow {
  * its per-provider/model routes, since one session can mix a BYOK host with an
  * OpenRouter-hosted model.
  *
+ * Spend that carried no chat identifier (an agent-host or SDK session, whose
+ * client-BYOK bridge sends none) renders as a single trailing "Unattributed"
+ * entry instead of being charged to an unrelated chat.
+ *
  * The markup is `<details>`, so expansion works without any script and survives
  * the panel being re-rendered on every message.
  */
 export function renderSessionCosts(sessions: SessionCost[] | undefined): string {
     const withSpend = (sessions ?? []).filter(s => s.paid > 0);
-    if (withSpend.length === 0) {
-        return '<p class="muted">No OpenRouter spend recorded yet. Totals appear here once a turn reports a cost.</p>';
+    const chats = withSpend.filter(s => s.sessionId !== UNATTRIBUTED_SESSION_ID);
+    const unattributed = withSpend.find(s => s.sessionId === UNATTRIBUTED_SESSION_ID);
+    if (chats.length === 0 && unattributed === undefined) {
+        return '<p class="helptext">No OpenRouter spend recorded yet. Totals appear here once a turn reports a cost. An agent-host or SDK session (client BYOK) sends no chat identifier at all, so its spend is collected under an <strong>Unattributed</strong> entry rather than a chat.</p>';
     }
-    const rows = withSpend
-        .map((session, index) => {
-            const short = session.sessionId.replace(/^copilot-chat:/, '');
-            const label = session.title ?? `${short.slice(0, 8)}${short.length > 8 ? '\u2026' : ''}`;
-            const open = index === 0 ? ' open' : '';
-            const routeRows = session.routes
-                .map(r => {
-                    const c = routeCostCells(r);
-                    return `<tr>
+    const rows = chats.map((session, index) => renderSessionDetails(session, index === 0)).join('');
+    const unattributedHtml = unattributed
+        ? renderSessionDetails(
+              unattributed,
+              chats.length === 0,
+              'Spend that reached OpenRouter with no Copilot chat identifier. An agent-host or SDK session talks to this provider through a client-BYOK bridge that carries no chat id, so nothing here is charged to an unrelated chat and no <code>session_id</code> is sent for it.'
+          )
+        : '';
+    const unattributedNote = unattributed
+        ? ' Spend that carried no chat identifier is collected under the Unattributed entry.'
+        : '';
+    return `${rows}${unattributedHtml}
+        <p class="helptext">One entry per Copilot chat session (<code>session_id</code>), newest first, up to the ${MAX_TRACKED_SESSIONS} most recent. Named from the chat title when VS Code has one, otherwise the id; times are local. Stored locally and kept across window reloads.${unattributedNote}</p>`;
+}
+
+/** One collapsible spend entry; `note` replaces the session-id footer line. */
+function renderSessionDetails(session: SessionCost, open: boolean, note?: string): string {
+    const short = session.sessionId.replace(/^copilot-chat:/, '');
+    const label =
+        session.sessionId === UNATTRIBUTED_SESSION_ID
+            ? 'Unattributed (no chat id)'
+            : session.title ?? `${short.slice(0, 8)}${short.length > 8 ? '\u2026' : ''}`;
+    const routeRows = session.routes
+        .map(r => {
+            const c = routeCostCells(r);
+            return `<tr>
                                 <td class="num">${esc(c.cost)}</td>
                                 <td>${esc(c.provider)}</td>
                                 <td>${esc(c.model ?? '\u2014')}</td>
                                 <td class="num">${esc(c.calls)}</td>
                                 <td class="num">${esc(c.cached ?? '\u2014')}</td>
                             </tr>`;
-                })
-                .join('');
-            const cacheShare = cacheShareSuffix(session);
-            const updated = session.updatedAt >= 1e12 ? formatReset(new Date(session.updatedAt), true) : undefined;
-            return `<details class="session"${open}>
+        })
+        .join('');
+    const cacheShare = cacheShareSuffix(session);
+    const updated = session.updatedAt >= 1e12 ? formatReset(new Date(session.updatedAt), true) : undefined;
+    return `<details class="session"${open ? ' open' : ''}>
                         <summary>
                             <span class="sessioncost">${esc(formatUsdPrecise(session.paid))}</span>
                             <span class="sessionname">${esc(label)}</span>
@@ -139,13 +161,45 @@ export function renderSessionCosts(sessions: SessionCost[] | undefined): string 
                                 </thead>
                                 <tbody>${routeRows}</tbody>
                             </table>
-                            <p class="muted">OpenRouter session <code>${esc(session.sessionId)}</code></p>
+                            <p class="helptext">${note ?? `OpenRouter session <code>${esc(session.sessionId)}</code>`}</p>
                         </div>
                     </details>`;
+}
+
+/**
+ * The Context limits table: one row per catalog model that carries a
+ * long-context price step, with its threshold, base vs stepped prompt price,
+ * the effective input cap, and an Auto / Full / Custom control.
+ */
+export function renderContextTiers(rows: ContextTierRow[] | undefined): string {
+    if (!rows || rows.length === 0) {
+        return '<p class="helptext">No model in the current catalog has a long-context price step. OpenRouter exposes the step under <code>pricing.overrides</code>; it appears here once a model has one.</p>';
+    }
+    const fmt = (n: number): string => n.toLocaleString('en-US');
+    const body = rows
+        .map((r, i) => {
+            const mode = r.override === 'full' ? 'full' : typeof r.override === 'number' ? 'custom' : 'auto';
+            const customValue = typeof r.override === 'number' ? r.override : r.effectiveCap;
+            return `<tr>
+                        <td class="ctxmodel">${esc(r.label)}</td>
+                        <td class="num">${esc(fmt(r.threshold))}</td>
+                        <td class="num">${esc(formatPricePerM(r.basePromptPerM))}</td>
+                        <td class="num">${esc(formatPricePerM(r.tierPromptPerM))}</td>
+                        <td class="num">${esc(fmt(r.effectiveCap))}</td>
+                        <td><select class="capmode" data-idx="${i}" data-model="${esc(r.modelId)}">
+                            <option value="auto" ${mode === 'auto' ? 'selected' : ''}>Auto</option>
+                            <option value="full" ${mode === 'full' ? 'selected' : ''}>Full</option>
+                            <option value="custom" ${mode === 'custom' ? 'selected' : ''}>Custom</option>
+                        </select></td>
+                        <td><input type="number" class="capval" id="capval-${i}" aria-label="Custom input cap in tokens for ${esc(r.label)}" title="Enter a token cap; the custom-cap reduction applies to this saved value." data-idx="${i}" data-model="${esc(r.modelId)}" min="1" step="1" value="${esc(String(customValue))}" /></td>
+                    </tr>`;
         })
         .join('');
-    return `${rows}
-        <p class="muted">One entry per Copilot chat session (<code>session_id</code>), newest first, up to the ${MAX_TRACKED_SESSIONS} most recent. Named from the chat title when VS Code has one, otherwise the id; times are local. Stored locally and kept across window reloads.</p>`;
+    return `<table class="routes contexttiers">
+                <thead><tr><th>Model</th><th>Step starts</th><th>Base $/1M</th><th>Stepped $/1M</th><th>Effective input cap</th><th>Policy</th><th>Custom cap (tokens)</th></tr></thead>
+                <tbody>${body}</tbody>
+            </table>
+        <p class="helptext">A stepped price applies at and above the threshold. Auto uses the threshold; Full uses the model input budget; Custom uses the saved token cap. Hover a model in the picker for context and pricing details.</p>`;
 }
 
 export function renderPanelHtml(
@@ -161,7 +215,11 @@ export function renderPanelHtml(
     template?: Record<string, unknown>,
     presets?: PresetRow[],
     presetConfig?: Record<string, unknown>,
-    sessions?: SessionCost[]
+    sessions?: SessionCost[],
+    contextPolicy?: string,
+    contextMarginPercent?: number,
+    contextTiers?: ContextTierRow[],
+    settings: Partial<PanelSettings> = {}
 ): string {
     const nonce = randomBytes(16).toString('hex');
     const detail = info ? buildDetail(info, limit, resetPeriod, includeByok, accountCredits) : undefined;
@@ -199,27 +257,38 @@ export function renderPanelHtml(
     const keyState = maskedKey
         ? `<span class="ok">\u2713 Key set</span>`
         : `<span class="warn">No API key set</span>`;
-    const manual = detail && detail.limitSource === 'manual';
-    const guardrailDisabled = manual && limit <= 0;
-    const controlsEnabled = manual && !guardrailDisabled;
-    const limitInputValue = manual ? limit : (detail?.limitNum ?? limit);
-    const selectedPeriod = manual ? resetPeriod : (detail?.resetPeriod ?? resetPeriod);
-    const byokChecked = manual ? includeByok : (info && info.include_byok_in_limit !== false);
-    const limitLine = detail
-        ? `<div class="limitline">
-               <span class="limitlabel">Limit</span>
+    const limitLine = `<div class="limitline">
+               <label class="limitlabel" for="limit">Spending limit</label>
                <span>$</span>
-                <input type="number" id="limit" min="0" step="0.01" value="${esc(String(limitInputValue))}" ${manual ? '' : 'disabled'} />
-               <select id="resetPeriod" ${controlsEnabled ? '' : 'disabled'}>
-                   ${RESET_PERIODS.map((p) => `<option value="${p}" ${selectedPeriod === p ? 'selected' : ''}>${resetPeriodLabel(p)}</option>`).join('')}
+                <input type="number" id="limit" min="0" step="0.01" value="${esc(String(limit))}" />
+               <select id="resetPeriod" aria-label="Spending limit reset period" title="How often the local spending limit resets">
+                   ${RESET_PERIODS.map((p) => `<option value="${p}" ${resetPeriod === p ? 'selected' : ''}>${resetPeriodLabel(p)}</option>`).join('')}
                </select>
-                <label class="optlabel"><input type="checkbox" id="includeByok" ${byokChecked ? 'checked' : ''} ${controlsEnabled ? '' : 'disabled'} /> BYOK included</label>
-           </div>`
-        : '';
+                <label class="optlabel"><input type="checkbox" id="includeByok" ${includeByok ? 'checked' : ''} title="Count bring-your-own-key usage in the remaining balance" /> Include BYOK usage</label>
+           </div>`;
     const sessionCostHtml = renderSessionCosts(sessions);
+    const policyValue = contextPolicy === 'full' ? 'full' : 'auto';
+    const marginValue = Number.isFinite(contextMarginPercent)
+        ? Math.min(MAX_CONTEXT_MARGIN_PERCENT, Math.max(0, Math.round(contextMarginPercent as number)))
+        : 0;
+    const contextSectionHtml = `<div class="section">
+        <div class="section-title">Context limits</div>
+        <div class="keyline">
+            <label class="optlabel" for="contextPolicy">Tiered-price policy</label>
+            <select id="contextPolicy">
+                <option value="auto" ${policyValue === 'auto' ? 'selected' : ''}>Auto</option>
+                <option value="full" ${policyValue === 'full' ? 'selected' : ''}>Full</option>
+            </select>
+            <label class="optlabel" for="contextMargin">Custom-cap reduction (%)</label>
+            <input type="number" id="contextMargin" min="0" max="${MAX_CONTEXT_MARGIN_PERCENT}" step="1" value="${esc(String(marginValue))}" class="intervalinput" />
+        </div>
+        <p class="helptext"><strong>Tiered-price policy:</strong> Auto caps tiered models at the surcharge threshold; Full uses the full input budget, <code>context_length \u2212 max_output</code>.</p>
+        <p class="helptext"><strong>Custom-cap reduction:</strong> Changing this percentage scales every saved numeric Custom cap in place across all models. Auto and Full selections are unchanged.</p>
+        ${renderContextTiers(contextTiers)}
+    </div>`;
     const updatedLine = `<div class="keyline updatedline">
-            <label class="optlabel">Auto-refresh (min)</label>
-            <input type="number" id="refreshInterval" min="1" step="1" value="${esc(String(refreshIntervalMinutes))}" class="intervalinput" />
+            <label class="optlabel" for="refreshInterval">Usage refresh interval (minutes)</label>
+            <input type="number" id="refreshInterval" min="1" max="${MAX_REFRESH_INTERVAL_MINUTES}" step="1" aria-label="Usage refresh interval in minutes" title="Refresh usage data every 1 to ${MAX_REFRESH_INTERVAL_MINUTES} minutes" value="${esc(String(refreshIntervalMinutes))}" class="intervalinput" />
             ${fetchedAt ? `<span class="muted">Updated ${esc(formatReset(fetchedAt, true))}</span>` : ''}
             <button id="refresh">Refresh</button>
         </div>`;
@@ -249,25 +318,26 @@ export function renderPanelHtml(
             .join('')}
         </select>`;
     const presetsHint = presets === undefined
-        ? '<p class="muted">Presets could not be loaded for this key.</p>'
+        ? '<p class="helptext">Presets could not be loaded for this key.</p>'
         : presets.length === 0
-            ? '<p class="muted">No presets found for this key.</p>'
+            ? '<p class="helptext">No presets found for this key.</p>'
             : '';
-    const footnoteRows: Array<[string, string]> = [
-        ['fn-1', '<code>stream</code> \u2014 always on; responses stream token-by-token.'],
-        ['fn-2', '<code>session_id</code> \u2014 one OpenRouter session per Copilot chat session: the chat session\u2019s own id (which VS Code persists) is sent, so your prompt cache stays warm and every turn of that chat, reload or restart included, stays under one session in OpenRouter\u2019s Logs \u2192 Sessions view. When Copilot sends no chat-session id (an internal sub-agent call), the most recently active chat\u2019s id is used instead; if no chat is known, no <code>session_id</code> is sent at all \u2014 there is no per-window random ID.'],
-        ['fn-3', 'Applied to every Copilot Chat request to OpenRouter until cleared; each turn the live conversation and tools are merged in, so any pasted <code>messages</code>/<code>prompt</code>/<code>model</code> fields are ignored.'],
-        ['fn-4', 'Reasoning effort / enabled \u2014 taken from the model picker\u2019s Thinking Effort selector and spread into the template\u2019s <code>reasoning</code> object (overwrites <code>effort</code>/<code>enabled</code> only; other keys like <code>max_tokens</code>/<code>exclude</code> survive).'],
-        ['fn-5', 'No built-in defaults \u2014 everything you paste, including a <code>provider</code> object, is sent verbatim to every request, with no separate UI for it.'],
-        ['fn-6', 'Usage accounting \u2014 OpenRouter attaches a <code>usage</code> chunk to every streamed response automatically; nothing to paste.'],
-        ['fn-7', 'Key storage (SecretStorage) and the https-only base URL are not configurable.'],
-        ['fn-8', 'Anthropic-family models (<code>anthropic/*</code>) get a top-level <code>cache_control</code> (a 5-minute ephemeral breakpoint that advances with the conversation) unless your template sets its own <code>cache_control</code>.'],
-        ['fn-9', 'Presets \u2014 selecting a preset in the Presets section sends <code>"preset": "&lt;slug&gt;"</code> with every request; model presets also appear in the model picker as <code>@preset/&lt;slug&gt;</code>. Picker preset entries only affect turns on that entry \u2014 other models are untouched while the custom request is empty. If both are set, the picker entry wins as the preset reference (a different <code>preset</code> in the custom request is dropped for that turn) and the custom request\u2019s other fields still apply on top. Preset requests keep the preset\u2019s own provider routing: the extension adds no default <code>provider</code>, so the preset\u2019s routing applies unless a pasted <code>provider</code> overrides it.'],
-        ['fn-10', 'Per-turn usage \u2014 every turn forwards OpenRouter\u2019s own <code>usage</code> chunk (prompt/completion tokens, cache reads) back to Copilot, so the context-usage ring shows used / max tokens. Cost is accumulated per chat session in the <b>Session spend</b> section above, broken down by provider and model: OpenRouter\u2019s <code>cost</code> when OpenRouter charges you, or \u2014 on a BYOK route, where OpenRouter reports <code>cost: 0</code> because the upstream provider bills you \u2014 the upstream cost it reports in <code>cost_details.upstream_inference_cost</code>. Costs are never written into the chat transcript, and Copilot\u2019s own response footer is not reachable by an extension-provided model.'],
+    const behaviorNotes: Array<[string, string]> = [
+        ['Streaming', 'Responses stream automatically; no <code>stream</code> field is needed.'],
+        ['Live conversation', 'Copilot supplies the conversation, model, and tools. Pasted <code>messages</code>, <code>prompt</code>, and <code>model</code> fields are ignored.'],
+        ['Thinking effort', 'The model picker controls <code>reasoning.effort</code> and <code>reasoning.enabled</code>; other reasoning options are preserved.'],
+        ['Provider routing', 'No routing is added automatically. A pasted <code>provider</code> object passes through unchanged.'],
+        ['Anthropic caching', 'Anthropic-family models (<code>anthropic/*</code>, including <code>~anthropic/*</code>) get a top-level, 5-minute <code>cache_control</code> breakpoint unless the template sets one.'],
+        ['Picker presets', '<code>@preset/&lt;slug&gt;</code> applies only while that picker entry is selected; it takes precedence over a different template preset.'],
+        ['Context usage', 'OpenRouter reports token usage per request. Copilot’s context indicator can change between requests.'],
     ];
-    const footnotesHtml = footnoteRows
-        .map(([id, text]) => `<p class="tmplnote"><a id="${id}">${id.slice(3)}.</a> ${text}</p>`)
+    const renderNotes = (topics: string[]): string => behaviorNotes
+        .filter(([topic]) => topics.includes(topic))
+        .map(([topic, text]) => `<p class="helptext"><strong>${topic}:</strong> ${text}</p>`)
         .join('');
+    const keyNotesHtml = '<p class="helptext"><strong>Storage:</strong> Your API key is kept in VS Code SecretStorage.</p>';
+    const sessionNotesHtml = '<p class="helptext"><strong>BYOK routes:</strong> When OpenRouter reports zero, the session total uses the upstream provider\u2019s reported cost.</p>';
+    const sanitizeBase64Content = settings.sanitizeBase64Content ?? true;
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -276,8 +346,12 @@ export function renderPanelHtml(
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'">
 <style>
     body { font-family: var(--vscode-font-family); padding: 16px 20px; color: var(--vscode-foreground); }
-    h1 { margin: 0 0 16px; font-size: 1.4em; }
     .section { margin-bottom: 22px; }
+    .tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--vscode-panel-border, rgba(0,0,0,0.15)); margin: 0 0 16px; }
+    .tab { color: var(--vscode-descriptionForeground, #888); background: transparent; border-bottom: 2px solid transparent; }
+    .tab[aria-selected="true"] { color: var(--vscode-foreground); border-bottom-color: var(--vscode-focusBorder); }
+    .tab:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -2px; }
+    .tab-panel[hidden] { display: none; }
     .section-title { font-size: 12px; text-transform: uppercase; letter-spacing: .05em;
                      font-weight: 600; color: var(--vscode-foreground); margin-bottom: 10px; }
     .keyline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
@@ -286,7 +360,7 @@ export function renderPanelHtml(
         border: 1px solid var(--vscode-input-border, transparent); padding: 8px;
         width: 100%; box-sizing: border-box; font-family: var(--vscode-editor-font-family, monospace);
         white-space: pre; resize: vertical; }
-    input[type=password] {
+    input[type=password], input[type=text] {
         background: var(--vscode-input-background); color: var(--vscode-input-foreground);
         border: 1px solid var(--vscode-input-border, transparent); padding: 4px 8px; width: 320px; }
     input[type=number] {
@@ -332,12 +406,8 @@ export function renderPanelHtml(
     .remainingline.exhausted .limitvalue { color: var(--vscode-errorForeground, #f14c4c); }
     .freetier { font-style: italic; color: var(--vscode-descriptionForeground, #888); margin: 6px 0 0; }
     .modeline { font-style: italic; color: var(--vscode-descriptionForeground, #888); margin: 0 0 10px; }
-    .optblock { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--vscode-panel-border, rgba(0,0,0,0.1)); }
-    .divider { border-top: 1px solid var(--vscode-panel-border, rgba(0,0,0,0.1)); padding-top: 16px; }
     .muted { color: var(--vscode-descriptionForeground, #888); font-style: italic; }
-    .tmplnote { font-size: 11px; color: var(--vscode-descriptionForeground, #888); margin: 4px 0 0; }
-    .footnotes { margin-top: 10px; }
-    .sessiontotal { font-weight: 600; }
+    .helptext { font-size: 12px; line-height: 1.45; color: var(--vscode-descriptionForeground, #888); margin: 6px 0 0; }
     .sessioncost { font-family: var(--vscode-editor-font-family, monospace); font-weight: 600; }
     details.session { border: 1px solid var(--vscode-panel-border, rgba(0,0,0,0.1));
                       border-radius: 4px; margin: 6px 0; padding: 2px 8px; }
@@ -360,50 +430,70 @@ export function renderPanelHtml(
 </head>
 <body>
 <div class="wrap">
-    <h1>OpenRouter for Copilot</h1>
+    <div class="tabs" role="tablist" aria-label="OpenRouter settings">
+        <button class="tab" id="tab-key-info" role="tab" aria-selected="true" aria-controls="panel-key-info" tabindex="0">Key Info</button>
+        <button class="tab" id="tab-session-spend" role="tab" aria-selected="false" aria-controls="panel-session-spend" tabindex="-1">Session Spend</button>
+        <button class="tab" id="tab-request" role="tab" aria-selected="false" aria-controls="panel-request" tabindex="-1">Request</button>
+        <button class="tab" id="tab-context" role="tab" aria-selected="false" aria-controls="panel-context" tabindex="-1">Context</button>
+    </div>
 
+    <section class="tab-panel" id="panel-key-info" role="tabpanel" aria-labelledby="tab-key-info" tabindex="0">
     <div class="section">
-        <div class="section-title">API key</div>
+        <div class="section-title">OpenRouter API key</div>
         <div class="keyline">
-            <input type="${maskedKey ? 'text' : 'password'}" id="key" placeholder="OpenRouter API key (sk-or-v1-...)" />
-            <button id="saveKey">Save Key</button>
+            <input type="${maskedKey ? 'text' : 'password'}" id="key" aria-label="OpenRouter API key" placeholder="OpenRouter API key (sk-or-v1-...)" />
+            <button id="saveKey">Save key</button>
             ${keyState}
         </div>
         ${errorBanner}
     </div>
-
-    <div class="section divider">
-        <div class="section-title">Key credit info</div>
-        ${detail ? `${limitLine}${modeLine}${usageTable}${freeTierLine}${remainingLine}` : `<p class="muted">No key info yet. Save your API key to fetch usage.</p>`}
+    <div class="section">
+        <div class="section-title">Credit usage</div>
+        ${detail ? `${modeLine}${usageTable}${freeTierLine}${remainingLine}` : `<p class="helptext">No usage information yet. Save an API key to load account details.</p>`}
+        ${limitLine}
         ${updatedLine}
     </div>
+    ${keyNotesHtml}
+    </section>
 
-    <div class="section divider">
-        <div class="section-title">Session spend</div>
+    <section class="tab-panel" id="panel-session-spend" role="tabpanel" aria-labelledby="tab-session-spend" tabindex="0" hidden>
+    <div class="section">
+        <div class="section-title">Session Spend</div>
         ${sessionCostHtml}
+        ${sessionNotesHtml}
     </div>
+    </section>
 
-    <div class="section divider">
+    <section class="tab-panel" id="panel-request" role="tabpanel" aria-labelledby="tab-request" tabindex="0" hidden>
+    <div class="section">
+        <div class="section-title">Prompt safeguard</div>
+        <label class="optlabel"><input type="checkbox" id="sanitizeBase64" ${sanitizeBase64Content ? 'checked' : ''} /> Remove long base64-like text from prompts</label>
+        <p class="helptext"><strong>Prompt sanitization:</strong> Removes long base64-like runs from text to avoid encoded-prompt guardrails. Image attachments are not changed.</p>
+    </div>
+    <div class="section">
         <div class="section-title">Presets</div>
         <div class="keyline">
             <label class="optlabel" for="presetSelect">Preset</label>
             ${presetSelectHtml}
         </div>
         ${presetsHint}
-        <p class="muted">Selecting a preset saves <code>{"preset": "&lt;slug&gt;"}</code> as the custom request below; the preset\u2019s own configuration then applies to every request. Select \u201cNo preset loaded\u201d to unload it. The resolved configuration is shown under the JSON as <code>//</code> comments, which are ignored on save \u2014 copy fields into the JSON to override the preset.</p>
+        <p class="helptext">Selecting a preset replaces the saved request with <code>{"preset": "&lt;slug&gt;"}</code>. Selecting “No preset loaded” clears it. The resolved configuration appears below as <code>//</code> comments; copy fields into the JSON to override the preset.</p>
     </div>
 
     <div class="section">
-        <div class="section-title">Custom Request</div>
-        <textarea id="template" rows="10" placeholder="Paste a request body from the OpenRouter Request Builder (or any Chat Completions JSON)."></textarea>
+        <div class="section-title">Custom request</div>
+        <textarea id="template" aria-label="Custom request JSON" rows="10" placeholder="Paste a request body from the OpenRouter Request Builder (or any Chat Completions JSON)."></textarea>
         <div class="keyline">
             <button id="saveTemplate">Save request</button>
         </div>
-        <div class="footnotes">
-            <div class="section-title">How your pasted request is applied</div>
-            ${footnotesHtml}
-        </div>
+        ${renderNotes(['Streaming', 'Live conversation', 'Thinking effort', 'Provider routing', 'Anthropic caching', 'Picker presets'])}
     </div>
+    </section>
+
+    <section class="tab-panel" id="panel-context" role="tabpanel" aria-labelledby="tab-context" tabindex="0" hidden>
+    ${contextSectionHtml}
+    ${renderNotes(['Context usage'])}
+    </section>
 
     <script nonce="${nonce}">
         const vsc = acquireVsCodeApi();
@@ -411,6 +501,33 @@ export function renderPanelHtml(
             const el = document.getElementById(id);
             if (el) el.addEventListener(event, fn);
         };
+        const tabs = Array.from(document.querySelectorAll('[role="tab"]'));
+        const activateTab = (tab) => {
+            tabs.forEach((item) => {
+                const selected = item === tab;
+                item.setAttribute('aria-selected', String(selected));
+                item.tabIndex = selected ? 0 : -1;
+                document.getElementById(item.getAttribute('aria-controls')).hidden = !selected;
+            });
+            vsc.setState({ activeTab: tab.id });
+        };
+        const savedTab = vsc.getState()?.activeTab;
+        const initialTab = tabs.find((tab) => tab.id === savedTab) || tabs[0];
+        activateTab(initialTab);
+        tabs.forEach((tab, index) => {
+            tab.addEventListener('click', () => activateTab(tab));
+            tab.addEventListener('keydown', (event) => {
+                let nextIndex;
+                if (event.key === 'ArrowRight') nextIndex = (index + 1) % tabs.length;
+                else if (event.key === 'ArrowLeft') nextIndex = (index + tabs.length - 1) % tabs.length;
+                else if (event.key === 'Home') nextIndex = 0;
+                else if (event.key === 'End') nextIndex = tabs.length - 1;
+                else return;
+                event.preventDefault();
+                tabs[nextIndex].focus();
+                activateTab(tabs[nextIndex]);
+            });
+        });
         const templateEl = document.getElementById('template');
         templateEl.value = ${templateJson};
         const keyEl = document.getElementById('key');
@@ -436,6 +553,39 @@ export function renderPanelHtml(
         });
         bind('refreshInterval', 'change', () => {
             vsc.postMessage({ type: 'saveRefreshInterval', value: document.getElementById('refreshInterval').value });
+        });
+        bind('sanitizeBase64', 'change', () => {
+            vsc.postMessage({ type: 'saveSanitizeBase64', value: document.getElementById('sanitizeBase64').checked });
+        });
+        bind('contextPolicy', 'change', () => {
+            vsc.postMessage({ type: 'saveContextPolicy', value: document.getElementById('contextPolicy').value });
+        });
+        bind('contextMargin', 'change', () => {
+            vsc.postMessage({ type: 'saveContextMargin', value: document.getElementById('contextMargin').value });
+        });
+        document.querySelectorAll('select.capmode').forEach((el) => {
+            el.addEventListener('change', () => {
+                const idx = el.getAttribute('data-idx');
+                const valEl = document.getElementById('capval-' + idx);
+                vsc.postMessage({
+                    type: 'setContextCap',
+                    modelId: el.getAttribute('data-model'),
+                    mode: el.value,
+                    value: valEl ? valEl.value : undefined,
+                });
+            });
+        });
+        document.querySelectorAll('input.capval').forEach((el) => {
+            el.addEventListener('change', () => {
+                const idx = el.getAttribute('data-idx');
+                const selEl = document.querySelector('select.capmode[data-idx="' + idx + '"]');
+                vsc.postMessage({
+                    type: 'setContextCap',
+                    modelId: el.getAttribute('data-model'),
+                    mode: selEl ? selEl.value : 'custom',
+                    value: el.value,
+                });
+            });
         });
         bind('saveTemplate', 'click', () => {
             vsc.postMessage({ type: 'saveTemplate', value: templateEl.value });
@@ -476,6 +626,8 @@ function esc(s: string): string {
 export interface PanelMessage {
     type: string;
     value?: unknown;
+    modelId?: string;
+    mode?: string;
     currentKeyMasked?: string;
 }
 
@@ -490,6 +642,7 @@ export interface PanelDeps {
     setKey: (value: string) => Promise<void>;
     clearKey: () => Promise<void>;
     syncPresetSelection: (slug: string | undefined) => void;
+    setContextCap: (modelId: string, value: ContextCapValue | null) => Promise<void>;
 }
 
 export function templatePresetSlug(template: Record<string, unknown> | undefined): string | undefined {
@@ -561,6 +714,58 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Pr
                 return;
             }
             await saveConfig(deps, 'creditRefreshIntervalMinutes', n);
+            return;
+        }
+        case 'saveSanitizeBase64': {
+            if (typeof msg.value !== 'boolean') {
+                deps.error('invalid base64 sanitization flag');
+                return;
+            }
+            await saveConfig(deps, 'sanitizeBase64Content', msg.value);
+            return;
+        }
+        case 'saveContextPolicy': {
+            const value = String(msg.value ?? '');
+            if (value !== 'auto' && value !== 'full') {
+                deps.error('invalid context policy');
+                return;
+            }
+            await deps.updateConfig('contextWindowPolicy', value);
+            return;
+        }
+        case 'saveContextMargin': {
+            const n = Math.round(Number(msg.value));
+            if (!Number.isFinite(n) || n < 0 || n > MAX_CONTEXT_MARGIN_PERCENT) {
+                deps.error(`invalid safety margin (0-${MAX_CONTEXT_MARGIN_PERCENT}%)`);
+                return;
+            }
+            await deps.updateConfig('contextSafetyMarginPercent', n);
+            return;
+        }
+        case 'setContextCap': {
+            const modelId = String(msg.modelId ?? '').trim();
+            if (modelId === '') {
+                deps.error('invalid model for the context cap');
+                return;
+            }
+            const mode = String(msg.mode ?? 'auto');
+            if (mode === 'auto') {
+                await deps.setContextCap(modelId, null);
+                await deps.doRefresh();
+                return;
+            }
+            if (mode === 'full') {
+                await deps.setContextCap(modelId, 'full');
+                await deps.doRefresh();
+                return;
+            }
+            const n = Math.round(Number(msg.value));
+            if (!Number.isFinite(n) || n < 1) {
+                deps.error('invalid context cap');
+                return;
+            }
+            await deps.setContextCap(modelId, n);
+            await deps.doRefresh();
             return;
         }
         case 'clearKey':

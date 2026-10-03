@@ -2,7 +2,7 @@
   "name": "openrouter-copilot-request-credit",
   "displayName": "OpenRouter for Copilot with Custom Request & Credit Check",
   "description": "OpenRouter provider for Copilot Chat with one control panel: paste a request body from the OpenRouter Request Builder and every chat request follows it, while the status bar tracks your key's credit usage.",
-  "version": "0.3.1",
+  "version": "0.3.2-test8",
   "publisher": "tianyu-liu",
   "repository": {
     "type": "git",
@@ -56,18 +56,12 @@
       {
         "title": "OpenRouter for Copilot",
         "properties": {
-          "openrouterCopilot.baseUrl": {
-            "type": "string",
-            "default": "https://openrouter.ai/api/v1",
-            "scope": "application",
-            "description": "OpenRouter API base URL used by the Copilot Chat provider. Application-scoped: workspace overrides are ignored so a project cannot redirect your key to another host."
-          },
           "openrouterCopilot.creditLimit": {
             "type": "number",
             "default": 0,
             "minimum": 0,
             "scope": "application",
-            "description": "Your local cap in USD — shown as your limit when the key has no cap of its own (`0` disables the guardrail and shows the account balance). Application-scoped: workspace overrides are ignored."
+            "description": "Set the local spending limit in USD. Zero disables this limit and shows the account balance; it does not change OpenRouter's server-side guardrail. Workspace overrides are ignored."
           },
           "openrouterCopilot.creditResetPeriod": {
             "type": "string",
@@ -79,13 +73,13 @@
             ],
             "default": "daily",
             "scope": "application",
-            "description": "Reset cadence for the local limit when the key has no credit cap of its own (daily/weekly/monthly/never). Application-scoped: workspace overrides are ignored."
+            "description": "Choose when the local spending limit resets: daily, weekly, monthly, or never. Workspace overrides are ignored."
           },
           "openrouterCopilot.creditIncludeByok": {
             "type": "boolean",
             "default": true,
             "scope": "application",
-            "description": "Count bring-your-own-key (BYOK) usage toward the guardrail remaining balance. Application-scoped: workspace overrides are ignored."
+            "description": "Include bring-your-own-key (BYOK) usage in the displayed usage and local spending-limit calculation. Workspace overrides are ignored."
           },
           "openrouterCopilot.creditRefreshIntervalMinutes": {
             "type": "number",
@@ -93,13 +87,31 @@
             "minimum": 1,
             "maximum": 1440,
             "scope": "application",
-            "description": "How often (in minutes) to refresh usage from OpenRouter (clamped to 1-1440). Application-scoped: workspace overrides are ignored."
+            "description": "Set how often usage and credit data refresh, in minutes (1-1440). Workspace overrides are ignored."
           },
-          "openrouterCopilot.creditBaseUrl": {
+          "openrouterCopilot.contextWindowPolicy": {
             "type": "string",
-            "default": "https://openrouter.ai",
+            "enum": [
+              "auto",
+              "full"
+            ],
+            "default": "auto",
             "scope": "application",
-            "description": "OpenRouter base URL for the credit/usage check (advanced). https-only; workspace overrides are ignored so a project cannot redirect your key to another host."
+            "description": "Choose the reported input budget for tiered-price models: Auto caps at the lower-price threshold; Full uses the model's full input budget. Workspace overrides are ignored."
+          },
+          "openrouterCopilot.contextSafetyMarginPercent": {
+            "type": "number",
+            "default": 0,
+            "minimum": 0,
+            "maximum": 50,
+            "scope": "application",
+            "description": "Changing this percentage rescales every saved numeric Custom token cap in place across all models (0-50). Auto and Full selections are unchanged. Workspace overrides are ignored."
+          },
+          "openrouterCopilot.sanitizeBase64Content": {
+            "type": "boolean",
+            "default": true,
+            "scope": "application",
+            "description": "Remove long base64-like strings from prompt text before sending requests. Image attachments are unchanged. Workspace overrides are ignored."
           }
         }
       }

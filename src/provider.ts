@@ -1,21 +1,36 @@
 /// <reference path="../typings/vscode.proposed.languageModelThinkingPart.d.ts" />
+import * as fs from 'fs';
+import * as path from 'path';
 import * as vscode from 'vscode';
 import { clearStoredKey, readKey, storeKey } from './storage';
 import {
     buildModelInfo,
     buildReasoningSchema,
+    DEFAULT_CONTEXT_POLICY,
+    effectiveMaxInputTokens,
     effortFromModelConfiguration,
     enabledFromModelConfiguration,
+    longContextTier,
+    parsePrice,
+    type ContextBudgetOptions,
     type ModelCatalogEntry,
 } from './modelInfo';
 import { formatUsdPrecise, roundSignificant } from './logic';
 
 const TEMPLATE_KEY = 'requestTemplate';
-const DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
+const OPENROUTER_API_BASE_URL = 'https://openrouter.ai/api/v1';
 const PRESET_ID_PREFIX = '@preset/';
 const MAX_PRESET_LOOKUPS = 25;
 const WINDOW_SESSION_ID = crypto.randomUUID();
 const SESSION_ID_PREFIX = 'copilot-chat:';
+/**
+ * Cost-bucket key for spend that belongs to no known Copilot chat.
+ *
+ * Deliberately *not* prefixed with `copilot-chat:`, so it can never be mistaken
+ * for a real chat id, and it is never used as an outgoing `session_id` — see the
+ * agent-host BYOK note on `resolveCostSession`.
+ */
+export const UNATTRIBUTED_SESSION_ID = 'unattributed';
 const MAX_SESSION_ID_CHARS = 256;
 const MAX_RETRIES = 3;
 const RETRY_DELAYS_MS = [1000, 2000, 4000];
@@ -25,6 +40,23 @@ const PRESET_LOOKUP_CONCURRENCY = 5;
 const USAGE_MIME = 'usage';
 const NANO_AIU_PER_CREDIT = 1_000_000_000;
 const POST_RESPONSE_TIMEOUT_MS = 60_000;
+const CONTEXT_CAPS_KEY = 'contextCaps';
+const CONTEXT_CAPS_BASE_KEY = 'contextCapsBase';
+const CONTEXT_MARGIN_KEY = 'contextMarginPercent';
+
+/** A per-model context override: a token cap, or `'full'` to ignore the auto tier cap. */
+export type ContextCapValue = number | 'full';
+
+/** One picker row for the panel's Context limits table. */
+export interface ContextTierRow {
+    modelId: string;
+    label: string;
+    threshold: number;
+    basePromptPerM: number;
+    tierPromptPerM: number;
+    effectiveCap: number;
+    override?: ContextCapValue;
+}
 
 export interface PresetSummary {
     slug: string;
@@ -74,12 +106,101 @@ export function stripTemplateComments(raw: string): string {
         .join('\n');
 }
 
-type ResponsePart = vscode.LanguageModelResponsePart | vscode.LanguageModelThinkingPart;
-const thinkingPartCtor = vscode.LanguageModelThinkingPart as
-    | (new (value: string | string[]) => vscode.LanguageModelThinkingPart)
-    | undefined;
+const BASE64_RUN_REGEX = /[A-Za-z0-9+/=_-]{200,}/g;
+export const GUARDRAIL_RETRY_NOTICE =
+    '\n[OpenRouter blocked the request (base64 injection guardrail); retrying with base64 content removed.]\n';
 
-let warnedBadBaseUrl = false;
+export function sanitizeBase64Text(text: string): { text: string; removed: number } {
+    let removed = 0;
+    const out = text.replace(BASE64_RUN_REGEX, (match) => {
+        removed += match.length;
+        return `[base64 content removed: ${match.length} chars]`;
+    });
+    return { text: out, removed };
+}
+
+/**
+ * Strip long base64-like runs from prompt TEXT only. Image `image_url` parts
+ * (data URLs) and every non-text part are left untouched.
+ */
+export function sanitizeRequestBody(body: Record<string, unknown>): { body: Record<string, unknown>; removed: number } {
+    const messages = body.messages;
+    if (!Array.isArray(messages)) {
+        return { body, removed: 0 };
+    }
+    let removed = 0;
+    const cleaned = messages.map((msg) => {
+        if (!msg || typeof msg !== 'object' || Array.isArray(msg)) {
+            return msg;
+        }
+        const record = msg as Record<string, unknown>;
+        const content = record.content;
+        if (typeof content === 'string') {
+            const s = sanitizeBase64Text(content);
+            if (s.removed === 0) {
+                return msg;
+            }
+            removed += s.removed;
+            return { ...record, content: s.text };
+        }
+        if (Array.isArray(content)) {
+            let changed = false;
+            const parts = content.map((part) => {
+                if (!part || typeof part !== 'object') {
+                    return part;
+                }
+                const p = part as Record<string, unknown>;
+                if (p.type === 'text' && typeof p.text === 'string') {
+                    const s = sanitizeBase64Text(p.text);
+                    if (s.removed > 0) {
+                        changed = true;
+                        removed += s.removed;
+                        return { ...p, text: s.text };
+                    }
+                }
+                return part;
+            });
+            return changed ? { ...record, content: parts } : msg;
+        }
+        return msg;
+    });
+    return removed > 0 ? { body: { ...body, messages: cleaned }, removed } : { body, removed: 0 };
+}
+
+function sanitizeBase64Enabled(): boolean {
+    return vscode.workspace.getConfiguration('openrouterCopilot').get<boolean>('sanitizeBase64Content', true);
+}
+
+async function isGuardrailBlock(response: Response): Promise<boolean> {
+    try {
+        const text = await response.clone().text();
+        return /base64|prompt injection|request blocked/i.test(text);
+    } catch {
+        return false;
+    }
+}
+
+type ResponsePart = vscode.LanguageModelResponsePart | vscode.LanguageModelThinkingPart;
+type ThinkingPartCtor = new (value: string | string[]) => vscode.LanguageModelThinkingPart;
+
+export function probeThinkingPartCtor(host: object): { ctor?: ThinkingPartCtor; error?: string } {
+    try {
+        const ctor: unknown = Reflect.get(host, 'LanguageModelThinkingPart');
+        return { ctor: typeof ctor === 'function' ? (ctor as ThinkingPartCtor) : undefined };
+    } catch (error) {
+        return { error: String(error) };
+    }
+}
+
+const thinkingProbe = probeThinkingPartCtor(vscode);
+const thinkingPartCtor = thinkingProbe.ctor;
+if (thinkingProbe.error !== undefined) {
+    console.warn(
+        'OpenRouter: LanguageModelThinkingPart probe failed; reasoning output will not be displayed.',
+        thinkingProbe.error
+    );
+}
+
 let delayFn: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 let postTimeoutMs = POST_RESPONSE_TIMEOUT_MS;
 let lastStreamUsage: unknown;
@@ -124,6 +245,25 @@ let lastActiveSessionId: string | undefined;
 let lastActiveAt = 0;
 
 /**
+ * Whether a request came through the Copilot harness at all.
+ *
+ * `ExtensionContributedChatEndpoint.makeChatRequest2` is the only place that builds
+ * a `modelOptions` bag for an extension-contributed provider, and it always sets
+ * `_capturingTokenCorrelationId` (and `_otelTraceContext`) as own keys. A bag
+ * without them was therefore built by some *other* caller — in practice an
+ * agent-host / SDK chat session, whose client-BYOK bridge (`AgentHostByokLmHandler`)
+ * forwards the caller's `modelOptions` untouched and has no session identifier to
+ * put in them. Such calls must never be folded into some unrelated chat.
+ */
+export function isHarnessOwnedModelOptions(modelOptions: unknown): boolean {
+    return (
+        typeof modelOptions === 'object' &&
+        modelOptions !== null &&
+        '_capturingTokenCorrelationId' in (modelOptions as Record<string, unknown>)
+    );
+}
+
+/**
  * Decide which session a model call's cost belongs to.
  *
  * A call that carries Copilot's conversation id **is** a chat turn and becomes the
@@ -139,20 +279,33 @@ let lastActiveAt = 0;
  * their parent turn (the normal case); two chats interleaving could occasionally
  * misattribute, which is why the window is bounded.
  *
- * Returns `undefined` when there is nothing to attribute to, in which case the call
- * is not tracked at all rather than creating a meaningless entry.
+ * The heuristic only applies to calls that came through the harness at all
+ * (`harnessOwned`). An agent-host / SDK session sends no conversation id and no
+ * harness marker, so nothing links its spend to a chat; charging it to whichever
+ * chat happened to be active would be wrong, and it would be invisible after the
+ * window lapsed. Those calls go to the `UNATTRIBUTED_SESSION_ID` bucket instead, so
+ * the spend stays visible without being blamed on a chat.
+ *
+ * Never returns `undefined`: every call has somewhere to go. The caller decides
+ * separately whether the bucket it returned may be sent as an outgoing `session_id`
+ * (only a real chat id may).
  */
-export function resolveCostSession(sessionId: string, hasConversationId: boolean, now = Date.now()): string | undefined {
+export function resolveCostSession(
+    sessionId: string,
+    hasConversationId: boolean,
+    now = Date.now(),
+    harnessOwned = true
+): string {
     if (hasConversationId) {
         lastActiveSessionId = sessionId;
         lastActiveAt = now;
         persistParentSession?.(sessionId, now);
         return sessionId;
     }
-    if (lastActiveSessionId !== undefined && now - lastActiveAt <= PARENT_ATTRIBUTION_WINDOW_MS) {
+    if (harnessOwned && lastActiveSessionId !== undefined && now - lastActiveAt <= PARENT_ATTRIBUTION_WINDOW_MS) {
         return lastActiveSessionId;
     }
-    return undefined;
+    return UNATTRIBUTED_SESSION_ID;
 }
 
 /**
@@ -204,6 +357,14 @@ export function buildUsagePart(usage: unknown): Record<string, unknown> | undefi
             cached_tokens: Math.max(0, finiteNumber(rawDetails.cached_tokens) ?? 0),
         },
     };
+    const rawCompletionDetails = raw.completion_tokens_details;
+    if (
+        typeof rawCompletionDetails === 'object' &&
+        rawCompletionDetails !== null &&
+        !Array.isArray(rawCompletionDetails)
+    ) {
+        part.completion_tokens_details = rawCompletionDetails;
+    }
     const cost = finiteNumber(raw.cost);
     if (cost !== undefined && cost > 0) {
         part.copilot_usage = { total_nano_aiu: cost * NANO_AIU_PER_CREDIT };
@@ -324,12 +485,19 @@ function trimToCap(): void {
     if (sessionCosts.size <= MAX_TRACKED_SESSIONS) {
         return;
     }
+    // The unattributed bucket is not a chat and must not be evicted by chat
+    // churn, so it keeps its slot and the chat entries share what is left.
+    const unattributedBucket = sessionCosts.get(UNATTRIBUTED_SESSION_ID);
     const keep = [...sessionCosts.values()]
+        .filter(session => session.sessionId !== UNATTRIBUTED_SESSION_ID)
         .sort((a, b) => b.updatedAt - a.updatedAt)
-        .slice(0, MAX_TRACKED_SESSIONS);
+        .slice(0, MAX_TRACKED_SESSIONS - (unattributedBucket ? 1 : 0));
     sessionCosts.clear();
     for (const session of keep) {
         sessionCosts.set(session.sessionId, session);
+    }
+    if (unattributedBucket) {
+        sessionCosts.set(UNATTRIBUTED_SESSION_ID, unattributedBucket);
     }
 }
 
@@ -346,10 +514,11 @@ export function hydrateSessionCosts(sessions: SessionCost[] | undefined): void {
         if (
             session &&
             typeof session.sessionId === 'string' &&
-            // Only real chat sessions are restored. Entries persisted by an earlier
-            // revision for unidentified calls carry a bare per-window UUID; those
-            // are now attributed to their parent instead, so they are dropped.
-            session.sessionId.startsWith(SESSION_ID_PREFIX) &&
+            // Only real chat sessions (and the shared unattributed bucket) are
+            // restored. Entries persisted by an earlier revision for unidentified
+            // calls carry a bare per-window UUID; those are now attributed to
+            // their parent or the bucket, so they are dropped.
+            (session.sessionId.startsWith(SESSION_ID_PREFIX) || session.sessionId === UNATTRIBUTED_SESSION_ID) &&
             Number.isFinite(session.paid) &&
             session.paid > 0 &&
             !sessionCosts.has(session.sessionId)
@@ -388,8 +557,8 @@ export function accumulateSessionCost(
     provider?: string,
     model?: string
 ): SessionCost | undefined {
-    // An unidentified call is not tracked: a session of its own would be a
-    // meaningless row that never accumulates (see `resolveCostSession`).
+    // An empty key means "no bucket at all" — `resolveCostSession` never returns
+    // one, so this only guards a bad direct call.
     if (typeof sessionId !== 'string' || sessionId.trim() === '') {
         return undefined;
     }
@@ -503,29 +672,16 @@ function reportUsagePart(progress: vscode.Progress<ResponsePart>, usage: unknown
     }
 }
 
-export function baseUrl(): string {
-    const cfg = vscode.workspace.getConfiguration('openrouterCopilot');
-    const inspected = cfg.inspect<string>('baseUrl');
-    const raw = String(inspected?.globalValue ?? inspected?.defaultValue ?? DEFAULT_BASE_URL);
-    let cleaned = raw.replace(/\/+$/, '');
-    cleaned = cleaned.replace(/\/chat\/completions$/i, '');
-    let parsed: URL | undefined;
+function dumpRequestBody(body: unknown): void {
+    if (process.env.OPENROUTER_RC_DEBUG !== '1') return;
     try {
-        parsed = new URL(cleaned);
+        const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+        const dir = path.join(root, 'tmp');
+        fs.mkdirSync(dir, { recursive: true });
+        fs.appendFileSync(path.join(dir, 'openrouter-requests.jsonl'), `${JSON.stringify(body)}\n`);
     } catch {
-        parsed = undefined;
+        return;
     }
-    if (!parsed || parsed.protocol !== 'https:' || !parsed.host) {
-        if (!warnedBadBaseUrl) {
-            warnedBadBaseUrl = true;
-            vscode.window.showWarningMessage(
-                `OpenRouter: ignoring baseUrl "${raw}" — must be an https:// URL set in user (global) settings.`
-            );
-        }
-        return DEFAULT_BASE_URL;
-    }
-    warnedBadBaseUrl = false;
-    return parsed.href.replace(/\/+$/, '');
 }
 
 function isRetryable(status: number): boolean {
@@ -715,7 +871,8 @@ export function buildRequestBody(
     tools: unknown,
     modelConfiguration: { readonly [key: string]: unknown } | undefined,
     cacheModelId?: string,
-    sessionId?: string
+    sessionId?: string,
+    requireToolCall?: boolean
 ): Record<string, unknown> {
     const body: Record<string, unknown> = {
         ...(template ?? {}),
@@ -724,9 +881,19 @@ export function buildRequestBody(
         tools,
         stream: true,
     };
+    delete body.prompt;
+    if (Array.isArray(body.tools) && body.tools.length === 0) {
+        delete body.tools;
+    }
     delete body.session_id;
     if (typeof sessionId === 'string' && sessionId.trim() !== '') {
         body.session_id = sessionId;
+    }
+    // Copilot's toolMode is an obligation on the provider. Auto (the default) needs
+    // nothing; Required must force a tool call, but a pasted template tool_choice
+    // stays the escape hatch and wins.
+    if (requireToolCall === true && !('tool_choice' in body)) {
+        body.tool_choice = 'required';
     }
     if (presetSlugFromModelId(modelId) !== undefined) {
         delete body.preset;
@@ -757,6 +924,7 @@ interface ChatModelInfo extends vscode.LanguageModelChatInformation {
 
 export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider {
     private cachedInfo: ChatModelInfo[] | undefined;
+    private cachedCatalog: ModelCatalogEntry[] | undefined;
     private catalogPromise: Promise<ModelCatalogEntry[]> | undefined;
     private cachedPresets: PresetSummary[] | undefined;
     private presetsPromise: Promise<PresetSummary[] | undefined> | undefined;
@@ -765,6 +933,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
     private template: Record<string, unknown> | undefined;
     private readonly infoChangeEvent = new vscode.EventEmitter<void>();
     private persistQueue: Promise<unknown> = Promise.resolve();
+    private contextMarginQueue: Promise<void> = Promise.resolve();
 
     readonly onDidChangeLanguageModelChatInformation: vscode.Event<void> = this.infoChangeEvent.event;
 
@@ -788,6 +957,9 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
                 .then(() => this.state.update(PARENT_SESSION_KEY, { sessionId, at }))
                 .catch(() => undefined);
         };
+        const margin = vscode.workspace.getConfiguration('openrouterCopilot')
+            .get<number>('contextSafetyMarginPercent', 0);
+        void this.setContextMargin(margin, false);
     }
 
     dispose(): void {
@@ -797,6 +969,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
     async setKey(value: string): Promise<void> {
         this.key = value;
         this.cachedInfo = undefined;
+        this.cachedCatalog = undefined;
         this.catalogPromise = undefined;
         this.cachedPresets = undefined;
         this.presetsPromise = undefined;
@@ -808,6 +981,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
     async clearKey(): Promise<void> {
         this.key = undefined;
         this.cachedInfo = undefined;
+        this.cachedCatalog = undefined;
         this.catalogPromise = undefined;
         this.cachedPresets = undefined;
         this.presetsPromise = undefined;
@@ -818,11 +992,130 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
 
     resetCatalogCache(): void {
         this.cachedInfo = undefined;
+        this.cachedCatalog = undefined;
         this.catalogPromise = undefined;
         this.cachedPresets = undefined;
         this.presetsPromise = undefined;
         this.presetConfigs.clear();
         this.infoChangeEvent.fire();
+    }
+
+    refreshContextConfiguration(): void {
+        this.cachedInfo = undefined;
+        this.infoChangeEvent.fire();
+    }
+
+    getContextCaps(): Record<string, ContextCapValue> {
+        const value = this.state.get<Record<string, ContextCapValue>>(CONTEXT_CAPS_KEY);
+        return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+    }
+
+    async setContextCap(modelId: string, value: ContextCapValue | null): Promise<void> {
+        this.contextMarginQueue = this.contextMarginQueue.then(async () => {
+            const caps = { ...this.getContextCaps() };
+            const baseCaps = { ...this.getContextCapsBase(caps) };
+            if (value === 'full') {
+                caps[modelId] = 'full';
+                delete baseCaps[modelId];
+            } else if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+                const cap = Math.floor(value);
+                const margin = this.getAppliedContextMargin();
+                caps[modelId] = cap;
+                baseCaps[modelId] = Math.max(1, Math.round(cap / (1 - margin / 100)));
+            } else {
+                delete caps[modelId];
+                delete baseCaps[modelId];
+            }
+            this.cachedInfo = undefined;
+            await this.state.update(CONTEXT_CAPS_KEY, Object.keys(caps).length > 0 ? caps : undefined);
+            await this.state.update(CONTEXT_CAPS_BASE_KEY, Object.keys(baseCaps).length > 0 ? baseCaps : undefined);
+            this.infoChangeEvent.fire();
+        }).catch(() => undefined);
+        return this.contextMarginQueue;
+    }
+
+    setContextMargin(value: number, notify = true): Promise<void> {
+        const margin = Number.isFinite(value) ? Math.min(50, Math.max(0, Math.round(value))) : 0;
+        this.contextMarginQueue = this.contextMarginQueue.then(async () => {
+            const previous = this.getAppliedContextMargin();
+            const caps = { ...this.getContextCaps() };
+            const baseCaps = { ...this.getContextCapsBase(caps) };
+            const factor = 1 - margin / 100;
+            for (const [modelId, cap] of Object.entries(caps)) {
+                if (typeof cap === 'number' && Number.isFinite(cap) && cap > 0) {
+                    const base = baseCaps[modelId];
+                    const original = typeof base === 'number' && Number.isFinite(base) && base > 0
+                        ? base
+                        : Math.max(1, Math.round(cap / (1 - previous / 100)));
+                    baseCaps[modelId] = original;
+                    caps[modelId] = Math.max(1, Math.round(original * factor));
+                } else {
+                    delete baseCaps[modelId];
+                }
+            }
+            this.cachedInfo = undefined;
+            await this.state.update(CONTEXT_CAPS_KEY, Object.keys(caps).length > 0 ? caps : undefined);
+            await this.state.update(CONTEXT_CAPS_BASE_KEY, Object.keys(baseCaps).length > 0 ? baseCaps : undefined);
+            await this.state.update(CONTEXT_MARGIN_KEY, margin);
+            if (notify && previous !== margin) this.infoChangeEvent.fire();
+        }).catch(() => undefined);
+        return this.contextMarginQueue;
+    }
+
+    private getAppliedContextMargin(): number {
+        const stored = this.state.get<number>(CONTEXT_MARGIN_KEY, 0);
+        return Number.isFinite(stored) ? Math.min(50, Math.max(0, stored)) : 0;
+    }
+
+    private getContextCapsBase(caps: Record<string, ContextCapValue>): Record<string, number> {
+        const stored = this.state.get<Record<string, number>>(CONTEXT_CAPS_BASE_KEY);
+        if (stored && typeof stored === 'object' && !Array.isArray(stored)) return stored;
+        const factor = 1 - this.getAppliedContextMargin() / 100;
+        return Object.fromEntries(
+            Object.entries(caps)
+                .filter(
+                    (entry): entry is [string, number] =>
+                        typeof entry[1] === 'number' && Number.isFinite(entry[1]) && entry[1] > 0
+                )
+                .map(([modelId, cap]) => [modelId, Math.max(1, Math.round(cap / factor))])
+        );
+    }
+
+    contextBudgetFor(modelId: string): ContextBudgetOptions {
+        const cfg = vscode.workspace.getConfiguration('openrouterCopilot');
+        const stored = this.getContextCaps()[modelId];
+        if (stored === 'full') {
+            return { policy: 'full' };
+        }
+        const policy = cfg.get<string>('contextWindowPolicy', DEFAULT_CONTEXT_POLICY) === 'full' ? 'full' : 'auto';
+        return { policy, overrideTokens: typeof stored === 'number' ? stored : undefined };
+    }
+
+    /** One row per cached model that has a detected long-context price step. */
+    contextTierRows(): ContextTierRow[] {
+        const caps = this.getContextCaps();
+        /** Prices are display figures; round off binary-float noise (2e-7*1e6). */
+        const perM = (perToken: number): number => Math.round(perToken * 1_000_000 * 1e6) / 1e6;
+        return (this.cachedCatalog ?? [])
+            .flatMap((m): ContextTierRow[] => {
+                const tier = longContextTier(m);
+                if (!tier) {
+                    return [];
+                }
+                const override = caps[m.id];
+                return [
+                    {
+                        modelId: m.id,
+                        label: m.name ?? m.id,
+                        threshold: tier.threshold,
+                        basePromptPerM: perM(parsePrice(m.pricing?.prompt)),
+                        tierPromptPerM: perM(tier.prompt),
+                        effectiveCap: effectiveMaxInputTokens(m, this.contextBudgetFor(m.id)),
+                        override: override === 'full' ? 'full' : typeof override === 'number' ? override : undefined,
+                    },
+                ];
+            })
+            .sort((a, b) => a.label.localeCompare(b.label));
     }
 
     async setTemplate(raw: string): Promise<{ ok: boolean; error?: string }> {
@@ -896,6 +1189,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             return [];
         }
         const models = await this.ensureCatalog(key, token);
+        this.cachedCatalog = models;
         const info = models.map(m => this.toInfo(m));
         this.cachedInfo = info;
         if (this.cachedPresets) {
@@ -975,50 +1269,83 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         const hasConversationId = typeof conversationId === 'string' && conversationId.trim() !== '';
         // Attribute the call to the chat that owns it: the chat itself for a turn,
         // or the last active chat for an internal (sub-agent / utility) call, so
-        // OpenRouter's Sessions view agrees with the panel. With no known parent no
-        // `session_id` is sent at all, so an unowned call cannot mint an orphan
-        // OpenRouter session.
-        const sessionId = resolveCostSession(sessionIdFor(conversationId), hasConversationId);
+        // OpenRouter's Sessions view agrees with the panel. A call that did not come
+        // through the Copilot harness at all (an agent-host / SDK session, whose
+        // client-BYOK bridge carries no chat id) goes to the unattributed cost
+        // bucket and sends no `session_id`, so it is neither blamed on an unrelated
+        // chat nor able to mint an orphan OpenRouter session.
+        const harnessOwned = isHarnessOwnedModelOptions(options.modelOptions);
+        const costKey = resolveCostSession(sessionIdFor(conversationId), hasConversationId, Date.now(), harnessOwned);
+        const sessionId = costKey === UNATTRIBUTED_SESSION_ID ? undefined : costKey;
         const presetSlug = presetSlugFromModelId(model.id);
         const presetModel = presetSlug !== undefined ? presetModelOf(this.presetConfigs.get(presetSlug)) : undefined;
+        const requireToolCall = options.toolMode === vscode.LanguageModelChatToolMode.Required;
         const body = buildRequestBody(
             template,
             model.id,
             toOpenAI(messages),
             options.tools?.map(tool => ({
                 type: 'function',
-                function: { name: tool.name, description: tool.description, parameters: tool.inputSchema },
+                function: {
+                    name: tool.name,
+                    description: tool.description,
+                    parameters: tool.inputSchema ?? { type: 'object', properties: {} },
+                },
             })),
             modelConfiguration,
             presetModel,
-            sessionId
+            sessionId,
+            requireToolCall
         );
+
+        dumpRequestBody(body);
 
         lastStreamUsage = undefined;
         lastStreamProvider = undefined;
         let usage: unknown;
         let provider: string | undefined;
+        const streamState = { reportedAnyPart: false, sawReasoning: false };
+        const trackedProgress: vscode.Progress<ResponsePart> = {
+            report: (part: ResponsePart) => {
+                if (!(part instanceof vscode.LanguageModelDataPart)) {
+                    streamState.reportedAnyPart = true;
+                }
+                progress.report(part);
+            },
+        };
 
         const controller = new AbortController();
         const abortListener = token.onCancellationRequested(() => controller.abort());
         const timeoutId = setTimeout(() => controller.abort(), postTimeoutMs);
 
         try {
-            const response = await fetchWithRetry(
-                `${baseUrl()}/chat/completions`,
-                {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        Authorization: `Bearer ${key}`,
-                        'HTTP-Referer': 'https://github.com/tianyu-liu/vscode-openrouter-copilot-request-credit',
-                        'X-Title': 'OpenRouter for Copilot',
-                    },
-                    body: JSON.stringify(body),
-                    signal: controller.signal,
-                },
-                token
-            );
+            const headers = {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${key}`,
+                'HTTP-Referer': 'https://github.com/tianyu-liu/vscode-openrouter-copilot-request-credit',
+                'X-Title': 'OpenRouter for Copilot',
+            };
+            const init = (payload: unknown): RequestInit => ({
+                method: 'POST',
+                headers,
+                body: JSON.stringify(payload),
+                signal: controller.signal,
+            });
+            let payload: Record<string, unknown> = body;
+            let sanitizedRemoved = 0;
+            if (sanitizeBase64Enabled()) {
+                const cleaned = sanitizeRequestBody(body);
+                payload = cleaned.body;
+                sanitizedRemoved = cleaned.removed;
+            }
+            let response = await fetchWithRetry(`${OPENROUTER_API_BASE_URL}/chat/completions`, init(payload), token);
+            if (response.status === 403 && sanitizedRemoved === 0 && (await isGuardrailBlock(response))) {
+                const cleaned = sanitizeRequestBody(body);
+                if (cleaned.removed > 0) {
+                    progress.report(new vscode.LanguageModelTextPart(GUARDRAIL_RETRY_NOTICE));
+                    response = await fetchWithRetry(`${OPENROUTER_API_BASE_URL}/chat/completions`, init(cleaned.body), token);
+                }
+            }
             clearTimeout(timeoutId);
             await throwIfNotOk(response);
             if (!response.body) {
@@ -1037,13 +1364,12 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
                 }
                 const { done, value } = await reader.read();
                 if (done) {
-                    flushToolCalls(toolCalls, progress);
+                    flushToolCalls(toolCalls, trackedProgress);
                     reportUsagePart(progress, usage);
-                    if (sessionId !== undefined) {
-                        accumulateSessionCost(sessionId, usage, provider, model.id);
-                    }
+                    accumulateSessionCost(costKey, usage, provider, model.id);
                     lastStreamUsage = usage;
                     lastStreamProvider = provider;
+                    finishStream(trackedProgress, streamState);
                     break;
                 }
                 buffer += decoder.decode(value, { stream: true });
@@ -1062,13 +1388,12 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
                         continue;
                     }
                     if (data === '[DONE]') {
-                        flushToolCalls(toolCalls, progress);
+                        flushToolCalls(toolCalls, trackedProgress);
                         reportUsagePart(progress, usage);
-                        if (sessionId !== undefined) {
-                            accumulateSessionCost(sessionId, usage, provider, model.id);
-                        }
+                        accumulateSessionCost(costKey, usage, provider, model.id);
                         lastStreamUsage = usage;
                         lastStreamProvider = provider;
+                        finishStream(trackedProgress, streamState);
                         return;
                     }
                     let json: any;
@@ -1092,9 +1417,9 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
                     }
                     const delta = choice.delta ?? {};
                     if (typeof delta.content === 'string' && delta.content.length > 0) {
-                        progress.report(new vscode.LanguageModelTextPart(delta.content));
+                        trackedProgress.report(new vscode.LanguageModelTextPart(delta.content));
                     }
-                    reportThinkingParts(delta, progress);
+                    reportThinkingParts(delta, trackedProgress, streamState);
                     for (const tc of delta.tool_calls ?? []) {
                         accumulateToolCall(toolCalls, tc);
                     }
@@ -1139,7 +1464,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
 
     private async fetchCatalog(key: string, token: vscode.CancellationToken): Promise<ModelCatalogEntry[]> {
         const response = await fetchWithRetry(
-            `${baseUrl()}/models`,
+            `${OPENROUTER_API_BASE_URL}/models`,
             { headers: { Authorization: `Bearer ${key}` } },
             token
         );
@@ -1195,7 +1520,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
     private async fetchPresets(key: string, token: vscode.CancellationToken): Promise<PresetSummary[] | undefined> {
         try {
             const response = await fetchWithRetry(
-                `${baseUrl()}/presets?limit=100`,
+                `${OPENROUTER_API_BASE_URL}/presets?limit=100`,
                 { headers: { Authorization: `Bearer ${key}` } },
                 token
             );
@@ -1251,7 +1576,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
     ): Promise<Record<string, unknown> | undefined> {
         try {
             const response = await fetchWithRetry(
-                `${baseUrl()}/presets/${encodeURIComponent(slug)}`,
+                `${OPENROUTER_API_BASE_URL}/presets/${encodeURIComponent(slug)}`,
                 { headers: { Authorization: `Bearer ${key}` } },
                 token
             );
@@ -1305,7 +1630,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         }
         const id = `${PRESET_ID_PREFIX}${preset.slug}`;
         const base = this.resolvePresetBase(preset.model, models);
-        const baseInfo = base ? buildModelInfo(base) : undefined;
+        const baseInfo = base ? buildModelInfo(base, this.contextBudgetFor(preset.model)) : undefined;
         const tooltip = [
             `**Preset: ${preset.name}**`,
             `\`${id}\` → \`${preset.model}\` with the preset's pinned provider routing.`,
@@ -1335,7 +1660,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
 
     private toInfo(m: ModelCatalogEntry): ChatModelInfo {
         const [family] = m.id.split('/');
-        const { detail, tooltip, maxInputTokens, maxOutputTokens } = buildModelInfo(m);
+        const { detail, tooltip, maxInputTokens, maxOutputTokens } = buildModelInfo(m, this.contextBudgetFor(m.id));
         const info: ChatModelInfo = {
             id: m.id,
             name: m.name ?? m.id,
@@ -1370,10 +1695,23 @@ function contentOrString(text: string[], multimodal: unknown[]): string | unknow
     return content.length === 1 && typeof content[0] === 'string' ? content[0] : content;
 }
 
+const RUNTIME_SYSTEM_ROLE = (vscode.LanguageModelChatMessageRole as unknown as { System?: number }).System;
+
+function openAIRoleOf(message: vscode.LanguageModelChatRequestMessage): 'assistant' | 'system' | 'user' {
+    if (message.role === vscode.LanguageModelChatMessageRole.Assistant) {
+        return 'assistant';
+    }
+    if (RUNTIME_SYSTEM_ROLE !== undefined && (message.role as number) === RUNTIME_SYSTEM_ROLE) {
+        return 'system';
+    }
+    return 'user';
+}
+
 export function toOpenAI(messages: readonly vscode.LanguageModelChatRequestMessage[]): unknown[] {
     const out: unknown[] = [];
     for (const message of messages) {
-        const role = message.role === vscode.LanguageModelChatMessageRole.Assistant ? 'assistant' : 'user';
+        const role = openAIRoleOf(message);
+        const name = typeof message.name === 'string' && message.name.trim() !== '' ? message.name : undefined;
         const text: string[] = [];
         const thinking: string[] = [];
         const multimodal: unknown[] = [];
@@ -1396,10 +1734,29 @@ export function toOpenAI(messages: readonly vscode.LanguageModelChatRequestMessa
                     function: { name: part.name, arguments: JSON.stringify(part.input ?? {}) },
                 });
             } else if (part instanceof vscode.LanguageModelToolResultPart) {
-                const resultText = part.content
-                    .map(c => (typeof c === 'string' ? c : c instanceof vscode.LanguageModelTextPart ? c.value : JSON.stringify(c)))
-                    .join('\n');
-                toolResults.push({ role: 'tool', tool_call_id: part.callId, content: resultText });
+                const resultParts: string[] = [];
+                for (const c of part.content) {
+                    if (typeof c === 'string') {
+                        resultParts.push(c);
+                    } else if (c instanceof vscode.LanguageModelTextPart) {
+                        resultParts.push(c.value);
+                    } else if (c instanceof vscode.LanguageModelPromptTsxPart) {
+                        resultParts.push(typeof c.value === 'string' ? c.value : JSON.stringify(c.value ?? ''));
+                    } else if (c instanceof vscode.LanguageModelDataPart) {
+                        if (c.mimeType.startsWith('image/')) {
+                            const base64 = Buffer.from(c.data).toString('base64');
+                            multimodal.push({
+                                type: 'image_url',
+                                image_url: { url: `data:${c.mimeType};base64,${base64}` },
+                            });
+                        } else {
+                            resultParts.push(Buffer.from(c.data).toString('utf8'));
+                        }
+                    } else {
+                        resultParts.push(JSON.stringify(c));
+                    }
+                }
+                toolResults.push({ role: 'tool', tool_call_id: part.callId, content: resultParts.join('\n') });
             } else if (part instanceof vscode.LanguageModelDataPart) {
                 if (part.mimeType.startsWith('image/')) {
                     const base64 = Buffer.from(part.data).toString('base64');
@@ -1407,6 +1764,11 @@ export function toOpenAI(messages: readonly vscode.LanguageModelChatRequestMessa
                         type: 'image_url',
                         image_url: { url: `data:${part.mimeType};base64,${base64}` },
                     });
+                } else {
+                    const decoded = Buffer.from(part.data).toString('utf8');
+                    if (decoded.length > 0) {
+                        text.push(decoded);
+                    }
                 }
             }
         }
@@ -1414,7 +1776,11 @@ export function toOpenAI(messages: readonly vscode.LanguageModelChatRequestMessa
             out.push(...toolResults);
             const userContent = contentOrString(text, multimodal);
             if (userContent !== null) {
-                out.push({ role: 'user', content: userContent });
+                const userMessage: Record<string, unknown> = { role: 'user', content: userContent };
+                if (name) {
+                    userMessage.name = name;
+                }
+                out.push(userMessage);
             }
             continue;
         }
@@ -1422,6 +1788,8 @@ export function toOpenAI(messages: readonly vscode.LanguageModelChatRequestMessa
             const converted: Record<string, unknown> = { role };
             if (thinking.length > 0) {
                 converted.reasoning = thinking.join('\n');
+            } else {
+                converted.reasoning_content = '';
             }
             if (toolCalls.length > 0) {
                 converted.content = text.length > 0 ? text.join('\n') : null;
@@ -1437,6 +1805,9 @@ export function toOpenAI(messages: readonly vscode.LanguageModelChatRequestMessa
                     converted.content = content;
                 }
             }
+            if (name) {
+                converted.name = name;
+            }
             out.push(converted);
             continue;
         }
@@ -1446,26 +1817,60 @@ export function toOpenAI(messages: readonly vscode.LanguageModelChatRequestMessa
             continue;
         }
         converted.content = content;
+        if (name) {
+            converted.name = name;
+        }
         out.push(converted);
     }
     return out;
 }
 
-function reportThinkingParts(delta: any, progress: vscode.Progress<ResponsePart>): void {
+export const EMPTY_RESPONSE_FALLBACK = ' ';
+export const REASONING_ONLY_ERROR =
+    'The model produced only reasoning output, which this version of VS Code could not display. ' +
+    'Update VS Code, or pick a model that returns final text.';
+
+export function finishStream(
+    progress: vscode.Progress<ResponsePart>,
+    state: { reportedAnyPart: boolean; sawReasoning: boolean }
+): void {
+    if (state.reportedAnyPart) {
+        return;
+    }
+    if (state.sawReasoning) {
+        throw new Error(REASONING_ONLY_ERROR);
+    }
+    progress.report(new vscode.LanguageModelTextPart(EMPTY_RESPONSE_FALLBACK));
+}
+
+function reportThinkingParts(
+    delta: any,
+    progress: vscode.Progress<ResponsePart>,
+    state?: { sawReasoning: boolean }
+): void {
+    const reasoning = typeof delta.reasoning === 'string' ? delta.reasoning : '';
+    const details = Array.isArray(delta.reasoning_details)
+        ? flattenReasoningDetails(delta.reasoning_details)
+        : undefined;
+    const hasReasoning =
+        reasoning.length > 0 ||
+        (details !== undefined && (details.thinking.length > 0 || details.text.length > 0));
+    if (state && hasReasoning) {
+        state.sawReasoning = true;
+    }
     if (!thinkingPartCtor) {
         return;
     }
-    if (typeof delta.reasoning === 'string' && delta.reasoning.length > 0) {
-        progress.report(new thinkingPartCtor(delta.reasoning));
+    if (reasoning.length > 0) {
+        progress.report(new thinkingPartCtor(reasoning));
         return;
     }
-    if (Array.isArray(delta.reasoning_details)) {
-        const { thinking, text } = flattenReasoningDetails(delta.reasoning_details);
-        if (thinking.length > 0) {
-            progress.report(new thinkingPartCtor(thinking));
+    if (details) {
+        if (details.thinking.length > 0) {
+            progress.report(new thinkingPartCtor(details.thinking));
         }
-        if (text.length > 0) {
-            progress.report(new vscode.LanguageModelTextPart(text));
+        if (details.text.length > 0) {
+            progress.report(new vscode.LanguageModelTextPart(details.text));
         }
     }
 }

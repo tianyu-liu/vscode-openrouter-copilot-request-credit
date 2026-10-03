@@ -42,6 +42,7 @@ function stubProvider(secrets: vscode.SecretStorage) {
         clearKey: async () => {
             await secrets.delete(KEY_STORAGE);
         },
+        setContextCap: async () => { },
     };
 }
 
@@ -155,9 +156,6 @@ suite("extension manifest", () => {
         assert.strictEqual(cfg.get<number>("creditRefreshIntervalMinutes"), 5);
         assert.strictEqual(cfg.get<string>("creditResetPeriod"), "daily");
         assert.strictEqual(cfg.get<boolean>("creditIncludeByok"), true);
-        assert.strictEqual(cfg.get<string>("creditBaseUrl"), "https://openrouter.ai");
-        const copilot = vscode.workspace.getConfiguration("openrouterCopilot");
-        assert.strictEqual(copilot.get<string>("baseUrl"), "https://openrouter.ai/api/v1");
     });
 
     test("Manifest constraints match the documented ranges", () => {
@@ -173,12 +171,10 @@ suite("extension manifest", () => {
         assert.strictEqual((props["openrouterCopilot.creditRefreshIntervalMinutes"] as any).minimum, 1);
         assert.strictEqual((props["openrouterCopilot.creditRefreshIntervalMinutes"] as any).maximum, 1440);
         for (const key of [
-            "openrouterCopilot.baseUrl",
             "openrouterCopilot.creditLimit",
             "openrouterCopilot.creditResetPeriod",
             "openrouterCopilot.creditIncludeByok",
             "openrouterCopilot.creditRefreshIntervalMinutes",
-            "openrouterCopilot.creditBaseUrl",
         ]) {
             assert.strictEqual((props[key] as any).scope, "application", `${key} must be application-scoped`);
         }

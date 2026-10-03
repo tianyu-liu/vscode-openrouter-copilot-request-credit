@@ -1,11 +1,10 @@
 import * as assert from "assert";
 import * as vscode from "vscode";
-import { apiBaseUrl, readConfig } from "../../extension";
+import { readConfig } from "../../extension";
 
 /**
- * A minimal fake WorkspaceConfiguration. `readConfig`/`apiBaseUrl` read global
- * scope only (via inspect().globalValue), so the fake separates global and
- * workspace values to prove workspace overrides are ignored.
+ * A minimal fake WorkspaceConfiguration. `readConfig` reads global scope only
+ * (via inspect().globalValue), so workspace overrides can be shown to be ignored.
  */
 function fakeCfg(
     globalValues: Record<string, unknown> = {},
@@ -16,7 +15,7 @@ function fakeCfg(
         creditResetPeriod: "daily",
         creditIncludeByok: true,
         creditRefreshIntervalMinutes: 5,
-        creditBaseUrl: "https://openrouter.ai",
+        sanitizeBase64Content: true,
     };
     const cfg = {
         get: (key: string, fallback?: unknown) =>
@@ -40,7 +39,27 @@ suite("readConfig", () => {
             resetPeriod: "daily",
             includeByok: true,
             refreshIntervalMinutes: 5,
+            contextPolicy: "auto",
+            contextMarginPercent: 0,
+            sanitizeBase64Content: true,
         });
+    });
+
+    test("contextPolicy: only 'full' opts out; anything else is auto", () => {
+        assert.strictEqual(readConfig(fakeCfg({ contextWindowPolicy: "full" })).contextPolicy, "full");
+        assert.strictEqual(readConfig(fakeCfg({ contextWindowPolicy: "AUTO" })).contextPolicy, "auto");
+        assert.strictEqual(readConfig(fakeCfg()).contextPolicy, "auto");
+    });
+
+    test("contextMarginPercent: clamps to 0-50 and falls back to 0", () => {
+        assert.strictEqual(readConfig(fakeCfg({ contextSafetyMarginPercent: -1 })).contextMarginPercent, 0);
+        assert.strictEqual(readConfig(fakeCfg({ contextSafetyMarginPercent: 200 })).contextMarginPercent, 50);
+        assert.strictEqual(readConfig(fakeCfg({ contextSafetyMarginPercent: 10 })).contextMarginPercent, 10);
+        assert.strictEqual(readConfig(fakeCfg({ contextSafetyMarginPercent: NaN })).contextMarginPercent, 0);
+        assert.strictEqual(
+            readConfig(fakeCfg({ contextSafetyMarginPercent: "x" as unknown as number })).contextMarginPercent,
+            0
+        );
     });
 
     test("limit coercion: non-finite -> 0, negative -> 0, valid numbers pass", () => {
@@ -84,49 +103,3 @@ suite("readConfig", () => {
     });
 });
 
-suite("apiBaseUrl", () => {
-    test("accepts a valid global https URL and strips trailing slashes", () => {
-        assert.strictEqual(apiBaseUrl(fakeCfg({ creditBaseUrl: "https://api.example.com///" })), "https://api.example.com");
-        assert.strictEqual(apiBaseUrl(fakeCfg({ creditBaseUrl: "https://openrouter.ai/api" })), "https://openrouter.ai/api");
-    });
-
-    test("falls back to the default for non-https or unparsable values", () => {
-        assert.strictEqual(apiBaseUrl(fakeCfg({ creditBaseUrl: "http://insecure.example.com" })), "https://openrouter.ai");
-        assert.strictEqual(apiBaseUrl(fakeCfg({ creditBaseUrl: "ftp://example.com" })), "https://openrouter.ai");
-        assert.strictEqual(apiBaseUrl(fakeCfg({ creditBaseUrl: "not a url" })), "https://openrouter.ai");
-        assert.strictEqual(apiBaseUrl(fakeCfg({ creditBaseUrl: "https://" })), "https://openrouter.ai");
-    });
-
-    test("workspace-scoped baseUrl values are ignored", () => {
-        assert.strictEqual(
-            apiBaseUrl(fakeCfg({}, { creditBaseUrl: "https://evil.example.com" })),
-            "https://openrouter.ai"
-        );
-    });
-
-    test("warns once per bad value, and warns again after a good value", () => {
-        const original = vscode.window.showWarningMessage;
-        let warnings = 0;
-        (vscode.window as { showWarningMessage: unknown }).showWarningMessage = (() => {
-            warnings++;
-            return Promise.resolve(undefined);
-        }) as typeof original;
-        try {
-            // Reset the warn-once flag with a valid value first (module state
-            // persists across tests).
-            apiBaseUrl(fakeCfg({ creditBaseUrl: "https://openrouter.ai" }));
-            assert.strictEqual(apiBaseUrl(fakeCfg({ creditBaseUrl: "http://bad.example.com" })), "https://openrouter.ai");
-            assert.strictEqual(warnings, 1);
-            // Same bad value again: no second warning (warn once).
-            assert.strictEqual(apiBaseUrl(fakeCfg({ creditBaseUrl: "http://bad.example.com" })), "https://openrouter.ai");
-            assert.strictEqual(warnings, 1);
-            // A good value resets the flag, so a later bad value warns again.
-            apiBaseUrl(fakeCfg({ creditBaseUrl: "https://openrouter.ai" }));
-            assert.strictEqual(apiBaseUrl(fakeCfg({ creditBaseUrl: "http://bad.example.com" })), "https://openrouter.ai");
-            assert.strictEqual(warnings, 2);
-        } finally {
-            (vscode.window as { showWarningMessage: unknown }).showWarningMessage = original;
-            apiBaseUrl(fakeCfg({ creditBaseUrl: "https://openrouter.ai" }));
-        }
-    });
-});

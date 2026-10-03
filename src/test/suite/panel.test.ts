@@ -1,7 +1,7 @@
 import * as assert from "assert";
 import * as vscode from "vscode";
-import { handlePanelMessage, PanelDeps, renderPanelHtml, renderSessionCosts } from "../../panel";
-import { SessionCost, stripTemplateComments } from "../../provider";
+import { handlePanelMessage, PanelDeps, renderContextTiers, renderPanelHtml, renderSessionCosts } from "../../panel";
+import { SessionCost, stripTemplateComments, UNATTRIBUTED_SESSION_ID } from "../../provider";
 import { KEY_SECRET } from "../../storage";
 import { KeyInfo } from "../../logic";
 
@@ -183,9 +183,81 @@ suite("renderSessionCosts", () => {
         const html = renderSessionCosts([sessionFixture({ updatedAt: 1 })]);
         assert.ok(!html.includes("sessiontime"), "no bogus 1970 stamp");
     });
+
+    test("a chat-only list is unchanged: no unattributed entry or note", () => {
+        const html = renderSessionCosts([sessionFixture(), sessionFixture({ sessionId: "copilot-chat:b", paid: 0.002 })]);
+        assert.ok(!html.includes("Unattributed"), "no bucket row for harness-owned spend");
+        assert.ok(!html.includes("carried no chat identifier"), "and no bucket note in the footer");
+    });
+
+    test("spend with no chat id renders as a labelled Unattributed entry", () => {
+        const html = renderSessionCosts([
+            sessionFixture({ sessionId: UNATTRIBUTED_SESSION_ID, byok: true }),
+            sessionFixture({ sessionId: "copilot-chat:chat", paid: 0.002 }),
+        ]);
+        assert.strictEqual((html.match(/<details/g) ?? []).length, 2, "one row per chat plus the bucket");
+        assert.ok(html.includes("Unattributed (no chat id)"), "the bucket is labelled");
+        assert.ok(!html.includes("OpenRouter session <code>unattributed"), "the bucket is not described as an OpenRouter session");
+        assert.ok(html.includes("Spend that reached OpenRouter with no Copilot chat identifier"), "the bucket explains itself");
+        assert.ok(html.includes("carried no chat identifier is collected under the Unattributed entry"), "and the footer mentions it");
+    });
+
+    test("the bucket is expanded when it is the only entry", () => {
+        const html = renderSessionCosts([sessionFixture({ sessionId: UNATTRIBUTED_SESSION_ID })]);
+        assert.strictEqual((html.match(/\bopen\b/g) ?? []).length, 1, "the lone entry is expanded");
+        assert.ok(html.includes("Unattributed (no chat id)"), html);
+    });
+
+    test("a chat keeps the expansion when a bucket is also present", () => {
+        const html = renderSessionCosts([
+            sessionFixture({ sessionId: UNATTRIBUTED_SESSION_ID }),
+            sessionFixture({ sessionId: "copilot-chat:chat", paid: 0.002 }),
+        ]);
+        const bucketAt = html.indexOf("Unattributed (no chat id)");
+        const chatAt = html.indexOf("copilot-chat:chat");
+        assert.ok(bucketAt > chatAt, "the bucket is listed last");
+        assert.strictEqual((html.match(/\bopen\b/g) ?? []).length, 1, "only the newest chat is expanded");
+        assert.ok(html.slice(0, bucketAt).includes(" open"), "the chat carries the expansion, not the bucket");
+    });
+
+    test("the empty state mentions the unattributed bucket", () => {
+        const html = renderSessionCosts([]);
+        assert.ok(html.includes("No OpenRouter spend recorded yet"), html);
+        assert.ok(html.includes("<strong>Unattributed</strong>"), "so a byok agent-host session is not a mystery");
+    });
+
+    test("a zero-spend bucket is omitted like any other session", () => {
+        const html = renderSessionCosts([sessionFixture({ sessionId: UNATTRIBUTED_SESSION_ID, paid: 0, upstream: 0, openRouter: 0 })]);
+        assert.ok(!html.includes("<details"), "nothing was spent, so no entry is rendered");
+        assert.ok(!html.includes("Unattributed (no chat id)"), "not even a labelled one");
+        assert.ok(html.includes("No OpenRouter spend recorded yet"), "the list falls back to the empty state");
+    });
 });
 
 suite("renderPanelHtml", () => {
+    test("renders ordered accessible tabs with Key Info selected and session spend second", () => {
+        const html = renderPanelHtml(undefined, 10, "daily", true, 5);
+        assert.ok(!html.includes("<h1>OpenRouter for Copilot</h1>"));
+        assert.match(html, /id="tab-key-info" role="tab" aria-selected="true" aria-controls="panel-key-info" tabindex="0">Key Info<\/button>/);
+        assert.match(html, /id="tab-session-spend" role="tab" aria-selected="false" aria-controls="panel-session-spend" tabindex="-1">Session Spend<\/button>/);
+        assert.match(html, /id="tab-request" role="tab" aria-selected="false" aria-controls="panel-request" tabindex="-1">Request<\/button>/);
+        assert.match(html, /id="tab-context" role="tab" aria-selected="false" aria-controls="panel-context"/);
+        assert.match(html, /id="panel-key-info" role="tabpanel" aria-labelledby="tab-key-info" tabindex="0">[\s\S]*id="key"[\s\S]*Credit usage/);
+        assert.match(html, /id="panel-session-spend" role="tabpanel" aria-labelledby="tab-session-spend" tabindex="0" hidden>[\s\S]*Session Spend/);
+        assert.match(html, /id="panel-request" role="tabpanel" aria-labelledby="tab-request" tabindex="0" hidden>[\s\S]*Custom request/);
+        assert.match(html, /id="panel-context" role="tabpanel" aria-labelledby="tab-context" tabindex="0" hidden>/);
+        assert.ok(html.indexOf('id="tab-key-info"') < html.indexOf('id="tab-request"'));
+        assert.ok(html.indexOf('id="tab-session-spend"') < html.indexOf('id="tab-request"'));
+        assert.ok(html.indexOf('id="tab-request"') < html.indexOf('id="tab-context"'));
+    });
+
+    test("restores the active tab from VS Code webview state on each render", () => {
+        const html = renderPanelHtml(undefined, 10, "daily", true, 5);
+        assert.match(html, /const savedTab = vsc\.getState\(\)\?\.activeTab/);
+        assert.match(html, /const initialTab = tabs\.find\(\(tab\) => tab\.id === savedTab\) \|\| tabs\[0\]/);
+        assert.match(html, /vsc\.setState\(\{ activeTab: tab\.id \}\)/);
+    });
+
     test("ships a per-render nonce CSP and escapes the masked key into the script", () => {
         const html = renderPanelHtml(BASE_INFO, 10, "daily", true, 5, undefined, `<img src=x onerror="alert(1)">`);
         assert.ok(html.includes("default-src 'none'"), "CSP default-src 'none' present");
@@ -219,25 +291,45 @@ suite("renderPanelHtml", () => {
         assert.ok(!withoutErr.includes('<div class="errbanner">'));
     });
 
-    test("disables reset period and BYOK controls when the guardrail is disabled", () => {
+    test("keeps reset period and BYOK controls editable when the guardrail is disabled", () => {
         const disabled = renderPanelHtml(BASE_INFO, 0, "daily", true, 5);
-        assert.ok(disabled.includes('<select id="resetPeriod" disabled>'));
-        assert.ok(disabled.includes('<input type="checkbox" id="includeByok" checked disabled'));
+        assert.ok(disabled.includes('<select id="resetPeriod" aria-label="Spending limit reset period"'));
+        assert.ok(disabled.includes('<input type="checkbox" id="includeByok" checked title='));
         const enabled = renderPanelHtml(BASE_INFO, 10, "daily", true, 5);
-        assert.ok(!enabled.includes('<select id="resetPeriod" disabled>'));
-        assert.ok(!enabled.includes('id="includeByok" checked disabled'));
+        assert.ok(enabled.includes('<select id="resetPeriod" aria-label="Spending limit reset period"'));
+        assert.ok(enabled.includes('id="includeByok" checked title='));
     });
 
     test("shows the no-key placeholder when there is no info", () => {
         const html = renderPanelHtml(undefined, 10, "daily", true, 5);
-        assert.ok(html.includes("No key info yet."));
+        assert.ok(html.includes("No usage information yet."));
         assert.ok(html.includes("No API key set"));
+    });
+
+    test("renders editable controls for all contributed settings without key details", () => {
+        const html = renderPanelHtml(undefined, 10, "daily", true, 5);
+        for (const id of [
+            "limit",
+            "resetPeriod",
+            "includeByok",
+            "refreshInterval",
+            "contextPolicy",
+            "contextMargin",
+            "sanitizeBase64",
+        ]) {
+            assert.ok(html.includes(`id="${id}"`), `${id} control is rendered`);
+        }
+        assert.ok(!html.includes('id="limit" min="0" step="0.01" value="10" disabled'));
+        assert.ok(html.includes('id="sanitizeBase64" checked'));
+        assert.ok(html.includes('title="Refresh usage data every 1 to 1440 minutes"'));
+        assert.ok(html.includes('aria-label="Spending limit reset period"'));
+        assert.ok(html.includes('Custom-cap reduction:</strong> Changing this percentage scales every saved numeric Custom cap in place across all models.'));
     });
 
     test("renders the custom request section, pre-filled from the saved template", () => {
         const template = { temperature: 0.2, provider: { quantizations: ["fp8"] } };
         const html = renderPanelHtml(undefined, 10, "daily", true, 5, undefined, undefined, undefined, undefined, template);
-        assert.ok(html.includes(">Custom Request</div>"), "custom request section present");
+        assert.ok(html.includes(">Custom request</div>"), "custom request section present");
         assert.ok(html.includes('id="saveTemplate">Save request</button>'), "Save request button present");
         assert.ok(!html.includes('id="clearTemplate"'), "Clear button removed");
         const prefill = html.match(/templateEl\.value = (.*);/);
@@ -263,87 +355,77 @@ suite("renderPanelHtml", () => {
         assert.ok(!html.includes("</script>alert(1)"), "the injected script body cannot terminate the page script");
     });
 
-    test("renders the enforced-options footnote block with numbered anchors", () => {
+    test("places concise guidance with the relevant panel sections", () => {
         const html = renderPanelHtml(undefined, 10, "daily", true, 5);
-        assert.ok(html.includes("How your pasted request is applied"), "footnote block title present");
-        assert.ok(html.includes('class="footnotes"'), "footnote block wrapper present");
-        assert.ok(html.includes('id="fn-1"'), "stream footnote anchor present");
-        assert.ok(html.includes('id="fn-2"'), "session_id footnote anchor present");
-        assert.ok(html.includes('id="fn-3"'), "application semantics footnote anchor present");
-        assert.ok(html.includes('id="fn-4"'), "reasoning precedence footnote anchor present");
-        assert.ok(html.includes('id="fn-5"'), "provider merge/passthrough footnote anchor present");
-        assert.ok(html.includes('id="fn-6"'), "usage accounting footnote anchor present");
-        assert.ok(html.includes('id="fn-7"'), "key storage footnote anchor present");
-        assert.ok(html.includes('id="fn-8"'), "anthropic cache_control footnote anchor present");
-        assert.ok(html.includes('id="fn-10"'), "per-turn usage footnote anchor present");
-        assert.ok(html.includes("Session spend"), "the session-spend section is rendered");
+        const keyInfoStart = html.indexOf('<section class="tab-panel" id="panel-key-info"');
+        const sessionSpendStart = html.indexOf('<section class="tab-panel" id="panel-session-spend"');
+        const requestStart = html.indexOf('<section class="tab-panel" id="panel-request"');
+        const contextStart = html.indexOf('<section class="tab-panel" id="panel-context"');
+        const scriptStart = html.indexOf('<script nonce=');
+        const keyInfo = html.slice(keyInfoStart, sessionSpendStart);
+        const sessionSpend = html.slice(sessionSpendStart, requestStart);
+        const request = html.slice(requestStart, contextStart);
+        const context = html.slice(contextStart, scriptStart);
+        assert.ok(keyInfo.includes("SecretStorage"), "key storage note stays with key controls");
+        assert.ok(sessionSpend.includes("BYOK routes:</strong> When OpenRouter reports zero"), "BYOK note stays with session spend");
+        assert.ok(request.includes("Responses stream automatically"), "request behavior notes stay by the template");
+        assert.ok(request.includes("No routing is added automatically"), "provider routing is accurately described");
+        assert.ok(context.includes("context indicator"), "token usage guidance is on Context");
+        assert.ok(html.includes('aria-label="OpenRouter API key"'), "key input has an accessible name");
+        assert.ok(html.includes('aria-label="Custom request JSON"'), "request editor has an accessible name");
+        assert.ok(!html.includes("id=\"fn-"), "numbered internal footnote anchors are removed");
     });
 
-    test("footnote fn-2 states the real session_id behavior (no per-window random ID)", () => {
-        const html = renderPanelHtml(undefined, 10, "daily", true, 5);
-        assert.ok(html.includes("there is no per-window random ID"), "the no-random-id rule is documented");
-        assert.ok(
-            !html.includes("does a per-window random ID apply"),
-            "the stale per-window-random-ID claim is removed"
+    test("Context limits section renders policy and Custom-only margin guidance", () => {
+        const auto = renderPanelHtml(
+            undefined, 10, "daily", true, 5,
+            undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, "auto", 0
         );
-        assert.ok(
-            html.includes("the most recently active chat\u2019s id is used instead"),
-            "parent-chat attribution for internal calls is documented"
+        assert.ok(auto.includes('id="contextPolicy"'), "policy control present");
+        assert.ok(auto.includes('id="contextMargin"'), "margin control present");
+        assert.ok(auto.includes('<option value="auto" selected>'), "auto selected by default");
+        assert.ok(auto.includes("context_length \u2212 max_output"), "the accurate-budget rule is stated");
+        assert.ok(auto.includes("Changing this percentage scales every saved numeric Custom cap in place across all models"), "margin scope and in-place behavior are explained");
+        assert.ok(auto.includes("Auto and Full selections are unchanged"), "Auto/Full are not reduced by the margin");
+        const full = renderPanelHtml(
+            undefined, 10, "daily", true, 5,
+            undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, "full", 10
         );
+        assert.ok(full.includes('<option value="full" selected>'), "full selected when configured");
+        assert.ok(full.includes('value="10"'), "the margin value is rendered");
     });
 
-    test("footnote fn-10 documents the per-turn token and cost readout honestly", () => {
-        const html = renderPanelHtml(undefined, 10, "daily", true, 5);
-        assert.ok(html.includes('id="fn-10"'), "per-turn usage footnote anchor present");
-        assert.ok(
-            html.includes("forwards OpenRouter\u2019s own <code>usage</code> chunk"),
-            "usage passthrough to Copilot documented"
+    test("Context limits table lists tier models with threshold, prices and a control", () => {
+        const rows = [
+            { modelId: "openai/gpt-5.6", label: "GPT-5.6", threshold: 272000, basePromptPerM: 0.2, tierPromptPerM: 0.4, effectiveCap: 272000 },
+            { modelId: "openai/gpt-6-sol", label: "GPT-6 Sol", threshold: 272000, basePromptPerM: 2, tierPromptPerM: 4, effectiveCap: 200000, override: 200000 as const },
+        ];
+        const html = renderPanelHtml(
+            undefined, 10, "daily", true, 5,
+            undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, "auto", 0, rows
         );
-        assert.ok(html.includes("the context-usage ring shows used / max tokens"), "context ring documented");
-        assert.ok(
-            html.includes("Session spend"),
-            "the real cost surface is named"
-        );
-        assert.ok(
-            html.includes("cost_details.upstream_inference_cost"),
-            "the BYOK cost fallback is documented"
-        );
-        assert.ok(
-            !html.includes("response footer shows the turn"),
-            "must not claim a footer cost that Copilot cannot render for this provider"
-        );
-        assert.ok(
-            html.includes("never written into the chat transcript"),
-            "must not imply cost is injected into the conversation"
-        );
+        assert.ok(html.includes('class="routes contexttiers"'), "table rendered");
+        assert.ok(html.includes("GPT-5.6"), "model label rendered");
+        assert.ok(html.includes("272,000"), "threshold rendered");
+        assert.ok(html.includes("$0.200") && html.includes("$0.400"), "base and stepped prices rendered");
+        assert.ok(html.includes('class="capmode"'), "the mode control rendered");
+        assert.ok(html.includes('data-model="openai/gpt-5.6"'), "the model id rides on the control");
+        assert.ok(html.includes('<option value="custom" selected>'), "the override row shows Custom");
+        assert.ok(html.includes('value="200000"'), "the custom cap is rendered");
+        const empty = renderPanelHtml(undefined, 10, "daily", true, 5);
+        assert.ok(empty.includes("No model in the current catalog has a long-context price step"), "empty state shown");
     });
 
-    test("footnotes surface the anthropic cache_control and the verbatim passthrough rules", () => {
+    test("request guidance states cache behavior and avoids blanket verbatim passthrough", () => {
         const html = renderPanelHtml(undefined, 10, "daily", true, 5);
         assert.ok(
-            html.includes("Anthropic-family models (<code>anthropic/*</code>) get a top-level <code>cache_control</code>"),
+            html.includes("Anthropic-family models (<code>anthropic/*</code>, including <code>~anthropic/*</code>) get a top-level, 5-minute <code>cache_control</code>"),
             "anthropic auto cache_control footnote present"
         );
-        assert.ok(html.includes("unless your template sets its own <code>cache_control</code>"), "template cache_control override documented");
         assert.ok(
-            html.includes("No built-in defaults"),
-            "no-defaults footnote wording present"
+            html.includes("No routing is added automatically. A pasted <code>provider</code> object passes through unchanged."),
+            "provider routing passthrough is clear"
         );
-        assert.ok(
-            html.includes("including a <code>provider</code> object, is sent verbatim to every request"),
-            "verbatim passthrough footnote wording present"
-        );
-        assert.ok(html.includes("is sent verbatim to every request"), "passthrough rule wording present");
-    });
-
-    test("footnotes describe verbatim provider passthrough without quantization wording", () => {
-        const html = renderPanelHtml(undefined, 10, "daily", true, 5);
-        assert.ok(
-            html.includes("including a <code>provider</code> object, is sent verbatim"),
-            "verbatim provider passthrough described without routing defaults"
-        );
-        assert.ok(!html.includes("quantizations"), "no quantization-specific mention in the footnotes");
-        assert.ok(!html.includes('<sup><a href="#'), "no standalone sup markers outside the list");
         assert.ok(
             !html.includes("always-applied quality floor"),
             "floor-specific provider-merge hint removed"
@@ -377,6 +459,7 @@ function spyDeps(): {
     setKeys: string[];
     clearedKeys: number;
     syncedPresets: Array<string | undefined>;
+    contextCaps: Array<[string, unknown]>;
 } {
     const secrets = fakeSecrets();
     const state = {
@@ -389,6 +472,7 @@ function spyDeps(): {
         setKeys: [] as string[],
         clearedKeys: 0,
         syncedPresets: [] as Array<string | undefined>,
+        contextCaps: [] as Array<[string, unknown]>,
     };
     const deps: PanelDeps = {
         updateConfig: async (key, value) => {
@@ -427,6 +511,9 @@ function spyDeps(): {
         syncPresetSelection: (slug) => {
             state.syncedPresets.push(slug);
         },
+        setContextCap: async (modelId, value) => {
+            state.contextCaps.push([modelId, value]);
+        },
     };
     return {
         deps,
@@ -447,6 +534,9 @@ function spyDeps(): {
         },
         get syncedPresets() {
             return state.syncedPresets;
+        },
+        get contextCaps() {
+            return state.contextCaps;
         },
     };
 }
@@ -528,6 +618,64 @@ suite("handlePanelMessage", () => {
         const ok = spyDeps();
         await handlePanelMessage({ type: "saveRefreshInterval", value: "1440" }, ok.deps);
         assert.deepStrictEqual(ok.updates, [["creditRefreshIntervalMinutes", 1440]]);
+    });
+
+    test("saveSanitizeBase64 requires a boolean and updates the setting", async () => {
+        const bad = spyDeps();
+        await handlePanelMessage({ type: "saveSanitizeBase64", value: "false" }, bad.deps);
+        assert.deepStrictEqual(bad.errors, ["invalid base64 sanitization flag"]);
+        assert.strictEqual(bad.updates.length, 0);
+        const ok = spyDeps();
+        await handlePanelMessage({ type: "saveSanitizeBase64", value: false }, ok.deps);
+        assert.deepStrictEqual(ok.updates, [["sanitizeBase64Content", false]]);
+        assert.strictEqual(ok.refreshes, 1);
+    });
+
+    test("saveContextPolicy accepts only auto/full", async () => {
+        const bad = spyDeps();
+        await handlePanelMessage({ type: "saveContextPolicy", value: "sideways" }, bad.deps);
+        assert.deepStrictEqual(bad.errors, ["invalid context policy"]);
+        assert.strictEqual(bad.updates.length, 0);
+        const ok = spyDeps();
+        await handlePanelMessage({ type: "saveContextPolicy", value: "full" }, ok.deps);
+        assert.deepStrictEqual(ok.updates, [["contextWindowPolicy", "full"]]);
+    });
+
+    test("saveContextMargin enforces the 0-50 range", async () => {
+        for (const value of ["-1", "51", "abc"]) {
+            const s = spyDeps();
+            await handlePanelMessage({ type: "saveContextMargin", value }, s.deps);
+            assert.strictEqual(s.errors.length, 1, `value ${value}`);
+            assert.match(s.errors[0], /invalid safety margin/);
+            assert.strictEqual(s.updates.length, 0);
+        }
+        const ok = spyDeps();
+        await handlePanelMessage({ type: "saveContextMargin", value: "10" }, ok.deps);
+        assert.deepStrictEqual(ok.updates, [["contextSafetyMarginPercent", 10]]);
+    });
+
+    test("setContextCap maps auto/full/custom and rejects an invalid cap", async () => {
+        const auto = spyDeps();
+        await handlePanelMessage({ type: "setContextCap", modelId: "openai/gpt-5.6", mode: "auto" }, auto.deps);
+        assert.deepStrictEqual(auto.contextCaps, [["openai/gpt-5.6", null]]);
+        const full = spyDeps();
+        await handlePanelMessage({ type: "setContextCap", modelId: "openai/gpt-5.6", mode: "full" }, full.deps);
+        assert.deepStrictEqual(full.contextCaps, [["openai/gpt-5.6", "full"]]);
+        const custom = spyDeps();
+        await handlePanelMessage({ type: "setContextcap", modelId: "openai/gpt-5.6", mode: "custom", value: "200000" } as never, custom.deps);
+        assert.strictEqual(custom.contextCaps.length, 0, "a wrong-cased type is ignored");
+        const ok = spyDeps();
+        await handlePanelMessage({ type: "setContextCap", modelId: "openai/gpt-5.6", mode: "custom", value: "200000" }, ok.deps);
+        assert.deepStrictEqual(ok.contextCaps, [["openai/gpt-5.6", 200000]]);
+        for (const value of ["0", "abc"]) {
+            const bad = spyDeps();
+            await handlePanelMessage({ type: "setContextCap", modelId: "openai/gpt-5.6", mode: "custom", value }, bad.deps);
+            assert.deepStrictEqual(bad.errors, ["invalid context cap"], `value ${value}`);
+            assert.strictEqual(bad.contextCaps.length, 0);
+        }
+        const noModel = spyDeps();
+        await handlePanelMessage({ type: "setContextCap", modelId: "  ", mode: "auto" }, noModel.deps);
+        assert.deepStrictEqual(noModel.errors, ["invalid model for the context cap"]);
     });
 
     test("clearKey deletes the secret and re-renders via the no-key refresh path", async () => {
@@ -788,13 +936,11 @@ suite("renderPanelHtml presets section", () => {
         assert.ok(html.includes("appendChild(option)"), "the presetSelection handler appends a not-in-list option");
     });
 
-    test("footnote fn-9 documents preset application without overriding the preset routing", () => {
+    test("preset guidance explains replacement and picker precedence", () => {
         const html = renderPanelHtml(undefined, 10, "daily", true, 5);
-        assert.ok(html.includes('id="fn-9"'), "preset footnote anchor present");
-        assert.ok(html.includes('<code>"preset": "&lt;slug&gt;"</code>'), "preset template field documented");
+        assert.ok(html.includes('Selecting a preset replaces the saved request with <code>{"preset": "&lt;slug&gt;"}</code>'));
+        assert.ok(html.includes('Selecting “No preset loaded” clears it.'));
         assert.ok(html.includes("<code>@preset/&lt;slug&gt;</code>"), "picker entry form documented");
-        assert.ok(html.includes("other models are untouched while the custom request is empty"), "picker isolation documented");
-        assert.ok(html.includes("the picker entry wins as the preset reference"), "picker-over-template preset precedence documented");
-        assert.ok(html.includes("a pasted <code>provider</code> overrides it"), "template provider precedence documented");
+        assert.ok(html.includes("takes precedence over a different template preset"), "picker preset precedence documented");
     });
 });

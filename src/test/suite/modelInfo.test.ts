@@ -2,14 +2,114 @@ import * as assert from "assert";
 import {
     buildModelInfo,
     buildReasoningSchema,
+    effectiveMaxInputTokens,
     effortFromModelConfiguration,
     enabledFromModelConfiguration,
     formatPerM,
     formatPricePerM,
     formatUsd,
+    longContextTier,
     parsePrice,
     type ModelCatalogEntry,
 } from "../../modelInfo";
+
+const OPENAI_LONG_CONTEXT: ModelCatalogEntry = {
+    id: "openai/gpt-5.6-luna-pro",
+    context_length: 1_050_000,
+    pricing: {
+        prompt: "0.0000002",
+        completion: "0.0000012",
+        input_cache_read: "0.00000002",
+        input_cache_write: "0.00000025",
+        overrides: [
+            {
+                min_prompt_tokens: 272000,
+                prompt: "0.0000004",
+                completion: "0.0000018",
+                input_cache_read: "0.00000004",
+                input_cache_write: "0.0000005",
+            },
+        ],
+    },
+    top_provider: { max_completion_tokens: 128_000 },
+};
+
+suite("long-context pricing", () => {
+    test("detects the smallest surcharge threshold and its stepped prices", () => {
+        const tier = longContextTier(OPENAI_LONG_CONTEXT);
+        assert.ok(tier);
+        assert.strictEqual(tier!.threshold, 272000);
+        assert.strictEqual(tier!.prompt, 0.0000004);
+        assert.strictEqual(tier!.completion, 0.0000018);
+        assert.strictEqual(tier!.inputCacheRead, 0.00000004);
+        assert.strictEqual(tier!.inputCacheWrite, 0.0000005);
+    });
+
+    test("ignores time-of-day overrides without a token threshold", () => {
+        const tier = longContextTier({
+            id: "tencent/hy4-preview",
+            context_length: 200000,
+            pricing: { prompt: "0.0000008", overrides: [{ utc_start: 0, utc_end: 1600, prompt: "0.000001" }] },
+        });
+        assert.strictEqual(tier, undefined);
+    });
+
+    test("ignores a discount and a threshold at or above the window", () => {
+        assert.strictEqual(
+            longContextTier({
+                id: "x/discount",
+                context_length: 200000,
+                pricing: { prompt: "0.000001", overrides: [{ min_prompt_tokens: 100000, prompt: "0.0000005" }] },
+            }),
+            undefined
+        );
+        assert.strictEqual(
+            longContextTier({
+                id: "x/quirk",
+                context_length: 200000,
+                pricing: { prompt: "0.000001", overrides: [{ min_prompt_tokens: 200000, prompt: "0.000002" }] },
+            }),
+            undefined
+        );
+    });
+
+    test("picks the cheapest of several surcharge thresholds", () => {
+        const tier = longContextTier({
+            id: "qwen/qwen3.7-flash",
+            context_length: 400000,
+            pricing: {
+                prompt: "0.0000005",
+                completion: "0.000001",
+                overrides: [
+                    { min_prompt_tokens: 256000, prompt: "0.0000015", completion: "0.000003" },
+                    { min_prompt_tokens: 32000, prompt: "0.0000008", completion: "0.0000016" },
+                ],
+            },
+        });
+        assert.strictEqual(tier?.threshold, 32000);
+    });
+
+    test("reports context minus output, capped at the tier on auto", () => {
+        assert.strictEqual(effectiveMaxInputTokens(OPENAI_LONG_CONTEXT), 272000);
+    });
+
+    test("full policy reports the whole input budget", () => {
+        assert.strictEqual(effectiveMaxInputTokens(OPENAI_LONG_CONTEXT, { policy: "full" }), 922000);
+    });
+
+    test("a saved per-model Custom cap wins over policy", () => {
+        assert.strictEqual(effectiveMaxInputTokens(OPENAI_LONG_CONTEXT, { overrideTokens: 200000 }), 200000);
+        assert.strictEqual(
+            effectiveMaxInputTokens(OPENAI_LONG_CONTEXT, { policy: "full", overrideTokens: 180000 }),
+            180000
+        );
+    });
+
+    test("a model without a tier reports its accurate input budget", () => {
+        const info = buildModelInfo({ id: "x/y", context_length: 131072, top_provider: { max_completion_tokens: 16384 } });
+        assert.strictEqual(info.maxInputTokens, 114688);
+    });
+});
 
 suite("model info", () => {
     test("parsePrice handles missing and non-numeric values", () => {
@@ -110,12 +210,13 @@ suite("model info", () => {
         };
         const info = buildModelInfo(m);
         assert.strictEqual(info.detail, "~$0.030/1M");
-        assert.ok(info.tooltip.includes("1,310,720 tokens"), "context listed");
+        assert.ok(info.tooltip.includes("1,310,720 tokens"), "context window listed");
+        assert.ok(info.tooltip.includes("367,002 tokens"), "input budget is context minus output");
         assert.ok(info.tooltip.includes("943,718 tokens"), "max output read from top_provider");
         assert.ok(info.tooltip.includes("tool calling"));
         assert.ok(info.tooltip.includes("text-only"));
         assert.ok(info.tooltip.includes("Reasoning: optional (supported: low, high, max, none; default: high)"));
-        assert.strictEqual(info.maxInputTokens, 1310720);
+        assert.strictEqual(info.maxInputTokens, 367002, "input budget = context minus max output");
         assert.strictEqual(info.maxOutputTokens, 943718);
     });
 

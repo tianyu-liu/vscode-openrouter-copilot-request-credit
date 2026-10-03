@@ -9,7 +9,8 @@ A VS Code extension that registers a **customizable OpenRouter provider** in Cop
 - **Presets**: pick a preset in the panel to send `"preset": "<slug>"` on every request; presets that pin a model also appear in the picker as `@preset/<slug>` entries (up to the first 25). Picker preset entries affect only turns on that entry.
 - Reasoning models get VS Code's native **Thinking Effort** selector (or a simple on/off toggle); reasoning traces render in chat.
 - Anthropic-family models (`anthropic/*`) automatically get a top-level `cache_control` (unless your pasted body sets its own).
-- Model picker entries show estimated blended price per 1M tokens, context window, max output, and capabilities.
+- Model picker entries show estimated blended price per 1M tokens, context window, max output, and capabilities — and, where OpenRouter charges more above a long-context threshold (e.g. OpenAI GPT above 272K tokens), the base vs stepped price and the input cap that keeps you in the cheaper tier.
+- **Context limits**: Auto caps tiered models at the surcharge threshold; Full uses the model input budget; per-model Custom caps can be set for any tiered model. The safety margin scales numeric Custom caps only, across all models.
 - **Used context size in Copilot Chat**: every turn forwards OpenRouter's own `usage` chunk (prompt/completion tokens, cache reads) to Copilot, so the context-usage ring shows *used / max tokens*.
 - **Session spend in the panel**: a **Session spend** section accumulates what each chat session has cost in this window, with a collapsible per-session breakdown by provider and model (see below). Nothing is added to the chat transcript.
 - **One OpenRouter session per Copilot chat session**: the `session_id` is the chat's own persisted id, so turns stay grouped in one OpenRouter session (sticky routing + the Logs → Sessions view) even after a window reload or a full VS Code restart. A new chat is a new OpenRouter session. Background/internal calls (sub-agents, and Copilot's own utility flows) join the chat that triggered them; when there is no such chat, no `session_id` is sent, so no stray session is created.
@@ -19,7 +20,7 @@ Always enforced (pasted copies are ignored): `model`, `messages`, and `tools` co
 
 ## The panel
 
-One webview, **"OpenRouter for Copilot"**, with five sections: **Settings** (save/clear the API key), **Usage** (credit dashboard), **Session spend** (per-session cost, collapsible), **Presets** (dropdown), and **Custom Request** (paste/save/clear). Open it from the status bar item (**OR …**) or the "OpenRouter: Manage provider" command.
+One webview, **"OpenRouter for Copilot"**, with four tabs: **Key Info**, **Session Spend**, **Request**, and **Context**. Open it from the status bar item (**OR …**) or the "OpenRouter: Manage provider" command. The Context tab lists every model with a price step and an **Auto / Full / Custom** control; the safety margin applies only to numeric Custom caps.
 
 ## Install (from VSIX)
 
@@ -37,15 +38,16 @@ One webview, **"OpenRouter for Copilot"**, with five sections: **Settings** (sav
 ## Settings
 
 | Setting | Default | Meaning |
-|---|---|---|
-| `openrouterCopilot.baseUrl` | `https://openrouter.ai/api/v1` | API base URL used by the Chat provider (https-only). |
+| --- | --- | --- |
 | `openrouterCopilot.creditLimit` | `0` | Local cap in USD (`0` disables it and shows the account-wide balance). |
 | `openrouterCopilot.creditResetPeriod` | `daily` | Guardrail reset cadence: `daily` / `weekly` / `monthly` / `never`. |
 | `openrouterCopilot.creditIncludeByok` | `true` | Count BYOK spend toward the guardrail. |
 | `openrouterCopilot.creditRefreshIntervalMinutes` | `5` | Usage refresh interval (1–1440 minutes). |
-| `openrouterCopilot.creditBaseUrl` | `https://openrouter.ai` | Base URL for the credit/usage check (advanced). |
+| `openrouterCopilot.contextWindowPolicy` | `auto` | `auto` caps tiered models at the long-context surcharge threshold; `full` uses the entire model input budget. |
+| `openrouterCopilot.contextSafetyMarginPercent` | `0` | Changing this percentage rescales every saved numeric Custom cap in place across all models (0–50%). Auto and Full selections are unchanged. |
+| `openrouterCopilot.sanitizeBase64Content` | `true` | Strip long base64-like runs from prompt text (never image attachments) so an org guardrail does not block the request. |
 
-All six are application-scoped: a workspace cannot redirect your key to another host or weaken the guardrail.
+All seven settings are application-scoped: workspace settings cannot change these provider, usage, or context preferences. Provider and credit requests use the fixed OpenRouter API endpoint.
 
 ## Session spend, in the panel
 

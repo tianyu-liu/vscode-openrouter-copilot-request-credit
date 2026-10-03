@@ -1,3 +1,14 @@
+export interface PricingOverride {
+    min_prompt_tokens?: number;
+    prompt?: string;
+    completion?: string;
+    input_cache_read?: string;
+    input_cache_write?: string;
+    utc_start?: number;
+    utc_end?: number;
+    utc_days?: number;
+}
+
 export interface ModelPricing {
     prompt?: string;
     completion?: string;
@@ -7,6 +18,7 @@ export interface ModelPricing {
     request?: string;
     image?: string;
     web_search?: string;
+    overrides?: PricingOverride[];
 }
 
 export interface ModelReasoning {
@@ -73,6 +85,10 @@ export function formatUsd(value: number): string {
 
 function formatThousands(n: number): string {
     return n.toLocaleString('en-US');
+}
+
+function formatTokenShort(n: number): string {
+    return n >= 1000 ? `${Math.round(n / 1000)}K` : String(n);
 }
 
 const EFFORT_DESCRIPTIONS: Record<string, string> = {
@@ -194,8 +210,97 @@ const T_IN = 3;
 const T_THINK = 5;
 const T_OUT = 1;
 const MAX_OUTPUT_TOKENS = 16_384;
+const ASSUMED_CONTEXT_TOKENS = 1_048_576;
 
-export function buildModelInfo(m: ModelCatalogEntry): ModelInfo {
+/** A stepped price that begins at `min_prompt_tokens` (OpenRouter `pricing.overrides`). */
+export interface LongContextTier {
+    threshold: number;
+    prompt: number;
+    completion: number;
+    inputCacheRead?: number;
+    inputCacheWrite?: number;
+}
+
+function finitePositive(value: unknown): number | undefined {
+    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+/**
+ * The smallest prompt-token threshold at which the catalog raises this model's
+ * price. Time-of-day overrides (`utc_*`, no `min_prompt_tokens`), thresholds at
+ * or above the window, and pure discounts are all ignored.
+ */
+export function longContextTier(m: ModelCatalogEntry): LongContextTier | undefined {
+    const overrides = m.pricing?.overrides;
+    if (!Array.isArray(overrides) || overrides.length === 0) {
+        return undefined;
+    }
+    const context = m.context_length ?? m.top_provider?.context_length;
+    const basePrompt = parsePrice(m.pricing?.prompt);
+    const baseCompletion = parsePrice(m.pricing?.completion);
+    let best: LongContextTier | undefined;
+    for (const override of overrides) {
+        const threshold = finitePositive(override.min_prompt_tokens);
+        if (threshold === undefined) {
+            continue;
+        }
+        if (context !== undefined && threshold >= context) {
+            continue;
+        }
+        const prompt = parsePrice(override.prompt);
+        const completion = parsePrice(override.completion);
+        if (prompt <= basePrompt && completion <= baseCompletion) {
+            continue;
+        }
+        if (!best || threshold < best.threshold) {
+            best = {
+                threshold,
+                prompt: prompt || basePrompt,
+                completion: completion || baseCompletion,
+                inputCacheRead: override.input_cache_read !== undefined ? parsePrice(override.input_cache_read) : undefined,
+                inputCacheWrite: override.input_cache_write !== undefined ? parsePrice(override.input_cache_write) : undefined,
+            };
+        }
+    }
+    return best;
+}
+
+export type ContextWindowPolicy = 'auto' | 'full';
+export const DEFAULT_CONTEXT_POLICY: ContextWindowPolicy = 'auto';
+export const MAX_CONTEXT_MARGIN_PERCENT = 50;
+
+export interface ContextBudgetOptions {
+    /** `auto` caps a tier model at its cheapest threshold; `full` reports the whole window. */
+    policy?: ContextWindowPolicy;
+    /** A per-model Custom cap, already reduced by the saved safety margin. */
+    overrideTokens?: number;
+}
+
+/**
+ * The input budget Copilot packs prompts against: the accurate
+ * `context_length - max_output_tokens`, or the long-context threshold on
+ * `auto`. Per-model Custom caps are applied as stored. No percentage fudge by
+ * default; Copilot's own auto-compaction acts on this number.
+ */
+export function effectiveMaxInputTokens(m: ModelCatalogEntry, opts: ContextBudgetOptions = {}): number {
+    const hasContext = m.context_length != null || m.top_provider?.context_length != null;
+    const context = m.context_length ?? m.top_provider?.context_length ?? ASSUMED_CONTEXT_TOKENS;
+    const maxOutput = m.top_provider?.max_completion_tokens ?? MAX_OUTPUT_TOKENS;
+    const raw = hasContext ? Math.max(1, context - maxOutput) : ASSUMED_CONTEXT_TOKENS;
+    let budget = Math.max(1, Math.floor(raw));
+    const policy = opts.policy ?? DEFAULT_CONTEXT_POLICY;
+    const tier = longContextTier(m);
+    if (policy === 'auto' && tier) {
+        budget = Math.min(budget, tier.threshold);
+    }
+    const override = finitePositive(opts.overrideTokens);
+    if (override !== undefined) {
+        budget = Math.floor(override);
+    }
+    return budget;
+}
+
+export function buildModelInfo(m: ModelCatalogEntry, opts: ContextBudgetOptions = {}): ModelInfo {
     const pricing = m.pricing ?? {};
     const pIn = parsePrice(pricing.prompt);
     const pOut = parsePrice(pricing.completion);
@@ -205,9 +310,9 @@ export function buildModelInfo(m: ModelCatalogEntry): ModelInfo {
     const hasPricing = pricing.prompt !== undefined || pricing.completion !== undefined || pIn > 0 || pOut > 0;
 
     const hasContextLength = m.context_length != null || m.top_provider?.context_length != null;
-    const maxInputTokens = m.context_length ?? m.top_provider?.context_length ?? 1_048_576;
-    const hasMaxOutputTokens = m.top_provider?.max_completion_tokens != null;
     const maxOutputTokens = m.top_provider?.max_completion_tokens ?? MAX_OUTPUT_TOKENS;
+    const hasMaxOutputTokens = m.top_provider?.max_completion_tokens != null;
+    const maxInputTokens = effectiveMaxInputTokens(m, opts);
 
     const components: Array<{ label: string; weight: number; price: number }> = [
         { label: 'uncached', weight: T_IN, price: pIn },
@@ -238,7 +343,13 @@ export function buildModelInfo(m: ModelCatalogEntry): ModelInfo {
     } else {
         blocks.push('Pricing: not listed by OpenRouter');
     }
+    const contextWindow = m.context_length ?? m.top_provider?.context_length;
+    const windowLine =
+        hasContextLength && contextWindow !== undefined && contextWindow !== maxInputTokens
+            ? [`Context window: ${formatThousands(contextWindow)} tokens`]
+            : [];
     const infoLines: string[] = [
+        ...windowLine,
         `Max input context: ${hasContextLength ? `${formatThousands(maxInputTokens)} tokens` : `not listed (assuming ${formatThousands(maxInputTokens)} tokens)`}`,
         `Max output context: ${hasMaxOutputTokens ? `${formatThousands(maxOutputTokens)} tokens` : `not listed (assuming ${formatThousands(maxOutputTokens)} tokens)`}`,
         `Capabilities: ${capabilities.join(', ')}`,
@@ -260,8 +371,32 @@ export function buildModelInfo(m: ModelCatalogEntry): ModelInfo {
     }
     blocks.push(infoLines.join('\n\n'));
 
+    const tier = longContextTier(m);
+    const cappedToBase = tier !== undefined && maxInputTokens < tier.threshold;
+    if (tier && hasPricing) {
+        const tierAvgM =
+            (T_IN * tier.prompt +
+                T_CW * (tier.inputCacheWrite ?? tier.prompt) +
+                T_CR * (tier.inputCacheRead ?? tier.prompt) +
+                T_THINK * pThink +
+                T_OUT * tier.completion) /
+            totalTokens *
+            1_000_000;
+        const threshold = formatThousands(tier.threshold);
+        blocks.push(
+            [
+                '**Long-context pricing**',
+                `- up to ${threshold} prompt tokens: ~${formatPricePerM(pAvgM)} / 1M`,
+                `- above ${threshold} prompt tokens: ~${formatPricePerM(tierAvgM)} / 1M`,
+                cappedToBase
+                    ? `- Input capped at ${formatThousands(maxInputTokens)} tokens to stay in the base tier. Change it in the panel's **Context limits**, or set \`openrouterCopilot.contextWindowPolicy\` to \`full\`.`
+                    : '- Full window in use \u2014 the long-context surcharge applies above the threshold.',
+            ].join('\n')
+        );
+    }
+
     const detail = hasPricing
-        ? `~${formatPricePerM(pAvgM)}/1M`
+        ? `~${formatPricePerM(pAvgM)}/1M${cappedToBase && tier ? ` \u00b7 \u2264${formatTokenShort(maxInputTokens)}` : ''}`
         : undefined;
 
     return { detail, tooltip: blocks.join('\n\n'), maxInputTokens, maxOutputTokens };
