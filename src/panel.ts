@@ -7,12 +7,11 @@ import {
     cacheShareSuffix,
     UNATTRIBUTED_SESSION_ID,
     MAX_TRACKED_SESSIONS,
-    type ContextCapValue,
-    type ContextTierRow,
     type SessionCost,
 } from './provider';
 import {
     buildDetail,
+    effectiveIncludeByok,
     formatReset,
     formatUsdPrecise,
     KeyInfo,
@@ -20,13 +19,106 @@ import {
     resetPeriodLabel,
     AccountCredits,
 } from './logic';
-import { formatPricePerM, MAX_CONTEXT_MARGIN_PERCENT } from './modelInfo';
+import {
+    ASSUMED_CONTEXT_TOKENS,
+    DEFAULT_OUTPUT_RESERVE_MAX_TOKENS,
+    DEFAULT_OUTPUT_RESERVE_MIN_TOKENS,
+    DEFAULT_OUTPUT_RESERVE_PERCENT,
+    effectiveOutputReserve,
+    normalizeOutputReservePolicy,
+    OUTPUT_RESERVE_PERCENT_MAX,
+    OUTPUT_RESERVE_PERCENT_MIN,
+    type ModelCatalogEntry,
+} from './modelInfo';
 
 const MAX_REFRESH_INTERVAL_MINUTES = 1440;
 const RESET_PERIODS: readonly ResetPeriod[] = ['daily', 'weekly', 'monthly', 'never'];
 
+const DEFAULT_RESERVE_K = Math.round(
+    effectiveOutputReserve({ context_length: ASSUMED_CONTEXT_TOKENS } as ModelCatalogEntry) / 1000
+);
+
+const PANEL_NOTES = {
+    storage: { term: 'Storage', text: 'Your API key is kept in VS Code SecretStorage.' },
+    byokRoutes: {
+        term: 'BYOK routes',
+        text: 'When OpenRouter reports zero, the session total uses the upstream provider\u2019s reported cost.',
+    },
+    unattributed: {
+        term: 'Unattributed',
+        text: 'Spend that reached OpenRouter with no Copilot chat identifier. An agent-host or SDK session talks to this provider through a client-BYOK bridge that carries no chat id, so nothing here is charged to an unrelated chat and no <code>session_id</code> is sent for it.',
+    },
+    sessionList: {
+        term: 'Session list',
+        text: `One entry per Copilot chat session (<code>session_id</code>), newest first, up to the ${MAX_TRACKED_SESSIONS} most recent. Named from the chat title when VS Code has one, otherwise the id; times are local. Stored locally and kept across window reloads.`,
+    },
+    hideUnavailable: {
+        term: 'Hide unavailable models',
+        text: 'Intersects the catalog with the models available to this key (provider preferences, privacy settings, guardrails) and hides the rest from the model picker. Falls back to the full catalog when the query fails.',
+    },
+    promptSanitization: {
+        term: 'Prompt sanitization',
+        text: 'Removes long base64-like runs from request text (messages, reasoning, tool arguments) to avoid encoded-prompt guardrails. Image attachments are not changed.',
+    },
+    streaming: { term: 'Streaming', text: 'Responses stream automatically; no <code>stream</code> field is needed.' },
+    liveConversation: {
+        term: 'Live conversation',
+        text: 'Copilot supplies the conversation, model, and tools; pasted <code>messages</code>, <code>prompt</code>, and <code>model</code> fields are ignored.',
+    },
+    thinkingEffort: {
+        term: 'Thinking effort',
+        text: 'The model picker controls <code>reasoning.effort</code> and <code>reasoning.enabled</code>; other reasoning options are preserved.',
+    },
+    providerRouting: {
+        term: 'Provider routing',
+        text: 'No routing is added automatically. A pasted <code>provider</code> object passes through unchanged.',
+    },
+    anthropicCaching: {
+        term: 'Anthropic caching',
+        text: 'Anthropic-family models (<code>anthropic/*</code>, including <code>~anthropic/*</code>) get a top-level, 5-minute <code>cache_control</code> breakpoint unless the template sets one.',
+    },
+    presetSelection: {
+        term: 'Preset selection',
+        text: 'Selecting a preset replaces the saved request with <code>{"preset": "&lt;slug&gt;"}</code>. Selecting "No preset loaded" clears it. The resolved configuration appears below as <code>//</code> comments; copy fields into the JSON to override the preset.',
+    },
+    pickerPresets: {
+        term: 'Picker presets',
+        text: '<code>@preset/&lt;slug&gt;</code> applies only while that picker entry is selected; it takes precedence over a different template preset.',
+    },
+    outputReserve: {
+        term: 'Output reserve',
+        text: `The reply budget held back from the window for the picker\u2019s context budget. With the default ${DEFAULT_OUTPUT_RESERVE_PERCENT}%, ~${DEFAULT_RESERVE_K}K on a 1M-token window, bounded by the lower and upper limits so tiny windows stay sane and huge ones are capped. Limits are entered in K (1 K = 1000 tokens). A real published cap is reserved as-is unless the upper limit is smaller; it is never inflated to the lower limit. The per-model Context size menu still sets the prompt budget itself.`,
+    },
+    autoLimit: {
+        term: 'Server-side limit',
+        text: 'The key has its own server-side limit; these local controls apply only when it has none. Include BYOK usage shows the key\u2019s authoritative <code>include_byok_in_limit</code> setting read-only.',
+    },
+} as const;
+
+type PanelNoteId = keyof typeof PANEL_NOTES;
+
+function renderNoteList(ids: PanelNoteId[]): string {
+    const items = ids.map((id) => {
+        const { term, text } = PANEL_NOTES[id];
+        return `<li><strong>${term}:</strong> ${text}</li>`;
+    });
+    return `<ul class="helptext">${items.join('')}</ul>`;
+}
+
+function renderNote(id: PanelNoteId): string {
+    return renderNoteList([id]);
+}
+
+function emptyState(text: string): string {
+    return `<p class="helptext empty">${text}</p>`;
+}
+
 export interface PanelSettings {
     sanitizeBase64Content: boolean;
+    hideUnavailableModels: boolean;
+    outputReservePercent: number;
+    outputReserveMinTokens: number;
+    outputReserveMaxTokens: number;
 }
 
 export function isResetPeriod(value: string): value is ResetPeriod {
@@ -47,9 +139,11 @@ export interface ConfigSnapshot {
     resetPeriod: ResetPeriod;
     includeByok: boolean;
     refreshIntervalMinutes: number;
-    contextPolicy: 'auto' | 'full';
-    contextMarginPercent: number;
     sanitizeBase64Content: boolean;
+    hideUnavailableModels: boolean;
+    outputReservePercent: number;
+    outputReserveMinTokens: number;
+    outputReserveMaxTokens: number;
 }
 
 export function readConfig(cfg: vscode.WorkspaceConfiguration = getConfig()): ConfigSnapshot {
@@ -65,22 +159,25 @@ export function readConfig(cfg: vscode.WorkspaceConfiguration = getConfig()): Co
         Number.isFinite(rawInterval) && rounded >= 1
             ? Math.min(rounded, MAX_REFRESH_INTERVAL_MINUTES)
             : 5;
-    const rawPolicy = globalSetting<string>(cfg, 'contextWindowPolicy', 'auto');
-    const contextPolicy: 'auto' | 'full' = rawPolicy === 'full' ? 'full' : 'auto';
-    const rawMargin = globalSetting<number>(cfg, 'contextSafetyMarginPercent', 0);
-    const contextMarginPercent = Number.isFinite(rawMargin)
-        ? Math.min(MAX_CONTEXT_MARGIN_PERCENT, Math.max(0, Math.round(rawMargin)))
-        : 0;
     const rawSanitize = globalSetting<boolean>(cfg, 'sanitizeBase64Content', true);
     const sanitizeBase64Content = typeof rawSanitize === 'boolean' ? rawSanitize : true;
+    const rawHide = globalSetting<boolean>(cfg, 'hideUnavailableModels', true);
+    const hideUnavailableModels = typeof rawHide === 'boolean' ? rawHide : true;
+    const reserve = normalizeOutputReservePolicy(
+        globalSetting<number>(cfg, 'outputReservePercent', DEFAULT_OUTPUT_RESERVE_PERCENT),
+        globalSetting<number>(cfg, 'outputReserveMinTokens', DEFAULT_OUTPUT_RESERVE_MIN_TOKENS),
+        globalSetting<number>(cfg, 'outputReserveMaxTokens', DEFAULT_OUTPUT_RESERVE_MAX_TOKENS)
+    );
     return {
         limit,
         resetPeriod,
         includeByok,
         refreshIntervalMinutes,
-        contextPolicy,
-        contextMarginPercent,
         sanitizeBase64Content,
+        hideUnavailableModels,
+        outputReservePercent: reserve.percent,
+        outputReserveMinTokens: reserve.minTokens,
+        outputReserveMaxTokens: reserve.maxTokens,
     };
 }
 
@@ -109,25 +206,15 @@ export function renderSessionCosts(sessions: SessionCost[] | undefined): string 
     const chats = withSpend.filter(s => s.sessionId !== UNATTRIBUTED_SESSION_ID);
     const unattributed = withSpend.find(s => s.sessionId === UNATTRIBUTED_SESSION_ID);
     if (chats.length === 0 && unattributed === undefined) {
-        return '<p class="helptext">No OpenRouter spend recorded yet. Totals appear here once a turn reports a cost. An agent-host or SDK session (client BYOK) sends no chat identifier at all, so its spend is collected under an <strong>Unattributed</strong> entry rather than a chat.</p>';
+        return emptyState('No OpenRouter spend recorded yet. Totals appear here once a turn reports a cost. Spend that carried no chat identifier is collected under the <strong>Unattributed</strong> entry.');
     }
     const rows = chats.map((session, index) => renderSessionDetails(session, index === 0)).join('');
-    const unattributedHtml = unattributed
-        ? renderSessionDetails(
-              unattributed,
-              chats.length === 0,
-              'Spend that reached OpenRouter with no Copilot chat identifier. An agent-host or SDK session talks to this provider through a client-BYOK bridge that carries no chat id, so nothing here is charged to an unrelated chat and no <code>session_id</code> is sent for it.'
-          )
-        : '';
-    const unattributedNote = unattributed
-        ? ' Spend that carried no chat identifier is collected under the Unattributed entry.'
-        : '';
-    return `${rows}${unattributedHtml}
-        <p class="helptext">One entry per Copilot chat session (<code>session_id</code>), newest first, up to the ${MAX_TRACKED_SESSIONS} most recent. Named from the chat title when VS Code has one, otherwise the id; times are local. Stored locally and kept across window reloads.${unattributedNote}</p>`;
+    const unattributedHtml = unattributed ? renderSessionDetails(unattributed, chats.length === 0) : '';
+    return `${rows}${unattributedHtml}${renderNote('sessionList')}`;
 }
 
-/** One collapsible spend entry; `note` replaces the session-id footer line. */
-function renderSessionDetails(session: SessionCost, open: boolean, note?: string): string {
+/** One collapsible spend entry; the unattributed bucket explains itself. */
+function renderSessionDetails(session: SessionCost, open: boolean): string {
     const short = session.sessionId.replace(/^copilot-chat:/, '');
     const label =
         session.sessionId === UNATTRIBUTED_SESSION_ID
@@ -147,11 +234,12 @@ function renderSessionDetails(session: SessionCost, open: boolean, note?: string
         .join('');
     const cacheShare = cacheShareSuffix(session);
     const updated = session.updatedAt >= 1e12 ? formatReset(new Date(session.updatedAt), true) : undefined;
+    const calls = `${session.calls} call${session.calls === 1 ? '' : 's'}`;
     return `<details class="session"${open ? ' open' : ''}>
                         <summary>
                             <span class="sessioncost">${esc(formatUsdPrecise(session.paid))}</span>
                             <span class="sessionname">${esc(label)}</span>
-                            <span class="muted">${esc(String(session.calls))} call(s)${esc(cacheShare)}</span>
+                            <span class="muted">${esc(calls)}${esc(cacheShare)}</span>
                             ${updated ? `<span class="muted sessiontime">${esc(updated)}</span>` : ''}
                         </summary>
                         <div class="sessionbody">
@@ -161,66 +249,47 @@ function renderSessionDetails(session: SessionCost, open: boolean, note?: string
                                 </thead>
                                 <tbody>${routeRows}</tbody>
                             </table>
-                            <p class="helptext">${note ?? `OpenRouter session <code>${esc(session.sessionId)}</code>`}</p>
+                            ${session.sessionId === UNATTRIBUTED_SESSION_ID
+                                ? renderNote('unattributed')
+                                : `<p class="muted">OpenRouter session <code>${esc(session.sessionId)}</code></p>`}
                         </div>
                     </details>`;
 }
 
-/**
- * The Context limits table: one row per catalog model that carries a
- * long-context price step, with its threshold, base vs stepped prompt price,
- * the effective input cap, and an Auto / Full / Custom control.
- */
-export function renderContextTiers(rows: ContextTierRow[] | undefined): string {
-    if (!rows || rows.length === 0) {
-        return '<p class="helptext">No model in the current catalog has a long-context price step. OpenRouter exposes the step under <code>pricing.overrides</code>; it appears here once a model has one.</p>';
-    }
-    const fmt = (n: number): string => n.toLocaleString('en-US');
-    const body = rows
-        .map((r, i) => {
-            const mode = r.override === 'full' ? 'full' : typeof r.override === 'number' ? 'custom' : 'auto';
-            const customValue = typeof r.override === 'number' ? r.override : r.effectiveCap;
-            return `<tr>
-                        <td class="ctxmodel">${esc(r.label)}</td>
-                        <td class="num">${esc(fmt(r.threshold))}</td>
-                        <td class="num">${esc(formatPricePerM(r.basePromptPerM))}</td>
-                        <td class="num">${esc(formatPricePerM(r.tierPromptPerM))}</td>
-                        <td class="num">${esc(fmt(r.effectiveCap))}</td>
-                        <td><select class="capmode" data-idx="${i}" data-model="${esc(r.modelId)}">
-                            <option value="auto" ${mode === 'auto' ? 'selected' : ''}>Auto</option>
-                            <option value="full" ${mode === 'full' ? 'selected' : ''}>Full</option>
-                            <option value="custom" ${mode === 'custom' ? 'selected' : ''}>Custom</option>
-                        </select></td>
-                        <td><input type="number" class="capval" id="capval-${i}" aria-label="Custom input cap in tokens for ${esc(r.label)}" title="Enter a token cap; the custom-cap reduction applies to this saved value." data-idx="${i}" data-model="${esc(r.modelId)}" min="1" step="1" value="${esc(String(customValue))}" /></td>
-                    </tr>`;
-        })
-        .join('');
-    return `<table class="routes contexttiers">
-                <thead><tr><th>Model</th><th>Step starts</th><th>Base $/1M</th><th>Stepped $/1M</th><th>Effective input cap</th><th>Policy</th><th>Custom cap (tokens)</th></tr></thead>
-                <tbody>${body}</tbody>
-            </table>
-        <p class="helptext">A stepped price applies at and above the threshold. Auto uses the threshold; Full uses the model input budget; Custom uses the saved token cap. Hover a model in the picker for context and pricing details.</p>`;
+export interface PanelRenderOptions {
+    info?: KeyInfo;
+    limit?: number;
+    resetPeriod?: ResetPeriod;
+    includeByok?: boolean;
+    refreshIntervalMinutes?: number;
+    fetchedAt?: Date;
+    maskedKey?: string;
+    accountCredits?: AccountCredits;
+    errorMessage?: string;
+    template?: Record<string, unknown>;
+    presets?: PresetRow[];
+    presetConfig?: Record<string, unknown>;
+    sessions?: SessionCost[];
+    settings?: Partial<PanelSettings>;
 }
 
-export function renderPanelHtml(
-    info: KeyInfo | undefined,
-    limit: number,
-    resetPeriod: ResetPeriod,
-    includeByok: boolean,
-    refreshIntervalMinutes: number,
-    fetchedAt?: Date,
-    maskedKey?: string,
-    accountCredits?: AccountCredits,
-    errorMessage?: string,
-    template?: Record<string, unknown>,
-    presets?: PresetRow[],
-    presetConfig?: Record<string, unknown>,
-    sessions?: SessionCost[],
-    contextPolicy?: string,
-    contextMarginPercent?: number,
-    contextTiers?: ContextTierRow[],
-    settings: Partial<PanelSettings> = {}
-): string {
+export function renderPanelHtml(options: PanelRenderOptions): string {
+    const {
+        info,
+        limit = 0,
+        resetPeriod = 'daily',
+        includeByok = true,
+        refreshIntervalMinutes = 5,
+        fetchedAt,
+        maskedKey,
+        accountCredits,
+        errorMessage,
+        template,
+        presets,
+        presetConfig,
+        sessions,
+        settings = {},
+    } = options;
     const nonce = randomBytes(16).toString('hex');
     const detail = info ? buildDetail(info, limit, resetPeriod, includeByok, accountCredits) : undefined;
     const usageTable = detail
@@ -242,8 +311,12 @@ export function renderPanelHtml(
             .join('')}</tbody>
            </table>`
         : '';
+    const rollingWeekly = detail?.resetPeriod === 'weekly' && detail.highlight !== null;
+    const resetText = rollingWeekly
+        ? 'Rolling 7-day window'
+        : `Next reset: ${detail?.resetDate ?? 'No reset'}`;
     const remainingLine = detail
-        ? `<div class="remainingline${detail.background === 'error' ? ' exhausted' : ''}"><span class="label">Remaining</span><span class="limitvalue">${esc(detail.remaining)} / ${esc(detail.limitValue)}</span><span class="muted">Next reset: ${esc(detail.resetDate ?? 'No reset')}</span></div>`
+        ? `<div class="remainingline${detail.background === 'error' ? ' exhausted' : ''}"><span class="label">Remaining</span><span class="limitvalue">${esc(detail.remaining)} / ${esc(detail.limitValue)}</span><span class="muted">${esc(resetText)}</span></div>`
         : '';
     const freeTierLine = detail
         ? `<p class="freetier">Free tier: ${esc(detail.freeTier)}</p>`
@@ -257,35 +330,23 @@ export function renderPanelHtml(
     const keyState = maskedKey
         ? `<span class="ok">\u2713 Key set</span>`
         : `<span class="warn">No API key set</span>`;
+    const autoMode = detail?.mode === 'auto';
+    const includeByokShown = autoMode && info ? effectiveIncludeByok(info, includeByok) : includeByok;
+    const limitFieldValue = autoMode
+        ? detail?.limitNum != null ? String(detail.limitNum) : ''
+        : String(limit);
+    const periodSelection = autoMode ? detail?.resetPeriod ?? resetPeriod : resetPeriod;
     const limitLine = `<div class="limitline">
                <label class="limitlabel" for="limit">Spending limit</label>
                <span>$</span>
-                <input type="number" id="limit" min="0" step="0.01" value="${esc(String(limit))}" />
-               <select id="resetPeriod" aria-label="Spending limit reset period" title="How often the local spending limit resets">
-                   ${RESET_PERIODS.map((p) => `<option value="${p}" ${resetPeriod === p ? 'selected' : ''}>${resetPeriodLabel(p)}</option>`).join('')}
+                <input type="number" id="limit" min="0" step="0.01" value="${esc(limitFieldValue)}"${autoMode ? ' disabled' : ''} />
+               <select id="resetPeriod" aria-label="Spending limit reset period" title="How often the local spending limit resets"${autoMode ? ' disabled' : ''}>
+                   ${RESET_PERIODS.map((p) => `<option value="${p}" ${periodSelection === p ? 'selected' : ''}>${resetPeriodLabel(p)}</option>`).join('')}
                </select>
-                <label class="optlabel"><input type="checkbox" id="includeByok" ${includeByok ? 'checked' : ''} title="Count bring-your-own-key usage in the remaining balance" /> Include BYOK usage</label>
-           </div>`;
+                <label class="optlabel"><input type="checkbox" id="includeByok" ${includeByokShown ? 'checked' : ''}${autoMode ? ' disabled' : ''} title="${autoMode ? 'Set on the API key; local controls apply only when the key has none' : 'Count bring-your-own-key usage in the remaining balance'}" /> Include BYOK usage${autoMode ? ' (set on the key)' : ''}</label>
+           </div>
+           ${autoMode ? renderNote('autoLimit') : ''}`;
     const sessionCostHtml = renderSessionCosts(sessions);
-    const policyValue = contextPolicy === 'full' ? 'full' : 'auto';
-    const marginValue = Number.isFinite(contextMarginPercent)
-        ? Math.min(MAX_CONTEXT_MARGIN_PERCENT, Math.max(0, Math.round(contextMarginPercent as number)))
-        : 0;
-    const contextSectionHtml = `<div class="section">
-        <div class="section-title">Context limits</div>
-        <div class="keyline">
-            <label class="optlabel" for="contextPolicy">Tiered-price policy</label>
-            <select id="contextPolicy">
-                <option value="auto" ${policyValue === 'auto' ? 'selected' : ''}>Auto</option>
-                <option value="full" ${policyValue === 'full' ? 'selected' : ''}>Full</option>
-            </select>
-            <label class="optlabel" for="contextMargin">Custom-cap reduction (%)</label>
-            <input type="number" id="contextMargin" min="0" max="${MAX_CONTEXT_MARGIN_PERCENT}" step="1" value="${esc(String(marginValue))}" class="intervalinput" />
-        </div>
-        <p class="helptext"><strong>Tiered-price policy:</strong> Auto caps tiered models at the surcharge threshold; Full uses the full input budget, <code>context_length \u2212 max_output</code>.</p>
-        <p class="helptext"><strong>Custom-cap reduction:</strong> Changing this percentage scales every saved numeric Custom cap in place across all models. Auto and Full selections are unchanged.</p>
-        ${renderContextTiers(contextTiers)}
-    </div>`;
     const updatedLine = `<div class="keyline updatedline">
             <label class="optlabel" for="refreshInterval">Usage refresh interval (minutes)</label>
             <input type="number" id="refreshInterval" min="1" max="${MAX_REFRESH_INTERVAL_MINUTES}" step="1" aria-label="Usage refresh interval in minutes" title="Refresh usage data every 1 to ${MAX_REFRESH_INTERVAL_MINUTES} minutes" value="${esc(String(refreshIntervalMinutes))}" class="intervalinput" />
@@ -304,7 +365,7 @@ export function renderPanelHtml(
     const currentPreset = selectedPreset;
     const presetOptions: Array<{ slug: string; label: string }> = (presets ?? []).map(p => ({
         slug: p.slug,
-        label: `${p.name}${p.model ? ` \u2192 ${p.model}` : p.lookupSkipped ? ' (lookup skipped)' : ' (routing profile)'}`,
+        label: `${p.name}${p.model ? ` \u2192 ${p.model}` : p.lookupSkipped ? ' (model not checked)' : ' (routing profile)'}`,
     }));
     if (currentPreset !== '' && !presetOptions.some(p => p.slug === currentPreset)) {
         presetOptions.push({ slug: currentPreset, label: `${currentPreset} (not in list)` });
@@ -318,26 +379,16 @@ export function renderPanelHtml(
             .join('')}
         </select>`;
     const presetsHint = presets === undefined
-        ? '<p class="helptext">Presets could not be loaded for this key.</p>'
+        ? emptyState('Presets could not be loaded for this key.')
         : presets.length === 0
-            ? '<p class="helptext">No presets found for this key.</p>'
+            ? emptyState('No presets found for this key.')
             : '';
-    const behaviorNotes: Array<[string, string]> = [
-        ['Streaming', 'Responses stream automatically; no <code>stream</code> field is needed.'],
-        ['Live conversation', 'Copilot supplies the conversation, model, and tools. Pasted <code>messages</code>, <code>prompt</code>, and <code>model</code> fields are ignored.'],
-        ['Thinking effort', 'The model picker controls <code>reasoning.effort</code> and <code>reasoning.enabled</code>; other reasoning options are preserved.'],
-        ['Provider routing', 'No routing is added automatically. A pasted <code>provider</code> object passes through unchanged.'],
-        ['Anthropic caching', 'Anthropic-family models (<code>anthropic/*</code>, including <code>~anthropic/*</code>) get a top-level, 5-minute <code>cache_control</code> breakpoint unless the template sets one.'],
-        ['Picker presets', '<code>@preset/&lt;slug&gt;</code> applies only while that picker entry is selected; it takes precedence over a different template preset.'],
-        ['Context usage', 'OpenRouter reports token usage per request. Copilot’s context indicator can change between requests.'],
-    ];
-    const renderNotes = (topics: string[]): string => behaviorNotes
-        .filter(([topic]) => topics.includes(topic))
-        .map(([topic, text]) => `<p class="helptext"><strong>${topic}:</strong> ${text}</p>`)
-        .join('');
-    const keyNotesHtml = '<p class="helptext"><strong>Storage:</strong> Your API key is kept in VS Code SecretStorage.</p>';
-    const sessionNotesHtml = '<p class="helptext"><strong>BYOK routes:</strong> When OpenRouter reports zero, the session total uses the upstream provider\u2019s reported cost.</p>';
     const sanitizeBase64Content = settings.sanitizeBase64Content ?? true;
+    const hideUnavailableModels = settings.hideUnavailableModels ?? true;
+    const outputReservePercent = settings.outputReservePercent ?? DEFAULT_OUTPUT_RESERVE_PERCENT;
+    const outputReserveMinTokens = settings.outputReserveMinTokens ?? DEFAULT_OUTPUT_RESERVE_MIN_TOKENS;
+    const outputReserveMaxTokens = settings.outputReserveMaxTokens ?? DEFAULT_OUTPUT_RESERVE_MAX_TOKENS;
+    const ktok = (tokens: number): string => String(parseFloat((tokens / 1000).toFixed(3)));
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -355,26 +406,36 @@ export function renderPanelHtml(
     .section-title { font-size: 12px; text-transform: uppercase; letter-spacing: .05em;
                      font-weight: 600; color: var(--vscode-foreground); margin-bottom: 10px; }
     .keyline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+    .fieldgroup { display: inline-flex; align-items: center; gap: 8px; }
+    .fieldgroup .muted { font-style: normal; }
+    .sep { color: var(--vscode-descriptionForeground, #888); }
     textarea {
         background: var(--vscode-input-background); color: var(--vscode-input-foreground);
         border: 1px solid var(--vscode-input-border, transparent); padding: 8px;
         width: 100%; box-sizing: border-box; font-family: var(--vscode-editor-font-family, monospace);
-        white-space: pre; resize: vertical; }
+        font-size: inherit; white-space: pre; resize: vertical; }
     input[type=password], input[type=text] {
         background: var(--vscode-input-background); color: var(--vscode-input-foreground);
-        border: 1px solid var(--vscode-input-border, transparent); padding: 4px 8px; width: 320px; }
+        border: 1px solid var(--vscode-input-border, transparent); padding: 4px 8px; width: 320px;
+        font: inherit; }
     input[type=number] {
         background: var(--vscode-input-background); color: var(--vscode-input-foreground);
-        border: 1px solid var(--vscode-input-border, transparent); padding: 4px 8px; width: 90px; }
+        border: 1px solid var(--vscode-input-border, transparent); padding: 4px 8px; width: 90px;
+        font: inherit; -moz-appearance: textfield; appearance: textfield; }
+    input[type=number]::-webkit-inner-spin-button,
+    input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+    #outputReservePercent { width: 52px; }
+    #outputReserveMinTokens, #outputReserveMaxTokens { width: 60px; }
     select {
         background: var(--vscode-dropdown-background); color: var(--vscode-dropdown-foreground);
-        border: 1px solid var(--vscode-dropdown-border, transparent); padding: 4px 8px; }
+        border: 1px solid var(--vscode-dropdown-border, transparent); padding: 4px 8px;
+        font: inherit; }
     input:disabled, select:disabled {
         opacity: .7; cursor: not-allowed; }
     .optlabel { color: var(--vscode-descriptionForeground, #888); display: inline-flex; align-items: center; gap: 6px; }
     #refreshInterval { width: 56px; }
     button { background: var(--vscode-button-background); color: var(--vscode-button-foreground);
-             border: none; padding: 5px 12px; cursor: pointer; white-space: nowrap; }
+             border: none; padding: 5px 12px; cursor: pointer; white-space: nowrap; font: inherit; }
     button:hover { background: var(--vscode-button-hoverBackground); }
     button:disabled { opacity: .7; cursor: not-allowed; }
     .ok { color: var(--vscode-charts-green, #89d185); }
@@ -389,9 +450,11 @@ export function renderPanelHtml(
     .updatedline { justify-content: flex-start; gap: 12px; align-items: baseline; }
     .rows { border: 1px solid var(--vscode-panel-border, rgba(0,0,0,0.15)); border-radius: 4px;
             border-collapse: collapse; margin-top: 10px; }
-    .rows caption.tabletitle { text-align: left; font-size: 12px; text-transform: uppercase;
+    caption.tabletitle { text-align: left; font-size: 12px; text-transform: uppercase;
             letter-spacing: .05em; font-weight: 600; color: var(--vscode-foreground);
-            padding: 8px 12px 4px; border-bottom: 1px solid var(--vscode-panel-border, rgba(0,0,0,0.1)); }
+            padding: 8px 0 4px; }
+    .rows caption.tabletitle { padding: 8px 12px 4px;
+            border-bottom: 1px solid var(--vscode-panel-border, rgba(0,0,0,0.1)); }
     .rows th, .rows td { padding: 6px 12px; text-align: right; white-space: nowrap;
             border-bottom: 1px solid var(--vscode-panel-border, rgba(0,0,0,0.1)); }
     .rows thead th { font-size: 11px; text-transform: uppercase; letter-spacing: .05em;
@@ -408,6 +471,9 @@ export function renderPanelHtml(
     .modeline { font-style: italic; color: var(--vscode-descriptionForeground, #888); margin: 0 0 10px; }
     .muted { color: var(--vscode-descriptionForeground, #888); font-style: italic; }
     .helptext { font-size: 12px; line-height: 1.45; color: var(--vscode-descriptionForeground, #888); margin: 6px 0 0; }
+    .helptext.empty { font-style: italic; }
+    ul.helptext { padding-left: 18px; }
+    ul.helptext li { margin: 2px 0; }
     .sessioncost { font-family: var(--vscode-editor-font-family, monospace); font-weight: 600; }
     details.session { border: 1px solid var(--vscode-panel-border, rgba(0,0,0,0.1));
                       border-radius: 4px; margin: 6px 0; padding: 2px 8px; }
@@ -433,8 +499,7 @@ export function renderPanelHtml(
     <div class="tabs" role="tablist" aria-label="OpenRouter settings">
         <button class="tab" id="tab-key-info" role="tab" aria-selected="true" aria-controls="panel-key-info" tabindex="0">Key Info</button>
         <button class="tab" id="tab-session-spend" role="tab" aria-selected="false" aria-controls="panel-session-spend" tabindex="-1">Session Spend</button>
-        <button class="tab" id="tab-request" role="tab" aria-selected="false" aria-controls="panel-request" tabindex="-1">Request</button>
-        <button class="tab" id="tab-context" role="tab" aria-selected="false" aria-controls="panel-context" tabindex="-1">Context</button>
+        <button class="tab" id="tab-configurations" role="tab" aria-selected="false" aria-controls="panel-configurations" tabindex="-1">Configurations</button>
     </div>
 
     <section class="tab-panel" id="panel-key-info" role="tabpanel" aria-labelledby="tab-key-info" tabindex="0">
@@ -443,32 +508,61 @@ export function renderPanelHtml(
         <div class="keyline">
             <input type="${maskedKey ? 'text' : 'password'}" id="key" aria-label="OpenRouter API key" placeholder="OpenRouter API key (sk-or-v1-...)" />
             <button id="saveKey">Save key</button>
+            ${maskedKey ? '<button id="clearKey">Clear key</button>' : ''}
             ${keyState}
         </div>
         ${errorBanner}
+        ${renderNote('storage')}
     </div>
     <div class="section">
         <div class="section-title">Credit usage</div>
-        ${detail ? `${modeLine}${usageTable}${freeTierLine}${remainingLine}` : `<p class="helptext">No usage information yet. Save an API key to load account details.</p>`}
+        ${detail ? `${modeLine}${usageTable}${freeTierLine}${remainingLine}` : emptyState('No usage information yet. Save an API key to load account details.')}
         ${limitLine}
         ${updatedLine}
     </div>
-    ${keyNotesHtml}
+    <div class="section">
+        <div class="section-title">Model availability</div>
+        <label class="optlabel"><input type="checkbox" id="hideUnavailableModels" ${hideUnavailableModels ? 'checked' : ''} /> Hide models this key cannot use</label>
+        ${renderNote('hideUnavailable')}
+    </div>
     </section>
 
     <section class="tab-panel" id="panel-session-spend" role="tabpanel" aria-labelledby="tab-session-spend" tabindex="0" hidden>
     <div class="section">
-        <div class="section-title">Session Spend</div>
+        <div class="section-title">Session spend</div>
         ${sessionCostHtml}
-        ${sessionNotesHtml}
+        ${renderNote('byokRoutes')}
     </div>
     </section>
 
-    <section class="tab-panel" id="panel-request" role="tabpanel" aria-labelledby="tab-request" tabindex="0" hidden>
+    <section class="tab-panel" id="panel-configurations" role="tabpanel" aria-labelledby="tab-configurations" tabindex="0" hidden>
+    <div class="section">
+        <div class="section-title">Output reserve</div>
+        <div class="keyline">
+            <span class="fieldgroup">
+                <label class="optlabel" for="outputReservePercent">Target:</label>
+                <input type="number" id="outputReservePercent" min="${OUTPUT_RESERVE_PERCENT_MIN}" max="${OUTPUT_RESERVE_PERCENT_MAX}" step="0.5" aria-label="Output reserve as percent of window" value="${esc(String(outputReservePercent))}" />
+                <span class="muted">%</span>
+            </span>
+            <span class="sep">.</span>
+            <span class="fieldgroup">
+                <label class="optlabel" for="outputReserveMinTokens">Lower limit:</label>
+                <input type="number" id="outputReserveMinTokens" min="0.5" step="0.5" aria-label="Lower bound on the output reserve in K" value="${esc(ktok(outputReserveMinTokens))}" />
+                <span class="muted">K</span>
+            </span>
+            <span class="sep">.</span>
+            <span class="fieldgroup">
+                <label class="optlabel" for="outputReserveMaxTokens">Upper limit:</label>
+                <input type="number" id="outputReserveMaxTokens" min="0.5" step="0.5" aria-label="Upper bound on the output reserve in K" value="${esc(ktok(outputReserveMaxTokens))}" />
+                <span class="muted">K</span>
+            </span>
+        </div>
+        ${renderNote('outputReserve')}
+    </div>
     <div class="section">
         <div class="section-title">Prompt safeguard</div>
         <label class="optlabel"><input type="checkbox" id="sanitizeBase64" ${sanitizeBase64Content ? 'checked' : ''} /> Remove long base64-like text from prompts</label>
-        <p class="helptext"><strong>Prompt sanitization:</strong> Removes long base64-like runs from text to avoid encoded-prompt guardrails. Image attachments are not changed.</p>
+        ${renderNote('promptSanitization')}
     </div>
     <div class="section">
         <div class="section-title">Presets</div>
@@ -477,7 +571,7 @@ export function renderPanelHtml(
             ${presetSelectHtml}
         </div>
         ${presetsHint}
-        <p class="helptext">Selecting a preset replaces the saved request with <code>{"preset": "&lt;slug&gt;"}</code>. Selecting “No preset loaded” clears it. The resolved configuration appears below as <code>//</code> comments; copy fields into the JSON to override the preset.</p>
+        ${renderNoteList(['presetSelection', 'pickerPresets'])}
     </div>
 
     <div class="section">
@@ -486,17 +580,50 @@ export function renderPanelHtml(
         <div class="keyline">
             <button id="saveTemplate">Save request</button>
         </div>
-        ${renderNotes(['Streaming', 'Live conversation', 'Thinking effort', 'Provider routing', 'Anthropic caching', 'Picker presets'])}
+        ${renderNoteList(['streaming', 'liveConversation', 'thinkingEffort', 'providerRouting', 'anthropicCaching'])}
     </div>
-    </section>
-
-    <section class="tab-panel" id="panel-context" role="tabpanel" aria-labelledby="tab-context" tabindex="0" hidden>
-    ${contextSectionHtml}
-    ${renderNotes(['Context usage'])}
     </section>
 
     <script nonce="${nonce}">
         const vsc = acquireVsCodeApi();
+        const savedState = vsc.getState() || {};
+        const draft = {
+            activeTab: savedState.activeTab,
+            template: typeof savedState.draftTemplate === 'string' ? savedState.draftTemplate : undefined,
+            templateBase: savedState.draftTemplateBase,
+            preset: typeof savedState.draftPreset === 'string' ? savedState.draftPreset : undefined,
+            presetBase: savedState.draftPresetBase,
+            reservePercent: savedState.draftReservePercent,
+            reservePercentBase: savedState.draftReservePercentBase,
+            reserveMin: savedState.draftReserveMin,
+            reserveMinBase: savedState.draftReserveMinBase,
+            reserveMax: savedState.draftReserveMax,
+            reserveMaxBase: savedState.draftReserveMaxBase,
+        };
+        let stateTimer;
+        const persistState = () => {
+            if (stateTimer) {
+                clearTimeout(stateTimer);
+                stateTimer = undefined;
+            }
+            vsc.setState({
+                activeTab: draft.activeTab,
+                draftTemplate: draft.template,
+                draftTemplateBase: draft.templateBase,
+                draftPreset: draft.preset,
+                draftPresetBase: draft.presetBase,
+                draftReservePercent: draft.reservePercent,
+                draftReservePercentBase: draft.reservePercentBase,
+                draftReserveMin: draft.reserveMin,
+                draftReserveMinBase: draft.reserveMinBase,
+                draftReserveMax: draft.reserveMax,
+                draftReserveMaxBase: draft.reserveMaxBase,
+            });
+        };
+        const persistStateSoon = () => {
+            if (stateTimer) clearTimeout(stateTimer);
+            stateTimer = setTimeout(persistState, 250);
+        };
         const bind = (id, event, fn) => {
             const el = document.getElementById(id);
             if (el) el.addEventListener(event, fn);
@@ -509,10 +636,10 @@ export function renderPanelHtml(
                 item.tabIndex = selected ? 0 : -1;
                 document.getElementById(item.getAttribute('aria-controls')).hidden = !selected;
             });
-            vsc.setState({ activeTab: tab.id });
+            draft.activeTab = tab.id;
+            persistStateSoon();
         };
-        const savedTab = vsc.getState()?.activeTab;
-        const initialTab = tabs.find((tab) => tab.id === savedTab) || tabs[0];
+        const initialTab = tabs.find((tab) => tab.id === draft.activeTab) || tabs[0];
         activateTab(initialTab);
         tabs.forEach((tab, index) => {
             tab.addEventListener('click', () => activateTab(tab));
@@ -528,8 +655,23 @@ export function renderPanelHtml(
                 activateTab(tabs[nextIndex]);
             });
         });
+        const rendered = {
+            template: ${templateJson},
+            preset: ${JSON.stringify(currentPreset).replace(/</g, '\\u003c')},
+            reservePercent: ${JSON.stringify(String(outputReservePercent))},
+            reserveMin: ${JSON.stringify(ktok(outputReserveMinTokens))},
+            reserveMax: ${JSON.stringify(ktok(outputReserveMaxTokens))},
+        };
         const templateEl = document.getElementById('template');
         templateEl.value = ${templateJson};
+        if (typeof draft.template === 'string' && draft.templateBase === rendered.template) {
+            templateEl.value = draft.template;
+        }
+        templateEl.addEventListener('input', () => {
+            draft.template = templateEl.value;
+            draft.templateBase = rendered.template;
+            persistStateSoon();
+        });
         const keyEl = document.getElementById('key');
         const currentKeyMask = ${JSON.stringify(maskedKey ?? '').replace(/</g, '\\u003c')};
         keyEl.value = currentKeyMask;
@@ -539,6 +681,50 @@ export function renderPanelHtml(
         bind('saveKey', 'click', () => {
             vsc.postMessage({ type: 'saveKey', value: keyEl.value, currentKeyMasked: currentKeyMask });
         });
+        bind('clearKey', 'click', () => {
+            vsc.postMessage({ type: 'clearKey' });
+        });
+        const presetEl = document.getElementById('presetSelect');
+        const restorePreset = (value) => {
+            const exists = Array.from(presetEl.options).some((o) => o.value === value);
+            if (!exists && value !== '') {
+                const option = document.createElement('option');
+                option.value = value;
+                option.textContent = value + ' (not in list)';
+                presetEl.appendChild(option);
+            }
+            presetEl.value = value;
+        };
+        if (typeof draft.preset === 'string' && draft.presetBase === rendered.preset) {
+            restorePreset(draft.preset);
+        }
+        bind('presetSelect', 'change', () => {
+            draft.preset = presetEl.value;
+            draft.presetBase = rendered.preset;
+            persistState();
+            vsc.postMessage({ type: 'selectPreset', value: presetEl.value });
+        });
+        const bindReserveField = (id, prop, baseProp, messageType) => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            if (draft[prop] !== undefined && draft[baseProp] === rendered[prop]) {
+                el.value = draft[prop];
+            }
+            el.addEventListener('input', () => {
+                draft[prop] = el.value;
+                draft[baseProp] = rendered[prop];
+                persistStateSoon();
+            });
+            el.addEventListener('change', () => {
+                draft[prop] = el.value;
+                draft[baseProp] = rendered[prop];
+                persistState();
+                vsc.postMessage({ type: messageType, value: el.value });
+            });
+        };
+        bindReserveField('outputReservePercent', 'reservePercent', 'reservePercentBase', 'saveOutputReservePercent');
+        bindReserveField('outputReserveMinTokens', 'reserveMin', 'reserveMinBase', 'saveOutputReserveMinTokens');
+        bindReserveField('outputReserveMaxTokens', 'reserveMax', 'reserveMaxBase', 'saveOutputReserveMaxTokens');
         bind('limit', 'change', () => {
             vsc.postMessage({ type: 'saveLimit', value: document.getElementById('limit').value });
         });
@@ -557,59 +743,34 @@ export function renderPanelHtml(
         bind('sanitizeBase64', 'change', () => {
             vsc.postMessage({ type: 'saveSanitizeBase64', value: document.getElementById('sanitizeBase64').checked });
         });
-        bind('contextPolicy', 'change', () => {
-            vsc.postMessage({ type: 'saveContextPolicy', value: document.getElementById('contextPolicy').value });
-        });
-        bind('contextMargin', 'change', () => {
-            vsc.postMessage({ type: 'saveContextMargin', value: document.getElementById('contextMargin').value });
-        });
-        document.querySelectorAll('select.capmode').forEach((el) => {
-            el.addEventListener('change', () => {
-                const idx = el.getAttribute('data-idx');
-                const valEl = document.getElementById('capval-' + idx);
-                vsc.postMessage({
-                    type: 'setContextCap',
-                    modelId: el.getAttribute('data-model'),
-                    mode: el.value,
-                    value: valEl ? valEl.value : undefined,
-                });
-            });
-        });
-        document.querySelectorAll('input.capval').forEach((el) => {
-            el.addEventListener('change', () => {
-                const idx = el.getAttribute('data-idx');
-                const selEl = document.querySelector('select.capmode[data-idx="' + idx + '"]');
-                vsc.postMessage({
-                    type: 'setContextCap',
-                    modelId: el.getAttribute('data-model'),
-                    mode: selEl ? selEl.value : 'custom',
-                    value: el.value,
-                });
-            });
+        bind('hideUnavailableModels', 'change', () => {
+            vsc.postMessage({ type: 'saveHideUnavailableModels', value: document.getElementById('hideUnavailableModels').checked });
         });
         bind('saveTemplate', 'click', () => {
             vsc.postMessage({ type: 'saveTemplate', value: templateEl.value });
         });
-        bind('presetSelect', 'change', () => {
-            vsc.postMessage({ type: 'selectPreset', value: document.getElementById('presetSelect').value });
-        });
         window.addEventListener('message', (event) => {
             const m = event.data;
-            if (!m || m.type !== 'presetSelection' || typeof m.value !== 'string') {
+            if (!m || typeof m !== 'object') {
                 return;
             }
-            const selectEl = document.getElementById('presetSelect');
-            if (!selectEl) {
+            if (m.type === 'templateCleared') {
+                templateEl.value = '';
+                delete draft.template;
+                delete draft.templateBase;
+                delete draft.preset;
+                delete draft.presetBase;
+                presetEl.value = '';
+                persistState();
                 return;
             }
-            const exists = Array.from(selectEl.options).some((o) => o.value === m.value);
-            if (!exists && m.value !== '') {
-                const option = document.createElement('option');
-                option.value = m.value;
-                option.textContent = m.value + ' (not in list)';
-                selectEl.appendChild(option);
+            if (m.type !== 'presetSelection' || typeof m.value !== 'string') {
+                return;
             }
-            selectEl.value = m.value;
+            restorePreset(m.value);
+            draft.preset = m.value;
+            draft.presetBase = rendered.preset;
+            persistStateSoon();
         });
     </script>
 </div>
@@ -626,8 +787,6 @@ function esc(s: string): string {
 export interface PanelMessage {
     type: string;
     value?: unknown;
-    modelId?: string;
-    mode?: string;
     currentKeyMasked?: string;
 }
 
@@ -642,7 +801,6 @@ export interface PanelDeps {
     setKey: (value: string) => Promise<void>;
     clearKey: () => Promise<void>;
     syncPresetSelection: (slug: string | undefined) => void;
-    setContextCap: (modelId: string, value: ContextCapValue | null) => Promise<void>;
 }
 
 export function templatePresetSlug(template: Record<string, unknown> | undefined): string | undefined {
@@ -660,7 +818,6 @@ function presetSlugOf(raw: string): string | undefined {
 
 async function saveConfig(deps: PanelDeps, key: string, value: unknown): Promise<void> {
     await deps.updateConfig(key, value);
-    await deps.doRefresh();
 }
 
 export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Promise<void> {
@@ -684,7 +841,7 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Pr
             const input = String(msg.value ?? '').trim();
             const n = Number(input);
             if (input === '' || !Number.isFinite(n) || n < 0) {
-                deps.error('invalid limit');
+                deps.error('Enter a limit of 0 or more.');
                 return;
             }
             await saveConfig(deps, 'creditLimit', n);
@@ -693,7 +850,7 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Pr
         case 'saveResetPeriod': {
             const value = String(msg.value);
             if (!isResetPeriod(value)) {
-                deps.error('invalid reset period');
+                deps.error('Select a valid reset period.');
                 return;
             }
             await saveConfig(deps, 'creditResetPeriod', value);
@@ -701,7 +858,7 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Pr
         }
         case 'saveIncludeByok': {
             if (typeof msg.value !== 'boolean') {
-                deps.error('invalid BYOK flag');
+                deps.error('Choose whether BYOK usage counts.');
                 return;
             }
             await saveConfig(deps, 'creditIncludeByok', msg.value);
@@ -710,7 +867,7 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Pr
         case 'saveRefreshInterval': {
             const n = Math.round(Number(msg.value));
             if (!Number.isFinite(n) || n < 1 || n > MAX_REFRESH_INTERVAL_MINUTES) {
-                deps.error(`invalid refresh interval (1-${MAX_REFRESH_INTERVAL_MINUTES} minutes)`);
+                deps.error(`Enter a refresh interval from 1 to ${MAX_REFRESH_INTERVAL_MINUTES} minutes.`);
                 return;
             }
             await saveConfig(deps, 'creditRefreshIntervalMinutes', n);
@@ -718,54 +875,45 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Pr
         }
         case 'saveSanitizeBase64': {
             if (typeof msg.value !== 'boolean') {
-                deps.error('invalid base64 sanitization flag');
+                deps.error('Choose whether long base64-like text is removed.');
                 return;
             }
             await saveConfig(deps, 'sanitizeBase64Content', msg.value);
             return;
         }
-        case 'saveContextPolicy': {
-            const value = String(msg.value ?? '');
-            if (value !== 'auto' && value !== 'full') {
-                deps.error('invalid context policy');
+        case 'saveHideUnavailableModels': {
+            if (typeof msg.value !== 'boolean') {
+                deps.error('Choose whether unavailable models are hidden.');
                 return;
             }
-            await deps.updateConfig('contextWindowPolicy', value);
+            await saveConfig(deps, 'hideUnavailableModels', msg.value);
             return;
         }
-        case 'saveContextMargin': {
-            const n = Math.round(Number(msg.value));
-            if (!Number.isFinite(n) || n < 0 || n > MAX_CONTEXT_MARGIN_PERCENT) {
-                deps.error(`invalid safety margin (0-${MAX_CONTEXT_MARGIN_PERCENT}%)`);
+        case 'saveOutputReservePercent': {
+            const n = Number(msg.value);
+            if (!Number.isFinite(n) || n < OUTPUT_RESERVE_PERCENT_MIN || n > OUTPUT_RESERVE_PERCENT_MAX) {
+                deps.error(`Enter an output reserve from ${OUTPUT_RESERVE_PERCENT_MIN}% to ${OUTPUT_RESERVE_PERCENT_MAX}%.`);
                 return;
             }
-            await deps.updateConfig('contextSafetyMarginPercent', n);
+            await saveConfig(deps, 'outputReservePercent', n);
             return;
         }
-        case 'setContextCap': {
-            const modelId = String(msg.modelId ?? '').trim();
-            if (modelId === '') {
-                deps.error('invalid model for the context cap');
-                return;
-            }
-            const mode = String(msg.mode ?? 'auto');
-            if (mode === 'auto') {
-                await deps.setContextCap(modelId, null);
-                await deps.doRefresh();
-                return;
-            }
-            if (mode === 'full') {
-                await deps.setContextCap(modelId, 'full');
-                await deps.doRefresh();
-                return;
-            }
-            const n = Math.round(Number(msg.value));
+        case 'saveOutputReserveMinTokens': {
+            const n = Math.round(Number(msg.value) * 1000);
             if (!Number.isFinite(n) || n < 1) {
-                deps.error('invalid context cap');
+                deps.error('Enter an output reserve lower limit above 0 K.');
                 return;
             }
-            await deps.setContextCap(modelId, n);
-            await deps.doRefresh();
+            await saveConfig(deps, 'outputReserveMinTokens', n);
+            return;
+        }
+        case 'saveOutputReserveMaxTokens': {
+            const n = Math.round(Number(msg.value) * 1000);
+            if (!Number.isFinite(n) || n < 1) {
+                deps.error('Enter an output reserve upper limit above 0 K.');
+                return;
+            }
+            await saveConfig(deps, 'outputReserveMaxTokens', n);
             return;
         }
         case 'clearKey':
@@ -783,7 +931,7 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Pr
             }
             const result = await deps.saveTemplate(raw);
             if (!result.ok) {
-                deps.error(result.error ?? 'invalid template');
+                deps.error(result.error ?? 'The request template is not valid.');
                 return;
             }
             deps.syncPresetSelection(presetSlugOf(raw));
@@ -805,12 +953,12 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Pr
                 return;
             }
             if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(slug)) {
-                deps.error('invalid preset');
+                deps.error('Enter a valid preset slug.');
                 return;
             }
             const result = await deps.saveTemplate(JSON.stringify({ preset: slug }));
             if (!result.ok) {
-                deps.error(result.error ?? 'invalid template');
+                deps.error(result.error ?? 'The request template is not valid.');
                 return;
             }
             await deps.doRefresh();

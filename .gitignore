@@ -1,4 +1,6 @@
-.*/
+# Local tooling state
+.kilo/
+.vscode-test/
 
 # Dependencies
 node_modules/

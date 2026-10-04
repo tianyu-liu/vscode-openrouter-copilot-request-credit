@@ -1,0 +1,44 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "type": "npm",
+            "script": "watch",
+            "problemMatcher": "$tsc-watch",
+            "isBackground": true,
+            "presentation": {
+                "reveal": "never",
+                "group": "build"
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "label": "npm: watch"
+        },
+        {
+            "type": "npm",
+            "script": "compile",
+            "problemMatcher": "$tsc",
+            "presentation": {
+                "reveal": "silent",
+                "group": "build"
+            },
+            "label": "npm: compile"
+        },
+        {
+            "type": "npm",
+            "script": "package",
+            "problemMatcher": [],
+            "label": "npm: package (VSIX)",
+            "detail": "vsce package --no-dependencies → openrouter-copilot-request-credit-<version>.vsix"
+        },
+        {
+            "type": "npm",
+            "script": "test",
+            "problemMatcher": [],
+            "label": "npm: test",
+            "detail": "compile + real VS Code integration test host (mocha)"
+        }
+    ]
+}

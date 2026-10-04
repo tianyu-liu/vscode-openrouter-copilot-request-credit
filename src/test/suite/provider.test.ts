@@ -9,12 +9,14 @@ import {
     getLastStreamUsage,
     getSessionCost,
     getSessionCosts,
+    GUARDRAIL_RETRY_NOTICE,
     hydrateSessionCosts,
     isHarnessOwnedModelOptions,
     MAX_TRACKED_SESSIONS,
     resetParentAttributionForTesting,
     resetSessionCostsForTesting,
     resolveCostSession,
+    retryBaseDelayMs,
     UNATTRIBUTED_SESSION_ID,
     mapResponseError,
     mapStreamedError,
@@ -113,6 +115,44 @@ suite("base64 sanitization", () => {
 
     test("a body with no messages is returned unchanged", () => {
         const body = { model: "x" };
+        const { body: out, removed } = sanitizeRequestBody(body);
+        assert.strictEqual(removed, 0);
+        assert.strictEqual(out, body);
+    });
+
+    test("sanitizes base64 runs in echoed reasoning and tool-call arguments", () => {
+        const reasoningRun = "C".repeat(240);
+        const argumentRun = "D".repeat(210);
+        const body = {
+            messages: [
+                {
+                    role: "assistant",
+                    reasoning: `trace ${reasoningRun}`,
+                    tool_calls: [
+                        {
+                            id: "call_1",
+                            type: "function",
+                            function: { name: "f", arguments: `{"blob":"${argumentRun}"}` },
+                        },
+                        { id: "call_2", type: "function", function: { name: "g" } },
+                    ],
+                },
+            ],
+        };
+        const { body: out, removed } = sanitizeRequestBody(body);
+        assert.strictEqual(removed, 450, "both the reasoning trace and the argument run are counted");
+        const message = (out.messages as Array<Record<string, unknown>>)[0];
+        assert.ok(String(message.reasoning).includes("[base64 content removed: 240 chars]"));
+        const calls = message.tool_calls as Array<Record<string, unknown>>;
+        const first = calls[0].function as Record<string, unknown>;
+        assert.strictEqual(calls[0].id, "call_1");
+        assert.strictEqual(first.name, "f");
+        assert.ok(String(first.arguments).includes("[base64 content removed: 210 chars]"));
+        assert.deepStrictEqual(calls[1], { id: "call_2", type: "function", function: { name: "g" } });
+    });
+
+    test("malformed reasoning and tool_calls values are left alone", () => {
+        const body = { messages: [{ role: "assistant", reasoning: 42, tool_calls: "junk" }] };
         const { body: out, removed } = sanitizeRequestBody(body);
         assert.strictEqual(removed, 0);
         assert.strictEqual(out, body);
@@ -696,13 +736,12 @@ suite("sessionIdFor", () => {
         assert.notStrictEqual(sessionIdFor("session-a"), sessionIdFor("session-b"));
     });
 
-    test("returns the per-window id when no conversation id is supplied", () => {
-        const fallback = sessionIdFor(undefined);
-        assert.strictEqual(fallback, sessionIdFor(null));
-        assert.strictEqual(fallback, sessionIdFor(""));
-        assert.strictEqual(fallback, sessionIdFor("   "));
-        assert.strictEqual(fallback, sessionIdFor(42));
-        assert.ok(!fallback.startsWith("copilot-chat:"), "the fallback is not namespaced");
+    test("returns undefined when no conversation id is supplied", () => {
+        assert.strictEqual(sessionIdFor(undefined), undefined);
+        assert.strictEqual(sessionIdFor(null), undefined);
+        assert.strictEqual(sessionIdFor(""), undefined);
+        assert.strictEqual(sessionIdFor("   "), undefined);
+        assert.strictEqual(sessionIdFor(42), undefined);
     });
 
     test("buildRequestBody omits session_id unless one is supplied", () => {
@@ -716,6 +755,7 @@ suite("sessionIdFor", () => {
 
     test("stays within OpenRouter's 256 character session_id limit", () => {
         const sessionId = sessionIdFor("x".repeat(400));
+        assert.ok(sessionId !== undefined);
         assert.strictEqual(sessionId.length, 256);
         assert.ok(sessionId.startsWith("copilot-chat:"));
     });
@@ -989,6 +1029,17 @@ suite("error mapping", () => {
         assert.strictEqual(mapStreamedError({ choices: [] }), undefined);
         assert.strictEqual(mapStreamedError(undefined), undefined);
         assert.strictEqual(mapStreamedError(null), undefined);
+    });
+});
+
+suite("retry backoff table", () => {
+    test("clamps an attempt past the table to the last delay instead of NaN", () => {
+        assert.strictEqual(retryBaseDelayMs(0), 1000);
+        assert.strictEqual(retryBaseDelayMs(1), 2000);
+        assert.strictEqual(retryBaseDelayMs(2), 4000);
+        assert.strictEqual(retryBaseDelayMs(3), 4000, "the fourth attempt reuses the last delay");
+        assert.strictEqual(retryBaseDelayMs(99), 4000);
+        assert.ok(Number.isFinite(retryBaseDelayMs(3)), "a clamped delay is never NaN");
     });
 });
 
@@ -1996,6 +2047,29 @@ suite("provideLanguageModelChatResponse (stubbed stream)", () => {
         assert.strictEqual(call.callId, "call_1");
         assert.strictEqual(call.name, "get_weather");
         assert.deepStrictEqual(call.input, { location: "Tokyo" });
+        assert.deepStrictEqual(textReported(), [], "no P18 space fallback follows a tool-call flush");
+    });
+
+    test("a tool-only stream finishing with finish_reason tool_calls reports exactly the tool call", async () => {
+        const body =
+            `data: ${JSON.stringify({
+                choices: [
+                    {
+                        delta: {
+                            tool_calls: [
+                                { index: 0, id: "call_9", function: { name: "get_info", arguments: '{"q":"x"}' } },
+                            ],
+                        },
+                        finish_reason: "tool_calls",
+                    },
+                ],
+            })}\n\n` + "data: [DONE]\n\n";
+        nextResponses.push(() => streamResponse(body));
+        await run();
+        const toolParts = reported.filter((p) => p instanceof vscode.LanguageModelToolCallPart);
+        assert.strictEqual(toolParts.length, 1);
+        assert.strictEqual(reported.length, 1, "exactly the tool call is reported");
+        assert.deepStrictEqual(textReported(), [], "the empty-response fallback is not appended after tool calls");
     });
 
     test("flushes pending tool calls when the stream ends at EOF without [DONE]", async () => {
@@ -2089,7 +2163,7 @@ suite("provideLanguageModelChatResponse (stubbed stream)", () => {
             const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
             await assert.rejects(
                 provider.provideLanguageModelChatResponse(model, [], options, progress as never, token as never),
-                (err: Error) => /did not respond within/.test(err.message)
+                (err: Error) => /did not respond within 0.02 seconds/.test(err.message)
             );
             assert.strictEqual(calls, 1, "a timeout abort is never retried");
         } finally {
@@ -2123,6 +2197,335 @@ suite("provideLanguageModelChatResponse (stubbed stream)", () => {
         ctrl.push(`data: ${JSON.stringify({ choices: [{ delta: { content: "second" } }] })}\n\n`);
         await assert.rejects(run, (err: unknown) => err instanceof vscode.CancellationError);
     });
+
+    test("a usage chunk already received is accounted before a later stream error is rethrown", async () => {
+        resetSessionCostsForTesting();
+        const body = sseBody([
+            {
+                provider: "Fireworks",
+                choices: [{ delta: { content: "partial" } }],
+                usage: {
+                    prompt_tokens: 10,
+                    completion_tokens: 2,
+                    total_tokens: 12,
+                    cost: 0,
+                    is_byok: true,
+                    prompt_tokens_details: { cached_tokens: 0 },
+                    cost_details: { upstream_inference_cost: 0.001 },
+                },
+            },
+            { error: { message: "provider exploded", code: "server_error" } },
+        ]);
+        nextResponses.push(() => streamResponse(body));
+        const opts = {
+            tools: undefined,
+            modelConfiguration: undefined,
+            modelOptions: { _conversationId: "conv-error" },
+        };
+        const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
+        await assert.rejects(
+            provider.provideLanguageModelChatResponse(model, [], opts as never, progress as never, token as never),
+            (err: Error) => err.message.includes("provider exploded")
+        );
+        assert.strictEqual(usageParts().length, 1, "the completed usage chunk is still reported");
+        const session = getSessionCost("copilot-chat:conv-error");
+        assert.ok(session, "and its cost is accumulated");
+        assert.strictEqual(session!.paid, 0.001);
+        assert.deepStrictEqual(textReported().map((p) => (p as { value: string }).value), ["partial"]);
+    });
+
+    test("a stream that stalls mid-response is abandoned and reported as a timeout", async () => {
+        const ctrl = controlledSse();
+        nextResponses.push(() => ctrl.response);
+        setPostTimeoutForTesting(20);
+        try {
+            const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
+            const run = provider.provideLanguageModelChatResponse(
+                model,
+                [],
+                options,
+                progress as never,
+                token as never
+            );
+            let guard = 0;
+            while (fetchCalls.length < 1 && guard++ < 100) {
+                await tick();
+            }
+            ctrl.push(`data: ${JSON.stringify({ choices: [{ delta: { content: "first" } }] })}\n\n`);
+            await assert.rejects(run, (err: Error) => /stopped sending data after 0.02 seconds/.test(err.message));
+            assert.deepStrictEqual(textReported().map((p) => (p as { value: string }).value), ["first"]);
+        } finally {
+            setPostTimeoutForTesting(60_000);
+        }
+    });
+
+    test("a chat response whose final URL is not HTTPS is rejected before it is read", async () => {
+        nextResponses.push(
+            () =>
+                ({
+                    status: 200,
+                    ok: true,
+                    redirected: true,
+                    url: "http://insecure.example/chat",
+                    headers: new Headers(),
+                }) as unknown as Response
+        );
+        await assert.rejects(
+            run(),
+            (err: Error) => /blocked insecure redirect to http:\/\/insecure\.example\/chat/.test(err.message)
+        );
+        assert.strictEqual(fetchCalls.length, 1, "an insecure redirect is not retried");
+    });
+
+    test("cancelling while a catalog fetch is pending rejects with CancellationError and never retries", async () => {
+        const listeners: Array<() => void> = [];
+        const mutableToken = {
+            isCancellationRequested: false,
+            onCancellationRequested: (cb: () => void) => {
+                listeners.push(cb);
+                return { dispose: () => { } };
+            },
+        };
+        const original = globalThis.fetch;
+        let calls = 0;
+        globalThis.fetch = ((_input: unknown, init?: RequestInit) => {
+            calls++;
+            return new Promise<Response>((_resolve, reject) => {
+                init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+            });
+        }) as typeof fetch;
+        try {
+            const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
+            const pending = provider.provideLanguageModelChatInformation(
+                { silent: true } as never,
+                mutableToken as never
+            );
+            while (calls < 1) {
+                await tick();
+            }
+            mutableToken.isCancellationRequested = true;
+            for (const notify of listeners) {
+                notify();
+            }
+            await assert.rejects(pending, (err: unknown) => err instanceof vscode.CancellationError);
+            assert.strictEqual(calls, 1, "a cancelled pending fetch is not retried");
+        } finally {
+            globalThis.fetch = original;
+        }
+    });
+
+    test("an in-flight catalog from the old key never repopulates the cache after a key switch", async () => {
+        const original = globalThis.fetch;
+        let release!: (response: Response) => void;
+        const firstCatalog = new Promise<Response>((resolve) => {
+            release = resolve;
+        });
+        const catalogJson = (id: string) =>
+            new Response(JSON.stringify({ data: [{ id, context_length: 1000 }] }), {
+                status: 200,
+                headers: { "content-type": "application/json" },
+            });
+        let catalogCalls = 0;
+        globalThis.fetch = (async (input: unknown) => {
+            const url = String(input);
+            if (url.includes("/models/user")) {
+                return new Response("nope", { status: 404 });
+            }
+            if (url.endsWith("/models")) {
+                catalogCalls++;
+                return catalogCalls === 1 ? firstCatalog : catalogJson("new-key/model");
+            }
+            return new Response("nope", { status: 404 });
+        }) as typeof fetch;
+        try {
+            const provider = new OpenRouterChatProvider(fakeSecrets("sk-old"), fakeState());
+            const staleRun = provider.provideLanguageModelChatInformation({ silent: true } as never, token as never);
+            while (catalogCalls < 1) {
+                await tick();
+            }
+            await provider.setKey("sk-new");
+            release(catalogJson("old-key/model"));
+            const stale = await staleRun;
+            assert.deepStrictEqual(stale.map((m) => m.id), ["old-key/model"]);
+            const fresh = await provider.provideLanguageModelChatInformation({ silent: true } as never, token as never);
+            assert.deepStrictEqual(fresh.map((m) => m.id), ["new-key/model"], "the new query fetches with the new key");
+            assert.strictEqual(catalogCalls, 2, "the stale result never served the new query or the cache");
+        } finally {
+            globalThis.fetch = original;
+        }
+    });
+
+    test("hydration repairs corrupted bucket fields and a non-array routes list", () => {
+        resetSessionCostsForTesting();
+        hydrateSessionCosts([
+            {
+                sessionId: "copilot-chat:corrupt",
+                paid: 0.5,
+                openRouter: "junk",
+                upstream: Number.NaN,
+                promptTokens: null,
+                completionTokens: -3,
+                cachedTokens: "many",
+                calls: "lots",
+                byok: "yes",
+                updatedAt: "yesterday",
+                routes: "junk",
+            } as never,
+            {
+                sessionId: "copilot-chat:routes",
+                paid: 0.25,
+                routes: [null, "junk", { provider: "Morph", model: "m", paid: "junk", calls: 3 }],
+            } as never,
+        ]);
+        const corrupt = getSessionCost("copilot-chat:corrupt")!;
+        assert.deepStrictEqual(corrupt.routes, []);
+        assert.strictEqual(corrupt.openRouter, 0);
+        assert.strictEqual(corrupt.upstream, 0);
+        assert.strictEqual(corrupt.promptTokens, 0);
+        assert.strictEqual(corrupt.completionTokens, 0);
+        assert.strictEqual(corrupt.cachedTokens, 0);
+        assert.strictEqual(corrupt.calls, 0);
+        assert.strictEqual(corrupt.byok, false);
+        assert.strictEqual(corrupt.updatedAt, 0);
+        const repaired = getSessionCost("copilot-chat:routes")!;
+        assert.strictEqual(repaired.routes.length, 1, "non-object route entries are dropped");
+        assert.strictEqual(repaired.routes[0].provider, "Morph");
+        assert.strictEqual(repaired.routes[0].calls, 3);
+        assert.strictEqual(repaired.routes[0].paid, 0);
+    });
+
+    function guardrail403(text: string): { response: Response; cancelled: () => boolean } {
+        let cancelled = false;
+        const response = {
+            status: 403,
+            ok: false,
+            redirected: false,
+            url: "https://openrouter.ai/api/v1/chat/completions",
+            headers: new Headers(),
+            clone: () => ({ text: async () => text }) as unknown as Response,
+            body: {
+                cancel: async () => {
+                    cancelled = true;
+                },
+            },
+            text: async () => text,
+        } as unknown as Response;
+        return { response, cancelled: () => cancelled };
+    }
+
+    async function withSanitize(value: boolean, fn: () => Promise<void>): Promise<void> {
+        const cfg = vscode.workspace.getConfiguration("openrouterCopilot");
+        const previous = cfg.get<boolean>("sanitizeBase64Content", true);
+        await cfg.update("sanitizeBase64Content", value, vscode.ConfigurationTarget.Global);
+        try {
+            await fn();
+        } finally {
+            await cfg.update("sanitizeBase64Content", previous, vscode.ConfigurationTarget.Global);
+        }
+    }
+
+    test("a guardrail 403 retry sanitizes prompt text and reports the retry notice once", async () => {
+        const promptRun = "P".repeat(300);
+        const guard = guardrail403("Request blocked: base64 prompt injection detected");
+        nextResponses.push(
+            guard.response,
+            () =>
+                streamResponse(
+                    sseBody([
+                        { choices: [{ delta: { content: "recovered" } }] },
+                        { choices: [{ delta: {}, finish_reason: "stop" }], usage: { total_tokens: 1 } },
+                    ])
+                )
+        );
+        await withSanitize(false, async () => {
+            await runMessages([
+                msg(vscode.LanguageModelChatMessageRole.User, [new vscode.LanguageModelTextPart(`data ${promptRun}`)]),
+            ]);
+        });
+        assert.strictEqual(fetchCalls.length, 2, "exactly one guardrail retry");
+        assert.ok(guard.cancelled(), "the discarded 403 body is cancelled before retrying");
+        const first = sentBody(0).messages as Array<{ content: string }>;
+        assert.ok(first[0].content.includes(promptRun), "with sanitizing off the proactive pass removed nothing");
+        const retried = sentBody(1).messages as Array<{ content: string }>;
+        assert.ok(retried[0].content.includes("[base64 content removed: 300 chars]"), "the retry body is sanitized");
+        assert.deepStrictEqual(
+            textReported().map((p) => (p as { value: string }).value),
+            [GUARDRAIL_RETRY_NOTICE, "recovered"],
+            "the retry notice is reported exactly once"
+        );
+    });
+
+    test("a guardrail 403 retry sanitizes base64 hidden in a tool-call argument", async () => {
+        const blob = "T".repeat(240);
+        const guard = guardrail403("blocked by the base64 filter");
+        const retriedBody =
+            `data: ${JSON.stringify({
+                choices: [
+                    {
+                        delta: {
+                            tool_calls: [
+                                { index: 0, id: "call_2", function: { name: "f", arguments: '{"ok":true}' } },
+                            ],
+                        },
+                        finish_reason: "tool_calls",
+                    },
+                ],
+            })}\n\n` + "data: [DONE]\n\n";
+        nextResponses.push(guard.response, () => streamResponse(retriedBody));
+        const messages = [
+            msg(vscode.LanguageModelChatMessageRole.Assistant, [
+                new vscode.LanguageModelToolCallPart("call_1", "fetch_blob", { blob }),
+            ]),
+            msg(vscode.LanguageModelChatMessageRole.User, [new vscode.LanguageModelTextPart("go on")]),
+        ];
+        await withSanitize(false, async () => {
+            await runMessages(messages);
+        });
+        assert.strictEqual(fetchCalls.length, 2, "one guardrail retry");
+        const rawCall = (sentBody(0).messages as any[])[0].tool_calls[0];
+        assert.ok(String(rawCall.function.arguments).includes(blob), "the proactive pass is off");
+        const cleanedCall = (sentBody(1).messages as any[])[0].tool_calls[0];
+        assert.ok(String(cleanedCall.function.arguments).includes("[base64 content removed: 240 chars]"));
+        assert.strictEqual(cleanedCall.id, "call_1");
+        assert.strictEqual(cleanedCall.function.name, "fetch_blob");
+        const toolParts = reported.filter((p) => p instanceof vscode.LanguageModelToolCallPart);
+        assert.strictEqual(toolParts.length, 1, "the retried stream's tool call is reported");
+        assert.strictEqual((toolParts[0] as vscode.LanguageModelToolCallPart).callId, "call_2");
+        assert.deepStrictEqual(
+            textReported().map((p) => (p as { value: string }).value),
+            [GUARDRAIL_RETRY_NOTICE],
+            "the notice counts as a reported part, so no space fallback follows"
+        );
+    });
+
+    test("sanitizeBase64Content off: the retry still sanitizes; on: a pre-sanitized body does not retry", async () => {
+        const off = "O".repeat(260);
+        const guardOff = guardrail403("blocked: prompt injection guardrail");
+        nextResponses.push(guardOff.response, okStream());
+        await withSanitize(false, async () => {
+            await runMessages([msg(vscode.LanguageModelChatMessageRole.User, [new vscode.LanguageModelTextPart(off)])]);
+        });
+        assert.strictEqual(fetchCalls.length, 2, "with proactive sanitizing off the 403 retry runs");
+        assert.ok(String((sentBody(0).messages as Array<{ content: string }>)[0].content).includes(off));
+        assert.ok(
+            String((sentBody(1).messages as Array<{ content: string }>)[0].content).includes("[base64 content removed:")
+        );
+
+        const on = "N".repeat(260);
+        const guardOn = guardrail403("blocked: prompt injection guardrail");
+        nextResponses.push(guardOn.response);
+        await withSanitize(true, async () => {
+            await assert.rejects(
+                runMessages([msg(vscode.LanguageModelChatMessageRole.User, [new vscode.LanguageModelTextPart(on)])]),
+                (err: Error) => err.message.includes("403")
+            );
+        });
+        assert.strictEqual(fetchCalls.length, 3, "an already-sanitized body is not retried");
+        assert.ok(
+            String((sentBody(2).messages as Array<{ content: string }>)[0].content).includes("[base64 content removed:")
+        );
+        assert.ok(!guardOn.cancelled(), "the 403 body is retained for error mapping when no retry happens");
+    });
 });
 
 suite("provideTokenCount", () => {
@@ -2139,13 +2542,106 @@ suite("provideTokenCount", () => {
         assert.strictEqual(await provider.provideTokenCount(model, "", token as never), 0);
     });
 
-    test("counts text parts of a message and ignores other part kinds", async () => {
+    test("counts text-bearing parts at one token per four characters", async () => {
         const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
         const message = msg(vscode.LanguageModelChatMessageRole.User, [
             new vscode.LanguageModelTextPart("abcdefgh"),
+            // 8 text chars + 11 name chars + 2 chars of "{}" = 21 -> 6 tokens
             new vscode.LanguageModelToolCallPart("call_1", "get_weather", {}),
         ]);
-        assert.strictEqual(await provider.provideTokenCount(model, message, token as never), 2);
+        assert.strictEqual(await provider.provideTokenCount(model, message, token as never), 6);
+    });
+
+    test("counts tool-result content and non-image data parts", async () => {
+        const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
+        const message = msg(vscode.LanguageModelChatMessageRole.User, [
+            new vscode.LanguageModelToolResultPart("call_1", [
+                new vscode.LanguageModelTextPart("01234567"),
+                new vscode.LanguageModelDataPart(new TextEncoder().encode("abcd"), "text/plain"),
+            ]),
+        ]);
+        assert.strictEqual(await provider.provideTokenCount(model, message, token as never), 3);
+    });
+
+    test("counts thinking-part values when the host exposes the class", async function () {
+        if (!runtimeThinkingPartCtor) {
+            this.skip();
+        }
+        const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
+        const message = msg(vscode.LanguageModelChatMessageRole.Assistant, [
+            new (runtimeThinkingPartCtor as any)("abcdefghij"),
+        ]);
+        assert.strictEqual(await provider.provideTokenCount(model, message, token as never), 3);
+    });
+
+    function pngBytes(width: number, height: number): Uint8Array {
+        const bytes = new Uint8Array(24);
+        bytes.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d, 0x49, 0x48, 0x44, 0x52], 0);
+        const view = new DataView(bytes.buffer);
+        view.setUint32(16, width);
+        view.setUint32(20, height);
+        return bytes;
+    }
+
+    function gifBytes(width: number, height: number): Uint8Array {
+        const bytes = new Uint8Array(10);
+        bytes.set([0x47, 0x49, 0x46, 0x38, 0x39, 0x61], 0);
+        const view = new DataView(bytes.buffer);
+        view.setUint16(6, width, true);
+        view.setUint16(8, height, true);
+        return bytes;
+    }
+
+    function jpegBytes(width: number, height: number): Uint8Array {
+        const bytes = new Uint8Array(11);
+        bytes.set([0xff, 0xd8, 0xff, 0xc0, 0x00, 0x11, 0x08], 0);
+        const view = new DataView(bytes.buffer);
+        view.setUint16(7, height);
+        view.setUint16(9, width);
+        return bytes;
+    }
+
+    function webpBytes(width: number, height: number): Uint8Array {
+        const bytes = new Uint8Array(30);
+        bytes.set([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50, 0x38, 0x58], 0);
+        const w = width - 1;
+        const h = height - 1;
+        bytes.set([w & 0xff, (w >> 8) & 0xff, (w >> 16) & 0xff, h & 0xff, (h >> 8) & 0xff, (h >> 16) & 0xff], 24);
+        return bytes;
+    }
+
+    test("estimates image parts from pixel dimensions (~750 px per token)", async () => {
+        const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
+        const estimate = async (bytes: Uint8Array, mime: string) =>
+            provider.provideTokenCount(
+                model,
+                msg(vscode.LanguageModelChatMessageRole.User, [new vscode.LanguageModelDataPart(bytes, mime)]),
+                token as never
+            );
+        assert.strictEqual(await estimate(pngBytes(1024, 1024), "image/png"), 1399);
+        assert.strictEqual(await estimate(gifBytes(640, 480), "image/gif"), 410);
+        assert.strictEqual(await estimate(jpegBytes(1920, 1080), "image/jpeg"), 2765);
+        assert.strictEqual(await estimate(webpBytes(800, 600), "image/webp"), 640);
+    });
+
+    test("falls back to a fixed estimate for an unreadable image header", async () => {
+        const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
+        const message = msg(vscode.LanguageModelChatMessageRole.User, [
+            new vscode.LanguageModelDataPart(new Uint8Array([1, 2, 3, 4]), "image/png"),
+        ]);
+        assert.strictEqual(await provider.provideTokenCount(model, message, token as never), 1024);
+    });
+
+    test("counts an image nested in a tool result", async () => {
+        const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
+        const message = msg(vscode.LanguageModelChatMessageRole.User, [
+            new vscode.LanguageModelToolResultPart("call_1", [
+                new vscode.LanguageModelTextPart("01234567"),
+                new vscode.LanguageModelDataPart(gifBytes(640, 480), "image/gif"),
+            ]),
+        ]);
+        // 8 text chars -> 2 tokens, plus the 640x480 image -> 410
+        assert.strictEqual(await provider.provideTokenCount(model, message, token as never), 412);
     });
 });
 
@@ -2178,6 +2674,7 @@ suite("preset model entries (catalog + presets)", () => {
                             id: "z-ai/glm-5.3-flash",
                             name: "GLM 5.3 Flash",
                             context_length: 131072,
+                            top_provider: { max_completion_tokens: 16384 },
                             pricing: { prompt: "0.000001", completion: "0.000003" },
                             architecture: { input_modalities: ["text", "image"] },
                             supported_parameters: ["tools", "temperature"],
@@ -2379,6 +2876,7 @@ suite("preset model entries (catalog + presets)", () => {
                             {
                                 id: "z-ai/glm-5.3-flash",
                                 context_length: 131072,
+                                top_provider: { max_completion_tokens: 16384 },
                                 reasoning: { supported_efforts: ["max", "high", "low"], default_effort: "high" },
                             },
                         ],
@@ -2638,6 +3136,175 @@ suite("preset model entries (catalog + presets)", () => {
             }
         );
     });
+
+    test("a catalog body without a data array surfaces an error instead of caching an empty list", async () => {
+        const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
+        await withFetch(
+            (url) => (url.endsWith("/models") ? jsonResponse({ models: [] }) : new Response("nope", { status: 404 })),
+            async () => {
+                await assert.rejects(
+                    provider.provideLanguageModelChatInformation({ silent: true } as never, token as never),
+                    (err: Error) => /unexpected response body/.test(err.message)
+                );
+            }
+        );
+    });
+
+    test("a catalog response whose final URL is not HTTPS is rejected", async () => {
+        const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
+        await withFetch(
+            () =>
+                ({
+                    status: 200,
+                    ok: true,
+                    redirected: true,
+                    url: "http://insecure.example/models",
+                    headers: new Headers(),
+                    json: async () => ({ data: [] }),
+                }) as unknown as Response,
+            async () => {
+                await assert.rejects(
+                    provider.provideLanguageModelChatInformation({ silent: true } as never, token as never),
+                    (err: Error) => /blocked insecure redirect to http:\/\/insecure\.example\/models/.test(err.message)
+                );
+            }
+        );
+    });
+
+    test("concurrent getPresetConfig calls for one slug share a single fetch", async () => {
+        const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
+        let slugRequests = 0;
+        await withFetch(
+            (url) => {
+                if (url.endsWith("/presets/faster-glm-flash")) {
+                    slugRequests++;
+                    return jsonResponse({
+                        data: {
+                            slug: "faster-glm-flash",
+                            designated_version: { config: { model: "z-ai/glm-5.3-flash" } },
+                        },
+                    });
+                }
+                throw new Error(`unexpected fetch: ${url}`);
+            },
+            async () => {
+                const [a, b] = await Promise.all([
+                    provider.getPresetConfig("faster-glm-flash"),
+                    provider.getPresetConfig("faster-glm-flash"),
+                ]);
+                assert.ok(a);
+                assert.strictEqual(a, b, "both callers see the same config object");
+                assert.strictEqual(slugRequests, 1, "one fetch for concurrent lookups");
+            }
+        );
+    });
+
+    test("a @preset turn records the resolved catalog model in the session route, not the alias", async () => {
+        resetSessionCostsForTesting();
+        const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
+        const routes = presetRoutes();
+        const progress = { report: () => undefined };
+        await withFetch(
+            (url) => {
+                if (url.endsWith("/chat/completions")) {
+                    return new Response(
+                        `data: ${JSON.stringify({
+                            provider: "Baseten",
+                            choices: [{ delta: { content: "ok" } }],
+                        })}\n\n` +
+                            `data: ${JSON.stringify({
+                                provider: "Baseten",
+                                choices: [{ delta: {}, finish_reason: "stop" }],
+                                usage: {
+                                    prompt_tokens: 10,
+                                    completion_tokens: 1,
+                                    total_tokens: 11,
+                                    cost: 0,
+                                    is_byok: true,
+                                    prompt_tokens_details: { cached_tokens: 0 },
+                                    cost_details: { upstream_inference_cost: 0.001 },
+                                },
+                            })}\n\n` +
+                            "data: [DONE]\n\n",
+                        { status: 200, headers: { "content-type": "text/event-stream" } }
+                    );
+                }
+                return routes(url);
+            },
+            async () => {
+                await provider.provideLanguageModelChatInformation({ silent: true } as never, token as never);
+                await provider.getPresetConfig("faster-glm-flash");
+                await provider.provideLanguageModelChatResponse(
+                    { id: "@preset/faster-glm-flash" } as unknown as vscode.LanguageModelChatInformation,
+                    [],
+                    {
+                        tools: undefined,
+                        modelConfiguration: undefined,
+                        modelOptions: { _conversationId: "conv-preset" },
+                    } as never,
+                    progress as never,
+                    token as never
+                );
+            }
+        );
+        const session = getSessionCost("copilot-chat:conv-preset");
+        assert.ok(session, "the preset turn was tracked");
+        assert.strictEqual(
+            session!.routes[0].model,
+            "z-ai/glm-5.3-flash",
+            "the resolved base model is recorded, not the @preset alias"
+        );
+    });
+
+    test("a preset's context budget is computed for the resolved base model", async () => {
+        const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
+        const catalog = {
+            data: [
+                {
+                    id: "openai/gpt-5.6",
+                    name: "GPT-5.6",
+                    context_length: 1000000,
+                    top_provider: { max_completion_tokens: 128000 },
+                    pricing: {
+                        prompt: "0.0000002",
+                        completion: "0.0000012",
+                        overrides: [{ min_prompt_tokens: 272000, prompt: "0.0000004", completion: "0.0000018" }],
+                    },
+                },
+            ],
+        };
+        await withFetch(
+            (url) => {
+                if (url.endsWith("/models")) {
+                    return jsonResponse(catalog);
+                }
+                if (url.includes("/presets?")) {
+                    return jsonResponse({ data: [{ slug: "dated", name: "dated", status: "active" }] });
+                }
+                if (url.endsWith("/presets/dated")) {
+                    return jsonResponse({
+                        data: { slug: "dated", designated_version: { config: { model: "openai/gpt-5.6-20260826" } } },
+                    });
+                }
+                if (url.includes("/models/user")) {
+                    return new Response("nope", { status: 404 });
+                }
+                throw new Error(`unexpected fetch: ${url}`);
+            },
+            async () => {
+                await provider.provideLanguageModelChatInformation({ silent: true } as never, token as never);
+                await provider.getPresets();
+                const info = await provider.provideLanguageModelChatInformation({ silent: true } as never, token as never);
+                const preset = info.find((m) => m.id === "@preset/dated");
+                assert.ok(preset, "the dated preset is listed");
+                assert.strictEqual(
+                    preset!.maxInputTokens,
+                    272000,
+                    "the default price-step cap comes from the resolved base model, not the alias"
+                );
+            }
+        );
+    });
 });
 
 suite("stripTemplateComments and setTemplate", () => {
@@ -2717,6 +3384,11 @@ suite("routeCostCells", () => {
         assert.strictEqual(routeCostCells(route({ model: "" })).model, undefined);
     });
 
+    test("a mixed-billing route keeps the stored BYOK marker even when OpenRouter also charged", () => {
+        const cells = routeCostCells(route({ openRouter: 0.0005, upstream: 0.001, paid: 0.0015 }));
+        assert.strictEqual(cells.provider, "Fireworks (BYOK)", "the stored flag decides, not the payable split");
+    });
+
     // The rate is per route, so hopping between models in one chat still shows
     // each endpoint's own cache behavior instead of a blended session figure.
     test("each route carries its own cache rate, one decimal place", () => {
@@ -2729,6 +3401,166 @@ suite("routeCostCells", () => {
     });
 });
 
+suite("hide unavailable models", () => {
+    function jsonResponse(body: unknown): Response {
+        return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+    }
+
+    const token = new vscode.CancellationTokenSource().token;
+
+    const catalog = [
+        {
+            id: "openai/gpt-5.6",
+            name: "GPT-5.6",
+            context_length: 1050000,
+            pricing: {
+                prompt: "0.0000002",
+                completion: "0.0000012",
+                overrides: [{ min_prompt_tokens: 272000, prompt: "0.0000004", completion: "0.0000018" }],
+            },
+        },
+        {
+            id: "qwen/qwen3.7-flash",
+            name: "Qwen3.7 Flash",
+            context_length: 1000000,
+            pricing: {
+                prompt: "0.0000005",
+                completion: "0.000001",
+                overrides: [{ min_prompt_tokens: 32000, prompt: "0.0000008", completion: "0.0000016" }],
+            },
+        },
+    ];
+
+    async function withHide(value: boolean, fn: () => Promise<void>): Promise<void> {
+        const cfg = vscode.workspace.getConfiguration("openrouterCopilot");
+        const previous = cfg.get<boolean>("hideUnavailableModels", true);
+        await cfg.update("hideUnavailableModels", value, vscode.ConfigurationTarget.Global);
+        try {
+            await fn();
+        } finally {
+            await cfg.update("hideUnavailableModels", previous, vscode.ConfigurationTarget.Global);
+        }
+    }
+
+    async function withFetch(handler: (url: string) => Response, fn: () => Promise<void>): Promise<void> {
+        const original = globalThis.fetch;
+        globalThis.fetch = (async (input: unknown) => handler(String(input))) as typeof fetch;
+        try {
+            await fn();
+        } finally {
+            globalThis.fetch = original;
+        }
+    }
+
+    test("on by default: hides models the key cannot use from the picker and the tier table", async () => {
+        const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
+        await withHide(true, async () => {
+            await withFetch(
+                (url) =>
+                    url.includes("/models/user")
+                        ? jsonResponse({ data: [{ id: "openai/gpt-5.6" }] })
+                        : jsonResponse({ data: catalog }),
+                async () => {
+                    const info = await provider.provideLanguageModelChatInformation(
+                        { silent: true } as never,
+                        token as never
+                    );
+                    assert.deepStrictEqual(info.map((m) => m.id), ["openai/gpt-5.6"]);
+                }
+            );
+        });
+    });
+
+    test("off: shows the full catalog and never queries availability", async () => {
+        const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
+        await withHide(false, async () => {
+            let userQueries = 0;
+            await withFetch(
+                (url) => {
+                    if (url.includes("/models/user")) {
+                        userQueries++;
+                    }
+                    return jsonResponse({ data: catalog });
+                },
+                async () => {
+                    const info = await provider.provideLanguageModelChatInformation(
+                        { silent: true } as never,
+                        token as never
+                    );
+                    assert.deepStrictEqual(info.map((m) => m.id), ["openai/gpt-5.6", "qwen/qwen3.7-flash"]);
+                    assert.strictEqual(userQueries, 0, "no availability query when the setting is off");
+                }
+            );
+        });
+    });
+
+    test("a failed availability query falls back to the full catalog", async () => {
+        const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
+        await withHide(true, async () => {
+            await withFetch(
+                (url) =>
+                    url.includes("/models/user")
+                        ? new Response("nope", { status: 404 })
+                        : jsonResponse({ data: catalog }),
+                async () => {
+                    const info = await provider.provideLanguageModelChatInformation(
+                        { silent: true } as never,
+                        token as never
+                    );
+                    assert.deepStrictEqual(info.map((m) => m.id), ["openai/gpt-5.6", "qwen/qwen3.7-flash"]);
+                }
+            );
+        });
+    });
+
+    test("a preset pinned to an unavailable model is omitted from the picker", async () => {
+        const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
+        await withHide(true, async () => {
+            await withFetch(
+                (url) => {
+                    if (url.includes("/models/user")) {
+                        return jsonResponse({ data: [{ id: "openai/gpt-5.6" }] });
+                    }
+                    if (url.endsWith("/models")) {
+                        return jsonResponse({ data: catalog });
+                    }
+                    if (url.includes("/presets?")) {
+                        return jsonResponse({
+                            data: [
+                                { slug: "kept", name: "kept", status: "active" },
+                                { slug: "hidden", name: "hidden", status: "active" },
+                            ],
+                        });
+                    }
+                    if (url.endsWith("/presets/kept")) {
+                        return jsonResponse({
+                            data: { slug: "kept", designated_version: { config: { model: "openai/gpt-5.6" } } },
+                        });
+                    }
+                    if (url.endsWith("/presets/hidden")) {
+                        return jsonResponse({
+                            data: {
+                                slug: "hidden",
+                                designated_version: { config: { model: "qwen/qwen3.7-flash-20260826" } },
+                            },
+                        });
+                    }
+                    throw new Error(`unexpected fetch: ${url}`);
+                },
+                async () => {
+                    await provider.getPresets();
+                    const ids = (await provider.provideLanguageModelChatInformation(
+                        { silent: true } as never,
+                        token as never
+                    )).map((m) => m.id);
+                    assert.ok(ids.includes("@preset/kept"), "a preset pinned to an available model stays");
+                    assert.ok(!ids.includes("@preset/hidden"), "a preset pinned to an unavailable model is hidden");
+                }
+            );
+        });
+    });
+});
+
 suite("context tier rows", () => {
     function jsonResponse(body: unknown): Response {
         return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
@@ -2736,92 +3568,190 @@ suite("context tier rows", () => {
 
     const tierToken = new vscode.CancellationTokenSource().token;
 
-    test("one row per model with a price step, reflecting the auto-capped input budget", async () => {
+    const STEPPED_CATALOG = {
+        data: [
+            {
+                id: "openai/gpt-5.6",
+                name: "GPT-5.6",
+                context_length: 1050000,
+                top_provider: { max_completion_tokens: 128000 },
+                pricing: {
+                    prompt: "0.0000002",
+                    completion: "0.0000012",
+                    overrides: [{ min_prompt_tokens: 272000, prompt: "0.0000004", completion: "0.0000018" }],
+                },
+            },
+            { id: "plain/model", context_length: 131072, pricing: { prompt: "0.000001" } },
+        ],
+    };
+
+    test("the model picker gets a Context size menu for stepped models only", async () => {
         const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
         const original = globalThis.fetch;
-        globalThis.fetch = (async () =>
-            jsonResponse({
-                data: [
-                    {
-                        id: "openai/gpt-5.6",
-                        name: "GPT-5.6",
-                        context_length: 1050000,
-                        top_provider: { max_completion_tokens: 128000 },
-                        pricing: {
-                            prompt: "0.0000002",
-                            completion: "0.0000012",
-                            overrides: [{ min_prompt_tokens: 272000, prompt: "0.0000004", completion: "0.0000018" }],
-                        },
-                    },
-                    { id: "plain/model", context_length: 131072, pricing: { prompt: "0.000001" } },
-                ],
-            })) as typeof fetch;
+        globalThis.fetch = (async () => jsonResponse(STEPPED_CATALOG)) as typeof fetch;
         try {
-            await provider.provideLanguageModelChatInformation({ silent: true } as never, tierToken as never);
-            const rows = provider.contextTierRows();
-            assert.strictEqual(rows.length, 1, "only the model with a price step appears");
-            const row = rows[0];
-            assert.strictEqual(row.modelId, "openai/gpt-5.6");
-            assert.strictEqual(row.label, "GPT-5.6");
-            assert.strictEqual(row.threshold, 272000);
-            assert.strictEqual(row.basePromptPerM, 0.2);
-            assert.strictEqual(row.tierPromptPerM, 0.4);
-            assert.strictEqual(row.effectiveCap, 272000, "auto keeps the prompt under the threshold");
-            assert.strictEqual(row.override, undefined, "no override until one is set");
+            const info = await provider.provideLanguageModelChatInformation({ silent: true } as never, tierToken as never);
+            const stepped = info.find((m) => m.id === "openai/gpt-5.6")!;
+            const cap = (stepped.configurationSchema as { properties?: Record<string, unknown> } | undefined)
+                ?.properties?.contextSize as Record<string, unknown> | undefined;
+            assert.ok(cap, "the stepped model exposes a Context size menu");
+            assert.deepStrictEqual(cap!.enum, ["272000", "full"]);
+            assert.strictEqual(cap!.default, "272000", "the step closest to 256K is the default");
+            assert.strictEqual(cap!.group, "tokens", "the menu rides VS Code's tokens group");
+            const plain = info.find((m) => m.id === "plain/model")!;
+            assert.strictEqual(plain.configurationSchema, undefined, "a model with no price step gets no menu");
         } finally {
             globalThis.fetch = original;
         }
     });
 
-    test("a per-model override is reflected in the row and in the effective cap", async () => {
-        const state = fakeState();
-        const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), state);
+    test("a picker Context size choice is persisted and updates the reported budget", async () => {
+        const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
         const original = globalThis.fetch;
-        globalThis.fetch = (async () =>
-            jsonResponse({
-                data: [
-                    {
-                        id: "openai/gpt-5.6",
-                        name: "GPT-5.6",
-                        context_length: 1050000,
-                        top_provider: { max_completion_tokens: 128000 },
-                        pricing: {
-                            prompt: "0.0000002",
-                            completion: "0.0000012",
-                            overrides: [{ min_prompt_tokens: 272000, prompt: "0.0000004", completion: "0.0000018" }],
-                        },
-                    },
-                ],
-            })) as typeof fetch;
+        globalThis.fetch = (async (input: unknown) => {
+            if (String(input).endsWith("/models")) {
+                return jsonResponse(STEPPED_CATALOG);
+            }
+            return new Response("data: [DONE]\n\n", {
+                status: 200,
+                headers: { "content-type": "text/event-stream" },
+            });
+        }) as typeof fetch;
+        const model = { id: "openai/gpt-5.6" } as unknown as vscode.LanguageModelChatInformation;
+        const call = (contextSize: string) =>
+            provider.provideLanguageModelChatResponse(
+                model,
+                [] as never,
+                { tools: undefined, modelConfiguration: { contextSize }, modelOptions: {} } as never,
+                { report: () => undefined } as never,
+                tierToken as never
+            );
         try {
-            await provider.provideLanguageModelChatInformation({ silent: true } as never, tierToken as never);
-            await provider.setContextCap("openai/gpt-5.6", 200000);
-            await provider.setContextCap("openai/other", 100000);
-            await provider.setContextCap("openai/full", "full");
-            const capped = provider.contextTierRows()[0];
-            assert.strictEqual(capped.override, 200000);
-            assert.strictEqual(capped.effectiveCap, 200000);
-            await provider.setContextMargin(10);
-            const marginAdjusted = provider.contextTierRows()[0];
-            assert.strictEqual(marginAdjusted.override, 180000, "the saved Custom count is reduced in place");
-            assert.strictEqual(marginAdjusted.effectiveCap, 180000, "the effective cap matches the saved count");
-            assert.strictEqual(provider.getContextCaps()["openai/other"], 90000, "other models are reduced too");
-            assert.strictEqual(provider.getContextCaps()["openai/full"], "full", "Full is not changed");
-            await provider.setContextMargin(20);
-            assert.strictEqual(provider.getContextCaps()["openai/gpt-5.6"], 160000, "subsequent changes scale from the applied margin");
-            await provider.setContextMargin(0);
-            assert.strictEqual(provider.getContextCaps()["openai/gpt-5.6"], 200000, "returning to zero restores the original count");
-            await provider.setContextCap("openai/gpt-5.6", "full");
-            const full = provider.contextTierRows()[0];
-            assert.strictEqual(full.override, "full");
-            assert.strictEqual(full.effectiveCap, 922000, "full ignores the tier cap");
-            await provider.setContextCap("openai/gpt-5.6", null);
-            const auto = provider.contextTierRows()[0];
-            assert.strictEqual(auto.override, undefined);
-            assert.strictEqual(auto.effectiveCap, 272000);
+            const initial = await provider.provideLanguageModelChatInformation({ silent: true } as never, tierToken as never);
+            assert.strictEqual(provider.getContextCaps()["openai/gpt-5.6"], undefined, "no cap until the picker is used");
+            assert.strictEqual(
+                initial.find((m) => m.id === "openai/gpt-5.6")!.maxInputTokens,
+                272000,
+                "with no choice the reported budget follows the default step (closest to 256K)"
+            );
+            await call("272000");
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            assert.strictEqual(
+                provider.getContextCaps()["openai/gpt-5.6"],
+                272000,
+                "a prompt-budget choice is stored verbatim (the picker value is the prompt budget)"
+            );
+            await call("full");
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            assert.strictEqual(provider.getContextCaps()["openai/gpt-5.6"], "full", "the full-window choice is persisted");
+            const info = await provider.provideLanguageModelChatInformation({ silent: true } as never, tierToken as never);
+            assert.strictEqual(
+                info.find((m) => m.id === "openai/gpt-5.6")!.maxInputTokens,
+                922000,
+                "the reported budget follows the picker choice"
+            );
+            await call("auto");
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            assert.strictEqual(provider.getContextCaps()["openai/gpt-5.6"], undefined, "an unknown value clears the cap");
         } finally {
             globalThis.fetch = original;
-            await vscode.workspace.getConfiguration("openrouterCopilot").update("contextSafetyMarginPercent", 0, vscode.ConfigurationTarget.Global);
         }
+    });
+
+    test("the output-reserve settings change the reported budget", async () => {
+        const cfg = vscode.workspace.getConfiguration("openrouterCopilot");
+        const previousPercent = cfg.get<number>("outputReservePercent", 12.5);
+        const previousMax = cfg.get<number>("outputReserveMaxTokens", 262144);
+        const catalog = {
+            data: [
+                {
+                    id: "deepseek/deepseek-v4.1-flash",
+                    context_length: 1048576,
+                    top_provider: { context_length: 1048576, max_completion_tokens: 943718 },
+                },
+            ],
+        };
+        const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
+        const original = globalThis.fetch;
+        globalThis.fetch = (async () => jsonResponse(catalog)) as typeof fetch;
+        try {
+            await cfg.update("outputReservePercent", 50, vscode.ConfigurationTarget.Global);
+            const capped = await provider.provideLanguageModelChatInformation({ silent: true } as never, tierToken as never);
+            assert.strictEqual(capped[0].maxOutputTokens, 262144, "the default upper limit caps the ratio");
+            await cfg.update("outputReserveMaxTokens", 524288, vscode.ConfigurationTarget.Global);
+            provider.refreshModelInfo();
+            const info = await provider.provideLanguageModelChatInformation({ silent: true } as never, tierToken as never);
+            assert.strictEqual(info[0].maxOutputTokens, 524288, "the bounds are read from the settings");
+            assert.strictEqual(info[0].maxInputTokens, 524288);
+        } finally {
+            globalThis.fetch = original;
+            await cfg.update("outputReservePercent", previousPercent, vscode.ConfigurationTarget.Global);
+            await cfg.update("outputReserveMaxTokens", previousMax, vscode.ConfigurationTarget.Global);
+        }
+    });
+
+    test("a context-cap or reserve change rebuilds model info without re-fetching /models or /models/user", async () => {
+        const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
+        const cfg = vscode.workspace.getConfiguration("openrouterCopilot");
+        const previousHide = cfg.get<boolean>("hideUnavailableModels", true);
+        const original = globalThis.fetch;
+        let modelRequests = 0;
+        let userRequests = 0;
+        await cfg.update("hideUnavailableModels", true, vscode.ConfigurationTarget.Global);
+        globalThis.fetch = (async (input: unknown) => {
+            const url = String(input);
+            if (url.endsWith("/models")) {
+                modelRequests++;
+                return jsonResponse(STEPPED_CATALOG);
+            }
+            if (url.includes("/models/user")) {
+                userRequests++;
+                return jsonResponse({ data: [{ id: "openai/gpt-5.6" }] });
+            }
+            return jsonResponse({ data: [] });
+        }) as typeof fetch;
+        try {
+            await provider.provideLanguageModelChatInformation({ silent: true } as never, tierToken as never);
+            assert.strictEqual(modelRequests, 1);
+            assert.strictEqual(userRequests, 1, "the availability set is fetched once");
+            await provider.setContextCap("openai/gpt-5.6", 300000);
+            provider.refreshModelInfo();
+            const info = await provider.provideLanguageModelChatInformation({ silent: true } as never, tierToken as never);
+            assert.strictEqual(modelRequests, 1, "the kept catalog serves the rebuilt information");
+            assert.strictEqual(userRequests, 1, "the cached availability set is reused");
+            assert.strictEqual(info.find((m) => m.id === "openai/gpt-5.6")!.maxInputTokens, 300000);
+        } finally {
+            globalThis.fetch = original;
+            await cfg.update("hideUnavailableModels", previousHide, vscode.ConfigurationTarget.Global);
+        }
+    });
+});
+
+suite("legacy context-cap migration", () => {
+    test("restores the gross cap from a margin-reduced store and clears the retired keys", () => {
+        const state = fakeState({
+            contextCaps: { "openai/gpt-5.6": 200000, "qwen/qwen3.7-flash": "full" },
+            contextCapsBase: { "openai/gpt-5.6": 250000 },
+            contextMarginPercent: 20,
+        });
+        const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), state);
+        assert.deepStrictEqual(provider.getContextCaps(), {
+            "openai/gpt-5.6": 250000,
+            "qwen/qwen3.7-flash": "full",
+        });
+        assert.strictEqual(state.get("contextCapsBase"), undefined);
+        assert.strictEqual(state.get("contextMarginPercent"), undefined);
+    });
+
+    test("derives the gross cap from the margin when no base was persisted", () => {
+        const state = fakeState({ contextCaps: { "openai/gpt-5.6": 200000 }, contextMarginPercent: 20 });
+        const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), state);
+        assert.deepStrictEqual(provider.getContextCaps(), { "openai/gpt-5.6": 250000 });
+    });
+
+    test("leaves a modern cap store alone", () => {
+        const state = fakeState({ contextCaps: { "openai/gpt-5.6": 250000 } });
+        const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), state);
+        assert.deepStrictEqual(provider.getContextCaps(), { "openai/gpt-5.6": 250000 });
     });
 });

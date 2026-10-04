@@ -43,23 +43,24 @@ export function resetPeriodLabel(p: ResetPeriod): string {
 }
 
 /**
- * Return a masked fragment of an API key so a user can confirm which key is in
- * use without exposing the full secret. Example: `sk-or-v1-12...1234`.
- * Falls back to a generic label when the key has no `label` field.
+ * Return a masked fragment of a stored API key so a user can confirm which key
+ * is in use without exposing the full secret. Example: `sk-or-v1-12...1234`.
+ * Takes the raw secret as stored; a missing or empty value falls back to a
+ * generic label.
  */
-export function maskKey(label: string | null | undefined): string {
-    if (!label) return "unknown key";
-    const len = label.length;
+export function maskKey(key: string | null | undefined): string {
+    if (!key) return "unknown key";
+    const len = key.length;
     if (len <= 4) return "****";
     if (len < 9) return "****";
     // Reveal a small leading/trailing fragment only: at most ~1/4 of long keys
     // (capped at 12 + 3 characters). Keys shorter than 9 characters reveal
     // nothing, and keys from 9 to 15 reveal a single leading character with no
     // trailing character, so the mask never reveals most of a short secret.
-    if (len < 16) return `${label.slice(0, 1)}...`;
+    if (len < 16) return `${key.slice(0, 1)}...`;
     const head = Math.min(12, Math.floor(len / 5));
     const tail = Math.min(3, Math.floor(len / 16));
-    return `${label.slice(0, head)}...${label.slice(-tail)}`;
+    return `${key.slice(0, head)}...${key.slice(-tail)}`;
 }
 
 /** The pure, render-ready result of deriving a status display for a key. */
@@ -272,7 +273,8 @@ export function usedDaily(info: KeyInfo, includeByok: boolean): number {
     return sumUsage(info.usage_daily, info.byok_usage_daily, includeByok);
 }
 
-/** Weekly spend (usage_weekly + optional BYOK). */
+/** Trailing 7-day spend (usage_weekly + optional BYOK). OpenRouter publishes a
+ *  rolling window, not a calendar week, so there is no fixed reset boundary. */
 export function usedWeekly(info: KeyInfo, includeByok: boolean): number {
     return sumUsage(info.usage_weekly, info.byok_usage_weekly, includeByok);
 }
@@ -314,7 +316,11 @@ function usedThisPeriod(info: KeyInfo, p: ResetPeriod, includeByok: boolean): nu
     }
 }
 
-/** Boundary Date for a configured reset period (next midnight / Monday / month start). */
+/**
+ * Boundary Date for a configured reset period (next midnight / month start).
+ * The weekly cadence has no boundary in the data model (usage_weekly is a
+ * trailing 7-day window), so its calendar Monday is not used by display code.
+ */
 export function resetBoundary(p: ResetPeriod, now: Date = new Date()): Date {
     if (p === "never") return new Date(Number.NaN);
     if (p === "weekly") return nextUtcMonday(now);
@@ -335,12 +341,15 @@ function limitResetPeriod(limit_reset: string | null | undefined): ResetPeriod {
 
 /**
  * Given OpenRouter's `limit_reset` value, return a human-friendly label for
- * when the limit refreshes. For recurring types we surface the exact next
- * UTC boundary; a "never"/null type reports no reset instead.
+ * when the limit refreshes. Daily/monthly surface the exact next UTC boundary;
+ * weekly is a rolling window with no fixed reset; a "never"/null type reports
+ * no reset instead.
  */
 export function describeReset(limit_reset: string | null | undefined): string {
     const period = limitResetPeriod(limit_reset);
-    return period === "never" ? "No reset" : `${formatReset(resetBoundary(period))} (${resetPeriodLabel(period)})`;
+    if (period === "never") return "No reset";
+    if (period === "weekly") return "Rolling 7-day window (Weekly)";
+    return `${formatReset(resetBoundary(period))} (${resetPeriodLabel(period)})`;
 }
 
 /** A single usage row: label plus OpenRouter-only, BYOK-only, and combined values. */
@@ -370,17 +379,13 @@ export interface Detail {
     /** Free-tier status: "yes"/"no"/"n/a". */
     freeTier: string;
     background: "default" | "error";
-    /** Masked key fragment shown near the key field, e.g. "sk-or-v1-b17...a682". */
-    keyLabel: string;
-    /** Source of the effective limit: "manual" (user limit) or "auto" (key's own limit). */
-    limitSource: "manual" | "auto";
     /** Effective limit value, e.g. "$10.00". */
     limitValue: string;
     /** The same limit as a number (null when unformattable), for numeric inputs. */
     limitNum: number | null;
     /** Reset cadence (daily/weekly/monthly/never), shown next to the limit. */
     resetPeriod: string;
-    /** Exact next reset date/time, shown separately, e.g. "2026/08/28 00:00". */
+    /** Exact next reset date/time, or a rolling-window/no-reset note. */
     resetDate: string;
     /** Derivation mode shared with the status bar: unlimited/manual/auto. */
     mode: ViewMode;
@@ -425,7 +430,7 @@ const MODE_TEXT: Record<ViewMode, { short: string; long: string }> = {
     },
     auto: {
         short: "Key limit",
-        long: "Key limit — limit is detected from key.",
+        long: "Key limit — the cap comes from the API key itself.",
     },
 };
 
@@ -484,7 +489,9 @@ export function coreView(
     const resetDate =
         unlimited || effectivePeriod === "never"
             ? "No reset"
-            : formatReset(resetBoundary(effectivePeriod));
+            : effectivePeriod === "weekly"
+                ? "Rolling 7-day window"
+                : formatReset(resetBoundary(effectivePeriod));
 
     let mode: ViewMode;
     let remainingNum: number;
@@ -567,7 +574,6 @@ export function buildDetail(
     ];
 
     const freeTierStr = info.is_free_tier == null ? "n/a" : info.is_free_tier ? "yes" : "no";
-    const keyLabel = info.label || "unknown key";
     const limitValue =
         view.mode === "unlimited" && !accountCredits
             ? "No cap"
@@ -578,8 +584,6 @@ export function buildDetail(
         remaining: formatUsdOrNa(view.remainingNum),
         freeTier: freeTierStr,
         background: view.exhausted ? "error" : "default",
-        keyLabel,
-        limitSource: view.mode === "auto" ? "auto" : "manual",
         limitValue,
         limitNum: Number.isFinite(view.limitNum) ? view.limitNum : null,
         resetPeriod: view.effectivePeriod,

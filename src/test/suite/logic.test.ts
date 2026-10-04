@@ -261,7 +261,7 @@ suite("logic.buildStatus", () => {
         assert.strictEqual(view.text, "OR $6.58/10");
         assert.match(view.tooltip, /Weekly limit: \$10\.00/);
         assert.match(view.tooltip, /Weekly usage: \$3\.42/);
-        assert.match(view.tooltip, /Resets: \d{4}\/\d{2}\/\d{2} \d{2}:\d{2} \S+/);
+        assert.match(view.tooltip, /Resets: Rolling 7-day window/);
     });
 
     test("guardrail branch: zero/over limit shows $(error) and error background", () => {
@@ -489,7 +489,7 @@ suite("logic.buildDetail", () => {
             is_free_tier: false,
         };
         const detail = buildDetail(info, 10);
-        assert.strictEqual(detail.limitSource, "auto");
+        assert.strictEqual(detail.mode, "auto");
         assert.strictEqual(detail.limitValue, "$10.00");
         assert.strictEqual(detail.resetPeriod, "daily");
         assert.strictEqual(detail.resetDate, formatReset(nextUtcMidnight()));
@@ -512,7 +512,7 @@ suite("logic.buildDetail", () => {
             return buildDetail(info, 10);
         };
         assert.strictEqual(mk("weekly").resetPeriod, "weekly");
-        assert.strictEqual(mk("weekly").resetDate, formatReset(nextUtcMonday()));
+        assert.strictEqual(mk("weekly").resetDate, "Rolling 7-day window");
         assert.strictEqual(mk("monthly").resetPeriod, "monthly");
         assert.strictEqual(mk("monthly").resetDate, formatReset(nextUtcMonthStart()));
         assert.strictEqual(mk(null).resetPeriod, "never");
@@ -531,13 +531,13 @@ suite("logic.buildDetail", () => {
             is_free_tier: false,
         };
         const detail = buildDetail(info, 10);
-        assert.strictEqual(detail.limitSource, "manual");
+        assert.strictEqual(detail.mode, "manual");
         assert.strictEqual(detail.limitValue, "$10.00");
         assert.strictEqual(detail.resetPeriod, "daily");
         assert.strictEqual(detail.resetDate, formatReset(nextUtcMidnight()));
     });
 
-    test("guardrail branch weekly reset period uses Monday boundary", () => {
+    test("guardrail branch weekly reset period reports a rolling window", () => {
         const info: KeyInfo = {
             limit: null,
             limit_reset: null,
@@ -550,7 +550,7 @@ suite("logic.buildDetail", () => {
         };
         const detail = buildDetail(info, 10, "weekly");
         assert.strictEqual(detail.resetPeriod, "weekly");
-        assert.strictEqual(detail.resetDate, formatReset(nextUtcMonday()));
+        assert.strictEqual(detail.resetDate, "Rolling 7-day window");
     });
 
     test("auto branch computes the reset time locally from the limit_reset type", () => {
@@ -565,40 +565,24 @@ suite("logic.buildDetail", () => {
             is_free_tier: false,
         };
         const detail = buildDetail(info, 10);
-        assert.strictEqual(detail.limitSource, "auto");
+        assert.strictEqual(detail.mode, "auto");
+        assert.strictEqual(detail.resetDate, "Rolling 7-day window");
+        assert.strictEqual(detail.modeText, "Key limit — the cap comes from the API key itself.");
     });
 
-    test("keyLabel passes through the API label as-is (no double-masking)", () => {
-        // OpenRouter returns label already masked, e.g. "sk-or-v1-test...test".
-        // buildDetail must NOT re-run maskKey on it.
+    test("limitNum keeps the numeric limit for the auto-mode input", () => {
         const info: KeyInfo = {
-            label: "sk-or-v1-test...test",
-            limit: 10,
+            limit: 25,
             limit_reset: "daily",
             limit_remaining: 5,
-            usage: 5,
+            usage: 20,
             usage_daily: 5,
             usage_weekly: 5,
             usage_monthly: 10,
             is_free_tier: false,
         };
-        const detail = buildDetail(info, 10);
-        assert.strictEqual(detail.keyLabel, "sk-or-v1-test...test");
-    });
-
-    test("keyLabel falls back to 'unknown key' when label is null", () => {
-        const info: KeyInfo = {
-            limit: null,
-            limit_reset: null,
-            limit_remaining: null,
-            usage: 1,
-            usage_daily: 1,
-            usage_weekly: 1,
-            usage_monthly: 1,
-            is_free_tier: false,
-        };
-        const detail = buildDetail(info, 10);
-        assert.strictEqual(detail.keyLabel, "unknown key");
+        assert.strictEqual(buildDetail(info, 10).limitNum, 25);
+        assert.strictEqual(buildDetail({ ...info, limit: 0 }, 10).limitNum, 0);
     });
 
     test("manual and auto modes share an identical 4-row table", () => {
@@ -839,7 +823,7 @@ suite("logic.buildDetail", () => {
         };
         const credits = { total_credits: 1000, total_usage: 0.526233832 };
         const detail = buildDetail(info, 0, "daily", true, credits);
-        assert.strictEqual(detail.limitSource, "auto");
+        assert.strictEqual(detail.mode, "auto");
         assert.strictEqual(detail.limitValue, "$10.00");
         assert.strictEqual(detail.remaining, "$4.50");
         assert.strictEqual(detail.resetPeriod, "never");
@@ -862,7 +846,7 @@ suite("logic.buildDetail", () => {
             is_free_tier: false,
         };
         const detail = buildDetail(info, 0);
-        assert.strictEqual(detail.limitSource, "manual");
+        assert.strictEqual(detail.mode, "unlimited");
         assert.strictEqual(detail.limitValue, "No cap");
         assert.strictEqual(detail.remaining, "n/a");
         assert.strictEqual(detail.resetDate, "No reset");
@@ -909,7 +893,7 @@ suite("logic.buildDetail", () => {
             is_free_tier: false,
         };
         const detail = buildDetail(info, 10, "never", true);
-        assert.strictEqual(detail.limitSource, "manual");
+        assert.strictEqual(detail.mode, "manual");
         assert.strictEqual(detail.limitValue, "$10.00");
         assert.strictEqual(detail.remaining, "$6.58"); // 10 − 3.42 (all-time usage)
         assert.strictEqual(detail.resetPeriod, "never");
@@ -958,9 +942,9 @@ suite("logic.buildDetail", () => {
 });
 
 suite("logic.describeReset", () => {
-    test("daily/weekly/monthly produce an exact next time; never/null report no reset", () => {
+    test("daily/monthly produce an exact next time; weekly rolls; never/null report no reset", () => {
         assert.match(describeReset("daily"), /^\d{4}\/\d{2}\/\d{2} \d{2}:\d{2} \S+ \(Daily\)$/);
-        assert.match(describeReset("weekly"), /^\d{4}\/\d{2}\/\d{2} \d{2}:\d{2} \S+ \(Weekly\)$/);
+        assert.strictEqual(describeReset("weekly"), "Rolling 7-day window (Weekly)");
         assert.match(describeReset("monthly"), /^\d{4}\/\d{2}\/\d{2} \d{2}:\d{2} \S+ \(Monthly\)$/);
         assert.strictEqual(describeReset(null), "No reset");
         assert.strictEqual(describeReset("never"), "No reset");
@@ -1126,7 +1110,7 @@ suite("logic.maskKey", () => {
             }
         }
     });
-    test("falls back for missing label", () => {
+    test("falls back for a missing key", () => {
         assert.strictEqual(maskKey(null), "unknown key");
         assert.strictEqual(maskKey(undefined), "unknown key");
     });

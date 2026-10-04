@@ -11,7 +11,7 @@ import {
     templatePresetSlug,
 } from './panel';
 import { readKey } from './storage';
-import { getSessionCosts, onTurnCost, OpenRouterChatProvider, type SessionCost } from './provider';
+import { getSessionCosts, onTurnCost, OpenRouterChatProvider, SESSION_ID_PREFIX, type SessionCost } from './provider';
 
 export { readConfig } from './panel';
 
@@ -21,10 +21,10 @@ const APP_PREFIX = 'OpenRouter: ';
 let statusBarItem: vscode.StatusBarItem | undefined;
 let refreshTimer: ReturnType<typeof setInterval> | undefined;
 let panel: vscode.WebviewPanel | undefined;
+let lastPanelHtml: string | undefined;
 let provider: OpenRouterChatProvider | undefined;
 let sessionTitleDir: vscode.Uri | undefined;
 
-const SESSION_ID_PREFIX = 'copilot-chat:';
 const CHAT_SESSIONS_DIR = 'chatSessions';
 const SESSION_TITLE_MAX_BYTES = 64 * 1024;
 const SESSION_FILE_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
@@ -154,6 +154,13 @@ async function fetchApi<T>(apiKey: string, resource: string, signal?: AbortSigna
 
 let panelRenderSeq = 0;
 
+/** Normalize the per-render nonce so identical panel content compares equal. */
+export function panelHtmlComparable(html: string): string {
+    return html
+        .replace(/nonce-[0-9a-f]{32}/g, 'nonce')
+        .replace(/nonce="[0-9a-f]{32}"/g, 'nonce="n"');
+}
+
 async function updatePanel(
     secrets: vscode.SecretStorage,
     info: KeyInfo | undefined,
@@ -168,9 +175,11 @@ async function updatePanel(
         resetPeriod,
         includeByok,
         refreshIntervalMinutes,
-        contextPolicy,
-        contextMarginPercent,
         sanitizeBase64Content,
+        hideUnavailableModels,
+        outputReservePercent,
+        outputReserveMinTokens,
+        outputReserveMaxTokens,
     } = readConfig();
     const key = storedKey !== undefined ? storedKey : await readKey(secrets);
     if (stale()) return;
@@ -183,35 +192,38 @@ async function updatePanel(
     if (stale()) return;
     const sessions = await withSessionTitles(getSessionCosts());
     if (stale()) return;
-    const contextTiers = provider ? provider.contextTierRows() : undefined;
-    if (stale()) return;
-    panel.webview.html = renderPanelHtml(
+    const html = renderPanelHtml({
         info,
         limit,
         resetPeriod,
         includeByok,
         refreshIntervalMinutes,
-        lastFetchAt,
-        key ? maskKey(key) : undefined,
-        lastAccountCredits,
-        lastErrorMessage,
+        fetchedAt: lastFetchAt,
+        maskedKey: key ? maskKey(key) : undefined,
+        accountCredits: lastAccountCredits,
+        errorMessage: lastErrorMessage,
         template,
         presets,
         presetConfig,
         sessions,
-        contextPolicy,
-        contextMarginPercent,
-        contextTiers,
-        { sanitizeBase64Content }
-    );
+        settings: {
+            sanitizeBase64Content,
+            hideUnavailableModels,
+            outputReservePercent,
+            outputReserveMinTokens,
+            outputReserveMaxTokens,
+        },
+    });
+    if (stale()) return;
+    const comparable = panelHtmlComparable(html);
+    if (comparable === lastPanelHtml) return;
+    lastPanelHtml = comparable;
+    panel.webview.html = html;
 }
 
 export function createPanelDeps(
     secrets: vscode.SecretStorage,
-    prov: Pick<
-        OpenRouterChatProvider,
-        'setTemplate' | 'clearTemplate' | 'setKey' | 'clearKey' | 'setContextCap'
-    >
+    prov: Pick<OpenRouterChatProvider, 'setTemplate' | 'clearTemplate' | 'setKey' | 'clearKey'>
 ): PanelDeps {
     return {
         updateConfig: (key, value) => getConfig().update(key, value, vscode.ConfigurationTarget.Global),
@@ -225,8 +237,27 @@ export function createPanelDeps(
         clearKey: () => prov.clearKey(),
         syncPresetSelection: (slug) =>
             void panel?.webview.postMessage({ type: 'presetSelection', value: slug ?? '' }),
-        setContextCap: (modelId, value) => prov.setContextCap(modelId, value),
     };
+}
+
+export interface PasteTemplateResult {
+    applied: boolean;
+    error?: string;
+}
+
+export async function pasteTemplateFromClipboard(
+    readClipboard: () => Thenable<string>,
+    prov: Pick<OpenRouterChatProvider, 'setTemplate'>
+): Promise<PasteTemplateResult> {
+    let text: string;
+    try {
+        text = await readClipboard();
+    } catch {
+        return { applied: false };
+    }
+    if (text.trim() === '') return { applied: false };
+    const result = await prov.setTemplate(text);
+    return result.ok ? { applied: true } : { applied: false, error: result.error };
 }
 
 function openPanel(secrets: vscode.SecretStorage): void {
@@ -241,6 +272,7 @@ function openPanel(secrets: vscode.SecretStorage): void {
         );
         panel.onDidDispose(() => {
             panel = undefined;
+            lastPanelHtml = undefined;
         });
         panel.webview.onDidReceiveMessage((msg) => {
             if (provider) {
@@ -254,7 +286,7 @@ function openPanel(secrets: vscode.SecretStorage): void {
 function showNoKey(): void {
     setStatus(
         '$(key) OR: no key',
-        `${APP_PREFIX}set your API key\nOpen the panel (click) and paste your key to begin.`
+        `${APP_PREFIX}set your API key.  \nOpen the panel (click) and paste your key to begin.`
     );
 }
 
@@ -353,10 +385,29 @@ export function activate(context: vscode.ExtensionContext): void {
     context.subscriptions.push(
         vscode.commands.registerCommand(SHOW, openAndRefresh),
         vscode.commands.registerCommand('openrouterCopilot.manage', openAndRefresh),
-        vscode.commands.registerCommand('openrouterCopilot.pasteTemplate', openAndRefresh),
+        vscode.commands.registerCommand('openrouterCopilot.pasteTemplate', async () => {
+            if (provider) {
+                const result = await pasteTemplateFromClipboard(
+                    () => vscode.env.clipboard.readText(),
+                    provider
+                );
+                if (result.applied) {
+                    void vscode.window.showInformationMessage(`${APP_PREFIX}Custom request saved from clipboard.`);
+                } else if (result.error) {
+                    void vscode.window.showErrorMessage(`${APP_PREFIX}${result.error}`);
+                }
+            }
+            openPanel(context.secrets);
+        }),
         vscode.commands.registerCommand('openrouterCopilot.clearTemplate', async () => {
+            const open = panel;
+            if (provider && open) {
+                await handlePanelMessage({ type: 'clearTemplate' }, createPanelDeps(context.secrets, provider));
+                void open.webview.postMessage({ type: 'templateCleared' });
+                return;
+            }
             await provider?.clearTemplate();
-            vscode.window.showInformationMessage(`${APP_PREFIX}Request template cleared.`);
+            void vscode.window.showInformationMessage(`${APP_PREFIX}Request template cleared.`);
         })
     );
 
@@ -374,21 +425,17 @@ export function activate(context: vscode.ExtensionContext): void {
         vscode.workspace.onDidChangeConfiguration((e) => {
             if (!e.affectsConfiguration('openrouterCopilot')) return;
             applyConfig();
+            if (e.affectsConfiguration('openrouterCopilot.hideUnavailableModels')) {
+                provider?.resetCatalogCache();
+                updatePanel(context.secrets, lastInfo).catch(() => undefined);
+            }
             if (
-                e.affectsConfiguration('openrouterCopilot.contextWindowPolicy') ||
-                e.affectsConfiguration('openrouterCopilot.contextSafetyMarginPercent')
+                e.affectsConfiguration('openrouterCopilot.outputReservePercent') ||
+                e.affectsConfiguration('openrouterCopilot.outputReserveMinTokens') ||
+                e.affectsConfiguration('openrouterCopilot.outputReserveMaxTokens')
             ) {
-                const refreshContext = async (): Promise<void> => {
-                    if (e.affectsConfiguration('openrouterCopilot.contextSafetyMarginPercent')) {
-                        const margin = vscode.workspace.getConfiguration('openrouterCopilot')
-                            .get<number>('contextSafetyMarginPercent', 0);
-                        await provider?.setContextMargin(margin);
-                    } else {
-                        provider?.refreshContextConfiguration();
-                    }
-                    await updatePanel(context.secrets, lastInfo);
-                };
-                refreshContext().catch(() => undefined);
+                provider?.refreshModelInfo();
+                updatePanel(context.secrets, lastInfo).catch(() => undefined);
             }
             if (
                 e.affectsConfiguration('openrouterCopilot.creditLimit') ||
@@ -396,6 +443,12 @@ export function activate(context: vscode.ExtensionContext): void {
                 e.affectsConfiguration('openrouterCopilot.creditIncludeByok')
             ) {
                 doRefresh(context.secrets).catch(() => undefined);
+            }
+            if (
+                e.affectsConfiguration('openrouterCopilot.sanitizeBase64Content') ||
+                e.affectsConfiguration('openrouterCopilot.creditRefreshIntervalMinutes')
+            ) {
+                updatePanel(context.secrets, lastInfo).catch(() => undefined);
             }
         })
     );

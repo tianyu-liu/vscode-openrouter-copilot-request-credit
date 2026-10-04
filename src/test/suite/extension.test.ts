@@ -8,11 +8,14 @@ import {
     createPanelDeps,
     doRefresh,
     getStatusText,
+    panelHtmlComparable,
+    pasteTemplateFromClipboard,
     readSessionTitleFromDisk,
     refresh,
     stopRefreshTimerForTesting,
 } from "../../extension";
-import { handlePanelMessage } from "../../panel";
+import { handlePanelMessage, renderPanelHtml } from "../../panel";
+import { OUTPUT_RESERVE_PERCENT_MAX, OUTPUT_RESERVE_PERCENT_MIN } from "../../modelInfo";
 import { setSecretStorageForTesting } from "../../storage";
 
 const EXTENSION_ID = "tianyu-liu.openrouter-copilot-request-credit";
@@ -42,7 +45,6 @@ function stubProvider(secrets: vscode.SecretStorage) {
         clearKey: async () => {
             await secrets.delete(KEY_STORAGE);
         },
-        setContextCap: async () => { },
     };
 }
 
@@ -156,6 +158,10 @@ suite("extension manifest", () => {
         assert.strictEqual(cfg.get<number>("creditRefreshIntervalMinutes"), 5);
         assert.strictEqual(cfg.get<string>("creditResetPeriod"), "daily");
         assert.strictEqual(cfg.get<boolean>("creditIncludeByok"), true);
+        assert.strictEqual(cfg.get<boolean>("hideUnavailableModels"), true);
+        assert.strictEqual(cfg.get<number>("outputReservePercent"), 12.5);
+        assert.strictEqual(cfg.get<number>("outputReserveMinTokens"), 16384);
+        assert.strictEqual(cfg.get<number>("outputReserveMaxTokens"), 262144);
     });
 
     test("Manifest constraints match the documented ranges", () => {
@@ -170,11 +176,20 @@ suite("extension manifest", () => {
         assert.strictEqual((props["openrouterCopilot.creditLimit"] as any).minimum, 0);
         assert.strictEqual((props["openrouterCopilot.creditRefreshIntervalMinutes"] as any).minimum, 1);
         assert.strictEqual((props["openrouterCopilot.creditRefreshIntervalMinutes"] as any).maximum, 1440);
+        assert.strictEqual((props["openrouterCopilot.outputReserveMinTokens"] as any).minimum, 1);
+        assert.strictEqual((props["openrouterCopilot.outputReserveMaxTokens"] as any).minimum, 1);
+        assert.strictEqual((props["openrouterCopilot.outputReservePercent"] as any).minimum, OUTPUT_RESERVE_PERCENT_MIN);
+        assert.strictEqual((props["openrouterCopilot.outputReservePercent"] as any).maximum, OUTPUT_RESERVE_PERCENT_MAX);
         for (const key of [
             "openrouterCopilot.creditLimit",
             "openrouterCopilot.creditResetPeriod",
             "openrouterCopilot.creditIncludeByok",
             "openrouterCopilot.creditRefreshIntervalMinutes",
+            "openrouterCopilot.sanitizeBase64Content",
+            "openrouterCopilot.hideUnavailableModels",
+            "openrouterCopilot.outputReservePercent",
+            "openrouterCopilot.outputReserveMinTokens",
+            "openrouterCopilot.outputReserveMaxTokens",
         ]) {
             assert.strictEqual((props[key] as any).scope, "application", `${key} must be application-scoped`);
         }
@@ -315,6 +330,48 @@ suite("network isolation (stubbed fetch)", () => {
             await cfg.update("creditLimit", 0, vscode.ConfigurationTarget.Global);
             await settle();
         }
+    });
+});
+
+suite("pasteTemplateFromClipboard", () => {
+    test("passes a non-empty clipboard body through setTemplate", async () => {
+        const seen: string[] = [];
+        const result = await pasteTemplateFromClipboard(
+            async () => '  {"temperature": 0.2}  ',
+            { setTemplate: async (raw) => { seen.push(raw); return { ok: true }; } }
+        );
+        assert.deepStrictEqual(result, { applied: true });
+        assert.deepStrictEqual(seen, ['  {"temperature": 0.2}  ']);
+    });
+
+    test("a validation failure reports the provider error", async () => {
+        const result = await pasteTemplateFromClipboard(
+            async () => "not json",
+            { setTemplate: async () => ({ ok: false, error: "Unexpected token" }) }
+        );
+        assert.deepStrictEqual(result, { applied: false, error: "Unexpected token" });
+    });
+
+    test("empty or unreadable clipboards never touch the template", async () => {
+        let calls = 0;
+        const prov = { setTemplate: async () => { calls++; return { ok: true }; } };
+        assert.deepStrictEqual(await pasteTemplateFromClipboard(async () => "   ", prov), { applied: false });
+        assert.deepStrictEqual(
+            await pasteTemplateFromClipboard(async () => { throw new Error("clipboard unavailable"); }, prov),
+            { applied: false }
+        );
+        assert.strictEqual(calls, 0);
+    });
+});
+
+suite("panel html replacement", () => {
+    test("dedupe ignores the per-render nonce but not content changes", () => {
+        const a = panelHtmlComparable(renderPanelHtml({ limit: 1 }));
+        const b = panelHtmlComparable(renderPanelHtml({ limit: 1 }));
+        const c = panelHtmlComparable(renderPanelHtml({ limit: 2 }));
+        assert.strictEqual(a, b, "identical content compares equal despite fresh nonces");
+        assert.notStrictEqual(a, c, "a content change still compares different");
+        assert.ok(!panelHtmlComparable(renderPanelHtml({ limit: 1 })).includes("nonce-"), "nonces are normalized away");
     });
 });
 

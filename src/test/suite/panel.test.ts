@@ -1,6 +1,6 @@
 import * as assert from "assert";
 import * as vscode from "vscode";
-import { handlePanelMessage, PanelDeps, renderContextTiers, renderPanelHtml, renderSessionCosts } from "../../panel";
+import { handlePanelMessage, PanelDeps, PanelRenderOptions, renderPanelHtml, renderSessionCosts } from "../../panel";
 import { SessionCost, stripTemplateComments, UNATTRIBUTED_SESSION_ID } from "../../provider";
 import { KEY_SECRET } from "../../storage";
 import { KeyInfo } from "../../logic";
@@ -16,6 +16,16 @@ const BASE_INFO: KeyInfo = {
     usage_monthly: 40,
     is_free_tier: false,
 };
+
+function render(overrides: Partial<PanelRenderOptions> = {}): string {
+    return renderPanelHtml({
+        limit: 10,
+        resetPeriod: "daily",
+        includeByok: true,
+        refreshIntervalMinutes: 5,
+        ...overrides,
+    });
+}
 
 function sessionFixture(over: Partial<SessionCost> = {}): SessionCost {
     return {
@@ -96,9 +106,16 @@ suite("renderSessionCosts", () => {
     // session reported no prompt tokens).
     test("the summary line carries the session-blended cache rate", () => {
         const html = renderSessionCosts([sessionFixture({ promptTokens: 1000, cachedTokens: 823 })]);
-        assert.ok(html.includes("2 call(s) \u00b7 82.3% cached"), html);
+        assert.ok(html.includes("2 calls \u00b7 82.3% cached"), html);
         const summary = (s: SessionCost) => renderSessionCosts([s]).match(/<span class="muted">([^<]*)<\/span>/)![1];
         assert.ok(!summary(sessionFixture({ promptTokens: 0, cachedTokens: 0 })).includes("cached"), "no rate at all");
+    });
+
+    test("call counts pluralize", () => {
+        const one = renderSessionCosts([sessionFixture({ calls: 1 })]);
+        assert.ok(one.includes("1 call \u00b7"), one);
+        const many = renderSessionCosts([sessionFixture({ calls: 3 })]);
+        assert.ok(many.includes("3 calls \u00b7"), many);
     });
 
     // Session hopping: one chat, two models — each route's cache figure is its own.
@@ -130,7 +147,7 @@ suite("renderSessionCosts", () => {
     });
 
     test("the session body leaves no stray gap after the session id line", () => {
-        const html = renderPanelHtml(undefined, 10, "daily", true, 5);
+        const html = render();
         assert.match(html, /\.sessionbody p \{ margin: 0; \}/, "the trailing paragraph margin is zeroed");
     });
 
@@ -199,7 +216,7 @@ suite("renderSessionCosts", () => {
         assert.ok(html.includes("Unattributed (no chat id)"), "the bucket is labelled");
         assert.ok(!html.includes("OpenRouter session <code>unattributed"), "the bucket is not described as an OpenRouter session");
         assert.ok(html.includes("Spend that reached OpenRouter with no Copilot chat identifier"), "the bucket explains itself");
-        assert.ok(html.includes("carried no chat identifier is collected under the Unattributed entry"), "and the footer mentions it");
+        assert.ok(html.includes("no <code>session_id</code> is sent for it"), "the bucket notes no session id is sent");
     });
 
     test("the bucket is expanded when it is the only entry", () => {
@@ -236,37 +253,35 @@ suite("renderSessionCosts", () => {
 
 suite("renderPanelHtml", () => {
     test("renders ordered accessible tabs with Key Info selected and session spend second", () => {
-        const html = renderPanelHtml(undefined, 10, "daily", true, 5);
+        const html = render();
         assert.ok(!html.includes("<h1>OpenRouter for Copilot</h1>"));
         assert.match(html, /id="tab-key-info" role="tab" aria-selected="true" aria-controls="panel-key-info" tabindex="0">Key Info<\/button>/);
         assert.match(html, /id="tab-session-spend" role="tab" aria-selected="false" aria-controls="panel-session-spend" tabindex="-1">Session Spend<\/button>/);
-        assert.match(html, /id="tab-request" role="tab" aria-selected="false" aria-controls="panel-request" tabindex="-1">Request<\/button>/);
-        assert.match(html, /id="tab-context" role="tab" aria-selected="false" aria-controls="panel-context"/);
+        assert.match(html, /id="tab-configurations" role="tab" aria-selected="false" aria-controls="panel-configurations" tabindex="-1">Configurations<\/button>/);
         assert.match(html, /id="panel-key-info" role="tabpanel" aria-labelledby="tab-key-info" tabindex="0">[\s\S]*id="key"[\s\S]*Credit usage/);
-        assert.match(html, /id="panel-session-spend" role="tabpanel" aria-labelledby="tab-session-spend" tabindex="0" hidden>[\s\S]*Session Spend/);
-        assert.match(html, /id="panel-request" role="tabpanel" aria-labelledby="tab-request" tabindex="0" hidden>[\s\S]*Custom request/);
-        assert.match(html, /id="panel-context" role="tabpanel" aria-labelledby="tab-context" tabindex="0" hidden>/);
-        assert.ok(html.indexOf('id="tab-key-info"') < html.indexOf('id="tab-request"'));
-        assert.ok(html.indexOf('id="tab-session-spend"') < html.indexOf('id="tab-request"'));
-        assert.ok(html.indexOf('id="tab-request"') < html.indexOf('id="tab-context"'));
+        assert.match(html, /id="panel-session-spend" role="tabpanel" aria-labelledby="tab-session-spend" tabindex="0" hidden>[\s\S]*Session spend/);
+        assert.match(html, /id="panel-configurations" role="tabpanel" aria-labelledby="tab-configurations" tabindex="0" hidden>[\s\S]*Custom request/);
+        assert.ok(html.indexOf('id="tab-key-info"') < html.indexOf('id="tab-configurations"'));
+        assert.ok(html.indexOf('id="tab-session-spend"') < html.indexOf('id="tab-configurations"'));
+        assert.ok(!html.includes('id="tab-context"'), "the Context tab is retired");
     });
 
-    test("restores the active tab from VS Code webview state on each render", () => {
-        const html = renderPanelHtml(undefined, 10, "daily", true, 5);
-        assert.match(html, /const savedTab = vsc\.getState\(\)\?\.activeTab/);
-        assert.match(html, /const initialTab = tabs\.find\(\(tab\) => tab\.id === savedTab\) \|\| tabs\[0\]/);
-        assert.match(html, /vsc\.setState\(\{ activeTab: tab\.id \}\)/);
+    test("restores the active tab from VS Code webview state, falling back to the first tab", () => {
+        const html = render();
+        assert.match(html, /const initialTab = tabs\.find\(\(tab\) => tab\.id === draft\.activeTab\) \|\| tabs\[0\]/);
+        assert.match(html, /draft\.activeTab = tab\.id/);
+        assert.match(html, /vsc\.setState\(\{/);
     });
 
     test("ships a per-render nonce CSP and escapes the masked key into the script", () => {
-        const html = renderPanelHtml(BASE_INFO, 10, "daily", true, 5, undefined, `<img src=x onerror="alert(1)">`);
+        const html = render({ info: BASE_INFO, maskedKey: `<img src=x onerror="alert(1)">` });
         assert.ok(html.includes("default-src 'none'"), "CSP default-src 'none' present");
         assert.match(html, /script-src 'nonce-[0-9a-f]{32}'/, "per-render nonce present");
         assert.ok(html.includes("\\u003cimg"), "masked key markup is escaped before embedding into the script");
     });
 
     test("the webview script posts currentKeyMasked for the saveKey no-op guard", () => {
-        const html = renderPanelHtml(undefined, 10, "daily", true, 5, undefined, "sk-or-v1-12…456");
+        const html = render({ maskedKey: "sk-or-v1-12…456" });
         const payload = html.match(/vsc\.postMessage\(\{[^}]*type:\s*'saveKey'[^}]*\}\)/);
         assert.ok(payload, "the Save Key button posts a saveKey message");
         assert.match(
@@ -278,57 +293,123 @@ suite("renderPanelHtml", () => {
 
     test("marks the remaining figure as exhausted for an exhausted guardrail", () => {
         const exhausted: KeyInfo = { ...BASE_INFO, usage_daily: 10 };
-        const html = renderPanelHtml(exhausted, 10, "daily", true, 5);
+        const html = render({ info: exhausted });
         assert.ok(html.includes('class="remainingline exhausted"'));
-        const ok = renderPanelHtml(BASE_INFO, 10, "daily", true, 5);
+        const ok = render({ info: BASE_INFO });
         assert.ok(!ok.includes('remainingline exhausted"'));
     });
 
     test("renders an error banner only when an error message is supplied", () => {
-        const withErr = renderPanelHtml(BASE_INFO, 10, "daily", true, 5, undefined, "sk...", undefined, "Refresh failed: boom");
+        const withErr = render({ info: BASE_INFO, maskedKey: "sk...", errorMessage: "Refresh failed: boom" });
         assert.ok(withErr.includes('<div class="errbanner">Refresh failed: boom</div>'));
-        const withoutErr = renderPanelHtml(BASE_INFO, 10, "daily", true, 5);
+        const withoutErr = render({ info: BASE_INFO });
         assert.ok(!withoutErr.includes('<div class="errbanner">'));
     });
 
     test("keeps reset period and BYOK controls editable when the guardrail is disabled", () => {
-        const disabled = renderPanelHtml(BASE_INFO, 0, "daily", true, 5);
+        const disabled = render({ info: BASE_INFO, limit: 0 });
         assert.ok(disabled.includes('<select id="resetPeriod" aria-label="Spending limit reset period"'));
         assert.ok(disabled.includes('<input type="checkbox" id="includeByok" checked title='));
-        const enabled = renderPanelHtml(BASE_INFO, 10, "daily", true, 5);
+        const enabled = render({ info: BASE_INFO });
         assert.ok(enabled.includes('<select id="resetPeriod" aria-label="Spending limit reset period"'));
         assert.ok(enabled.includes('id="includeByok" checked title='));
     });
 
+    test("auto mode disables the ignored local controls and seeds the key's own limit", () => {
+        const autoInfo: KeyInfo = {
+            ...BASE_INFO,
+            limit: 25,
+            limit_reset: "daily",
+            limit_remaining: 17,
+            include_byok_in_limit: false,
+        };
+        const html = render({ info: autoInfo, maskedKey: "sk...", limit: 10 });
+        assert.ok(html.includes('id="limit" min="0" step="0.01" value="25" disabled'), html);
+        assert.ok(
+            html.includes('<select id="resetPeriod" aria-label="Spending limit reset period" title="How often the local spending limit resets" disabled>'),
+            "the local reset period is disabled"
+        );
+        assert.match(html, /id="includeByok"\s+disabled/, "the checkbox is read-only");
+        assert.ok(!html.includes('id="includeByok" checked'), "the key's include_byok_in_limit=false is shown honestly");
+        assert.ok(html.includes("Include BYOK usage (set on the key)"));
+        assert.ok(html.includes("The key has its own server-side limit; these local controls apply only when it has none."));
+        const included: KeyInfo = { ...autoInfo, include_byok_in_limit: true };
+        assert.ok(render({ info: included }).includes('id="includeByok" checked '), "the key's true flag renders checked");
+    });
+
+    test("weekly guardrail labels its trailing window instead of a Monday reset", () => {
+        const html = render({ info: BASE_INFO, resetPeriod: "weekly" });
+        assert.ok(html.includes("Rolling 7-day window"), html);
+        assert.ok(!html.includes("Next reset:"), "no fictional Monday reset date");
+    });
+
+    test("offers a Clear key action wired to the clearKey message only when a key is set", () => {
+        const withKey = render({ maskedKey: "sk-or-v1-12\u2026456" });
+        assert.ok(withKey.includes('<button id="clearKey">Clear key</button>'));
+        assert.ok(withKey.includes("vsc.postMessage({ type: 'clearKey' })"));
+        assert.ok(!render().includes('id="clearKey"'), "nothing to clear without a stored key");
+    });
+
+    test("persists unsaved drafts through webview state, debounced, and restores them", () => {
+        const html = render();
+        for (const field of ["draftTemplate", "draftPreset", "draftReservePercent", "draftReserveMin", "draftReserveMax"]) {
+            assert.ok(html.includes(field), `${field} is persisted`);
+        }
+        assert.ok(!html.includes("draftKey"), "the unsaved key is never persisted into webview state");
+        assert.match(html, /setTimeout\(persistState, 250\)/, "draft persistence is debounced");
+        assert.ok(html.includes("templateEl.value = draft.template"), "the template draft is restored");
+        assert.ok(html.includes("restorePreset(draft.preset)"), "the preset draft is restored");
+        assert.ok(html.includes("el.value = draft[prop]"), "reserve drafts are restored");
+        assert.ok(html.includes("m.type === 'templateCleared'"), "the clear-template command clears the textarea draft");
+    });
+
+    test("the output-reserve row uses a well-formed class attribute", () => {
+        const html = render();
+        const reserveStart = html.indexOf("Output reserve");
+        const reserve = html.slice(reserveStart, html.indexOf("Prompt safeguard", reserveStart));
+        assert.ok(reserve.includes('<div class="keyline">'), "the reserve row uses the keyline class");
+        assert.ok(!html.includes('class="keyline\''), "no stray quote inside the class attribute");
+        assert.ok(!/<div class="[^"]*'/.test(html), "every div class attribute is closed with a double quote");
+    });
+
     test("shows the no-key placeholder when there is no info", () => {
-        const html = renderPanelHtml(undefined, 10, "daily", true, 5);
+        const html = render();
         assert.ok(html.includes("No usage information yet."));
         assert.ok(html.includes("No API key set"));
     });
 
     test("renders editable controls for all contributed settings without key details", () => {
-        const html = renderPanelHtml(undefined, 10, "daily", true, 5);
+        const html = render();
         for (const id of [
             "limit",
             "resetPeriod",
             "includeByok",
             "refreshInterval",
-            "contextPolicy",
-            "contextMargin",
             "sanitizeBase64",
+            "hideUnavailableModels",
+            "outputReservePercent",
+            "outputReserveMinTokens",
+            "outputReserveMaxTokens",
         ]) {
             assert.ok(html.includes(`id="${id}"`), `${id} control is rendered`);
         }
         assert.ok(!html.includes('id="limit" min="0" step="0.01" value="10" disabled'));
         assert.ok(html.includes('id="sanitizeBase64" checked'));
+        assert.ok(html.includes('id="hideUnavailableModels" checked'), "hide-unavailable defaults on");
+        assert.ok(html.includes('id="outputReservePercent" min="1" max="50" step="0.5" aria-label="Output reserve as percent of window" value="12.5"'));
+        assert.ok(html.includes('id="outputReserveMinTokens" min="0.5" step="0.5" aria-label="Lower bound on the output reserve in K" value="16.384"'));
+        assert.ok(html.includes('id="outputReserveMaxTokens" min="0.5" step="0.5" aria-label="Upper bound on the output reserve in K" value="262.144"'));
+        assert.ok(html.includes('input[type=number]::-webkit-inner-spin-button'), "number inputs hide the step buttons");
+        assert.ok(html.includes('for="outputReservePercent">Target:</label>'), "ratio field is labelled Target");
+        assert.ok(html.includes('for="outputReserveMinTokens">Lower limit:</label>'));
+        assert.ok(html.includes('for="outputReserveMaxTokens">Upper limit:</label>'));
         assert.ok(html.includes('title="Refresh usage data every 1 to 1440 minutes"'));
         assert.ok(html.includes('aria-label="Spending limit reset period"'));
-        assert.ok(html.includes('Custom-cap reduction:</strong> Changing this percentage scales every saved numeric Custom cap in place across all models.'));
     });
 
     test("renders the custom request section, pre-filled from the saved template", () => {
         const template = { temperature: 0.2, provider: { quantizations: ["fp8"] } };
-        const html = renderPanelHtml(undefined, 10, "daily", true, 5, undefined, undefined, undefined, undefined, template);
+        const html = render({ template });
         assert.ok(html.includes(">Custom request</div>"), "custom request section present");
         assert.ok(html.includes('id="saveTemplate">Save request</button>'), "Save request button present");
         assert.ok(!html.includes('id="clearTemplate"'), "Clear button removed");
@@ -338,7 +419,7 @@ suite("renderPanelHtml", () => {
     });
 
     test("renders the auto-refresh input merged with the updated line and no save button", () => {
-        const html = renderPanelHtml(BASE_INFO, 10, "daily", true, 5, new Date());
+        const html = render({ info: BASE_INFO, fetchedAt: new Date() });
         assert.ok(html.includes('id="refreshInterval"'), "auto-refresh interval input present");
         assert.ok(!html.includes('id="saveRefreshInterval"'), "save refresh interval button removed");
         assert.ok(/<div class="keyline updatedline">/.test(html), "interval and updated line share one row");
@@ -347,7 +428,7 @@ suite("renderPanelHtml", () => {
 
     test("escapes the template value before embedding into the script", () => {
         const evil = { note: "</textarea><script>alert(1)</script>" };
-        const html = renderPanelHtml(undefined, 10, "daily", true, 5, undefined, undefined, undefined, undefined, evil);
+        const html = render({ template: evil });
         assert.ok(!html.includes("</textarea><script>"), "raw script markup must not leak into the HTML");
         assert.ok(html.includes("\\u003c/textarea"), "dangerous characters are JSON-escaped in the textarea value");
         assert.ok(html.includes("\\u003c/script"), "script close tags are JSON-escaped too");
@@ -355,69 +436,67 @@ suite("renderPanelHtml", () => {
         assert.ok(!html.includes("</script>alert(1)"), "the injected script body cannot terminate the page script");
     });
 
+    test("escapes the template preset before embedding it into the script", () => {
+        const html = render({ template: { preset: "</script><img src=x onerror=1>" } });
+        assert.ok(html.includes('preset: "\\u003c/script>'), "the preset channel is escaped");
+        assert.ok(!html.includes('preset: "</script>'), "raw preset markup cannot close the page script");
+    });
+
     test("places concise guidance with the relevant panel sections", () => {
-        const html = renderPanelHtml(undefined, 10, "daily", true, 5);
+        const html = render();
         const keyInfoStart = html.indexOf('<section class="tab-panel" id="panel-key-info"');
         const sessionSpendStart = html.indexOf('<section class="tab-panel" id="panel-session-spend"');
-        const requestStart = html.indexOf('<section class="tab-panel" id="panel-request"');
-        const contextStart = html.indexOf('<section class="tab-panel" id="panel-context"');
+        const requestStart = html.indexOf('<section class="tab-panel" id="panel-configurations"');
         const scriptStart = html.indexOf('<script nonce=');
         const keyInfo = html.slice(keyInfoStart, sessionSpendStart);
         const sessionSpend = html.slice(sessionSpendStart, requestStart);
-        const request = html.slice(requestStart, contextStart);
-        const context = html.slice(contextStart, scriptStart);
+        const request = html.slice(requestStart, scriptStart);
         assert.ok(keyInfo.includes("SecretStorage"), "key storage note stays with key controls");
+        assert.ok(!keyInfo.includes('id="outputReservePercent"'), "output reserve controls moved out of Key Info");
+        const reserveIndex = request.indexOf("Output reserve");
+        assert.ok(reserveIndex > -1 && reserveIndex < request.indexOf(">Custom request</div>"), "output reserve is the first section of the Configurations tab");
+        assert.ok(request.includes('id="outputReservePercent"'), "reserve ratio control lives in Configurations");
+        assert.ok(request.includes('class="fieldgroup"'), "reserve fields are grouped");
+        assert.strictEqual(request.match(/<span class="sep">\.<\/span>/g)?.length, 2, "the three groups are dot-separated");
         assert.ok(sessionSpend.includes("BYOK routes:</strong> When OpenRouter reports zero"), "BYOK note stays with session spend");
         assert.ok(request.includes("Responses stream automatically"), "request behavior notes stay by the template");
         assert.ok(request.includes("No routing is added automatically"), "provider routing is accurately described");
-        assert.ok(context.includes("context indicator"), "token usage guidance is on Context");
         assert.ok(html.includes('aria-label="OpenRouter API key"'), "key input has an accessible name");
         assert.ok(html.includes('aria-label="Custom request JSON"'), "request editor has an accessible name");
         assert.ok(!html.includes("id=\"fn-"), "numbered internal footnote anchors are removed");
+        assert.ok(!html.includes('id="panel-context"'), "the Context tab is retired");
     });
 
-    test("Context limits section renders policy and Custom-only margin guidance", () => {
-        const auto = renderPanelHtml(
-            undefined, 10, "daily", true, 5,
-            undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, "auto", 0
-        );
-        assert.ok(auto.includes('id="contextPolicy"'), "policy control present");
-        assert.ok(auto.includes('id="contextMargin"'), "margin control present");
-        assert.ok(auto.includes('<option value="auto" selected>'), "auto selected by default");
-        assert.ok(auto.includes("context_length \u2212 max_output"), "the accurate-budget rule is stated");
-        assert.ok(auto.includes("Changing this percentage scales every saved numeric Custom cap in place across all models"), "margin scope and in-place behavior are explained");
-        assert.ok(auto.includes("Auto and Full selections are unchanged"), "Auto/Full are not reduced by the margin");
-        const full = renderPanelHtml(
-            undefined, 10, "daily", true, 5,
-            undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, "full", 10
-        );
-        assert.ok(full.includes('<option value="full" selected>'), "full selected when configured");
-        assert.ok(full.includes('value="10"'), "the margin value is rendered");
-    });
-
-    test("Context limits table lists tier models with threshold, prices and a control", () => {
-        const rows = [
-            { modelId: "openai/gpt-5.6", label: "GPT-5.6", threshold: 272000, basePromptPerM: 0.2, tierPromptPerM: 0.4, effectiveCap: 272000 },
-            { modelId: "openai/gpt-6-sol", label: "GPT-6 Sol", threshold: 272000, basePromptPerM: 2, tierPromptPerM: 4, effectiveCap: 200000, override: 200000 as const },
-        ];
-        const html = renderPanelHtml(
-            undefined, 10, "daily", true, 5,
-            undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, "auto", 0, rows
-        );
-        assert.ok(html.includes('class="routes contexttiers"'), "table rendered");
-        assert.ok(html.includes("GPT-5.6"), "model label rendered");
-        assert.ok(html.includes("272,000"), "threshold rendered");
-        assert.ok(html.includes("$0.200") && html.includes("$0.400"), "base and stepped prices rendered");
-        assert.ok(html.includes('class="capmode"'), "the mode control rendered");
-        assert.ok(html.includes('data-model="openai/gpt-5.6"'), "the model id rides on the control");
-        assert.ok(html.includes('<option value="custom" selected>'), "the override row shows Custom");
-        assert.ok(html.includes('value="200000"'), "the custom cap is rendered");
-        const empty = renderPanelHtml(undefined, 10, "daily", true, 5);
-        assert.ok(empty.includes("No model in the current catalog has a long-context price step"), "empty state shown");
+    test("renders every note in the unified bold-term list format", () => {
+        const html = render({
+            sessions: [
+                sessionFixture(),
+                sessionFixture({ sessionId: UNATTRIBUTED_SESSION_ID, paid: 0.002 }),
+            ],
+        });
+        for (const term of [
+            "Storage",
+            "Hide unavailable models",
+            "Session list",
+            "BYOK routes",
+            "Unattributed",
+            "Output reserve",
+            "Prompt sanitization",
+            "Preset selection",
+            "Picker presets",
+            "Streaming",
+            "Live conversation",
+            "Thinking effort",
+            "Provider routing",
+            "Anthropic caching",
+        ]) {
+            assert.ok(html.includes(`<li><strong>${term}:</strong>`), `${term} note is a list item`);
+        }
+        assert.ok(!html.includes('<p class="helptext"><strong>'), "no note renders as a standalone paragraph");
     });
 
     test("request guidance states cache behavior and avoids blanket verbatim passthrough", () => {
-        const html = renderPanelHtml(undefined, 10, "daily", true, 5);
+        const html = render();
         assert.ok(
             html.includes("Anthropic-family models (<code>anthropic/*</code>, including <code>~anthropic/*</code>) get a top-level, 5-minute <code>cache_control</code>"),
             "anthropic auto cache_control footnote present"
@@ -459,7 +538,6 @@ function spyDeps(): {
     setKeys: string[];
     clearedKeys: number;
     syncedPresets: Array<string | undefined>;
-    contextCaps: Array<[string, unknown]>;
 } {
     const secrets = fakeSecrets();
     const state = {
@@ -472,7 +550,6 @@ function spyDeps(): {
         setKeys: [] as string[],
         clearedKeys: 0,
         syncedPresets: [] as Array<string | undefined>,
-        contextCaps: [] as Array<[string, unknown]>,
     };
     const deps: PanelDeps = {
         updateConfig: async (key, value) => {
@@ -511,9 +588,6 @@ function spyDeps(): {
         syncPresetSelection: (slug) => {
             state.syncedPresets.push(slug);
         },
-        setContextCap: async (modelId, value) => {
-            state.contextCaps.push([modelId, value]);
-        },
     };
     return {
         deps,
@@ -534,9 +608,6 @@ function spyDeps(): {
         },
         get syncedPresets() {
             return state.syncedPresets;
-        },
-        get contextCaps() {
-            return state.contextCaps;
         },
     };
 }
@@ -577,20 +648,24 @@ suite("handlePanelMessage", () => {
         for (const value of ["", "   ", "-1", "abc"]) {
             const s = spyDeps();
             await handlePanelMessage({ type: "saveLimit", value }, s.deps);
-            assert.deepStrictEqual(s.errors, ["invalid limit"], `value ${JSON.stringify(value)}`);
+            assert.deepStrictEqual(s.errors, ["Enter a limit of 0 or more."], `value ${JSON.stringify(value)}`);
             assert.strictEqual(s.updates.length, 0);
             assert.strictEqual(s.refreshes, 0);
         }
         const ok = spyDeps();
         await handlePanelMessage({ type: "saveLimit", value: "25" }, ok.deps);
         assert.deepStrictEqual(ok.updates, [["creditLimit", 25]]);
-        assert.strictEqual(ok.refreshes, 1);
+        assert.strictEqual(
+            ok.refreshes,
+            0,
+            "saveConfig does not refresh; the config-change listener owns the refresh"
+        );
     });
 
     test("saveResetPeriod rejects unknown cadences", async () => {
         const bad = spyDeps();
         await handlePanelMessage({ type: "saveResetPeriod", value: "hourly" }, bad.deps);
-        assert.deepStrictEqual(bad.errors, ["invalid reset period"]);
+        assert.deepStrictEqual(bad.errors, ["Select a valid reset period."]);
         assert.strictEqual(bad.updates.length, 0);
         const ok = spyDeps();
         await handlePanelMessage({ type: "saveResetPeriod", value: "weekly" }, ok.deps);
@@ -600,7 +675,7 @@ suite("handlePanelMessage", () => {
     test("saveIncludeByok requires an actual boolean", async () => {
         const bad = spyDeps();
         await handlePanelMessage({ type: "saveIncludeByok", value: "false" }, bad.deps);
-        assert.deepStrictEqual(bad.errors, ["invalid BYOK flag"]);
+        assert.deepStrictEqual(bad.errors, ["Choose whether BYOK usage counts."]);
         assert.strictEqual(bad.updates.length, 0);
         const ok = spyDeps();
         await handlePanelMessage({ type: "saveIncludeByok", value: false }, ok.deps);
@@ -612,7 +687,7 @@ suite("handlePanelMessage", () => {
             const s = spyDeps();
             await handlePanelMessage({ type: "saveRefreshInterval", value }, s.deps);
             assert.strictEqual(s.errors.length, 1, `value ${value}`);
-            assert.match(s.errors[0], /invalid refresh interval/);
+            assert.match(s.errors[0], /Enter a refresh interval from 1 to 1440 minutes\./);
             assert.strictEqual(s.updates.length, 0);
         }
         const ok = spyDeps();
@@ -623,59 +698,65 @@ suite("handlePanelMessage", () => {
     test("saveSanitizeBase64 requires a boolean and updates the setting", async () => {
         const bad = spyDeps();
         await handlePanelMessage({ type: "saveSanitizeBase64", value: "false" }, bad.deps);
-        assert.deepStrictEqual(bad.errors, ["invalid base64 sanitization flag"]);
+        assert.deepStrictEqual(bad.errors, ["Choose whether long base64-like text is removed."]);
         assert.strictEqual(bad.updates.length, 0);
         const ok = spyDeps();
         await handlePanelMessage({ type: "saveSanitizeBase64", value: false }, ok.deps);
         assert.deepStrictEqual(ok.updates, [["sanitizeBase64Content", false]]);
-        assert.strictEqual(ok.refreshes, 1);
+        assert.strictEqual(ok.refreshes, 0, "the config-change listener owns the panel re-render");
     });
 
-    test("saveContextPolicy accepts only auto/full", async () => {
+    test("saveHideUnavailableModels requires a boolean and updates the setting", async () => {
         const bad = spyDeps();
-        await handlePanelMessage({ type: "saveContextPolicy", value: "sideways" }, bad.deps);
-        assert.deepStrictEqual(bad.errors, ["invalid context policy"]);
+        await handlePanelMessage({ type: "saveHideUnavailableModels", value: "false" }, bad.deps);
+        assert.deepStrictEqual(bad.errors, ["Choose whether unavailable models are hidden."]);
         assert.strictEqual(bad.updates.length, 0);
         const ok = spyDeps();
-        await handlePanelMessage({ type: "saveContextPolicy", value: "full" }, ok.deps);
-        assert.deepStrictEqual(ok.updates, [["contextWindowPolicy", "full"]]);
+        await handlePanelMessage({ type: "saveHideUnavailableModels", value: false }, ok.deps);
+        assert.deepStrictEqual(ok.updates, [["hideUnavailableModels", false]]);
+        assert.strictEqual(ok.refreshes, 0, "the config-change listener owns the model-info rebuild");
     });
 
-    test("saveContextMargin enforces the 0-50 range", async () => {
-        for (const value of ["-1", "51", "abc"]) {
+    test("saveOutputReservePercent enforces the 1-50 range", async () => {
+        for (const value of ["0", "51", "abc"]) {
             const s = spyDeps();
-            await handlePanelMessage({ type: "saveContextMargin", value }, s.deps);
+            await handlePanelMessage({ type: "saveOutputReservePercent", value }, s.deps);
             assert.strictEqual(s.errors.length, 1, `value ${value}`);
-            assert.match(s.errors[0], /invalid safety margin/);
+            assert.match(s.errors[0], /Enter an output reserve from 1% to 50%\./);
             assert.strictEqual(s.updates.length, 0);
         }
         const ok = spyDeps();
-        await handlePanelMessage({ type: "saveContextMargin", value: "10" }, ok.deps);
-        assert.deepStrictEqual(ok.updates, [["contextSafetyMarginPercent", 10]]);
+        await handlePanelMessage({ type: "saveOutputReservePercent", value: "12.5" }, ok.deps);
+        assert.deepStrictEqual(ok.updates, [["outputReservePercent", 12.5]]);
     });
 
-    test("setContextCap maps auto/full/custom and rejects an invalid cap", async () => {
-        const auto = spyDeps();
-        await handlePanelMessage({ type: "setContextCap", modelId: "openai/gpt-5.6", mode: "auto" }, auto.deps);
-        assert.deepStrictEqual(auto.contextCaps, [["openai/gpt-5.6", null]]);
-        const full = spyDeps();
-        await handlePanelMessage({ type: "setContextCap", modelId: "openai/gpt-5.6", mode: "full" }, full.deps);
-        assert.deepStrictEqual(full.contextCaps, [["openai/gpt-5.6", "full"]]);
-        const custom = spyDeps();
-        await handlePanelMessage({ type: "setContextcap", modelId: "openai/gpt-5.6", mode: "custom", value: "200000" } as never, custom.deps);
-        assert.strictEqual(custom.contextCaps.length, 0, "a wrong-cased type is ignored");
-        const ok = spyDeps();
-        await handlePanelMessage({ type: "setContextCap", modelId: "openai/gpt-5.6", mode: "custom", value: "200000" }, ok.deps);
-        assert.deepStrictEqual(ok.contextCaps, [["openai/gpt-5.6", 200000]]);
-        for (const value of ["0", "abc"]) {
-            const bad = spyDeps();
-            await handlePanelMessage({ type: "setContextCap", modelId: "openai/gpt-5.6", mode: "custom", value }, bad.deps);
-            assert.deepStrictEqual(bad.errors, ["invalid context cap"], `value ${value}`);
-            assert.strictEqual(bad.contextCaps.length, 0);
+    test("saveOutputReserveMinTokens requires a positive token count", async () => {
+        for (const value of ["0", "-5", "abc"]) {
+            const s = spyDeps();
+            await handlePanelMessage({ type: "saveOutputReserveMinTokens", value }, s.deps);
+            assert.strictEqual(s.errors.length, 1, `value ${value}`);
+            assert.match(s.errors[0], /Enter an output reserve lower limit above 0 K\./);
+            assert.strictEqual(s.updates.length, 0);
         }
-        const noModel = spyDeps();
-        await handlePanelMessage({ type: "setContextCap", modelId: "  ", mode: "auto" }, noModel.deps);
-        assert.deepStrictEqual(noModel.errors, ["invalid model for the context cap"]);
+        const ok = spyDeps();
+        await handlePanelMessage({ type: "saveOutputReserveMinTokens", value: "8" }, ok.deps);
+        assert.deepStrictEqual(ok.updates, [["outputReserveMinTokens", 8000]], "K is converted to tokens (decimal)");
+        const frac = spyDeps();
+        await handlePanelMessage({ type: "saveOutputReserveMinTokens", value: "8.5" }, frac.deps);
+        assert.deepStrictEqual(frac.updates, [["outputReserveMinTokens", 8500]]);
+    });
+
+    test("saveOutputReserveMaxTokens requires a positive token count", async () => {
+        for (const value of ["0", "-5", "abc"]) {
+            const s = spyDeps();
+            await handlePanelMessage({ type: "saveOutputReserveMaxTokens", value }, s.deps);
+            assert.strictEqual(s.errors.length, 1, `value ${value}`);
+            assert.match(s.errors[0], /Enter an output reserve upper limit above 0 K\./);
+            assert.strictEqual(s.updates.length, 0);
+        }
+        const ok = spyDeps();
+        await handlePanelMessage({ type: "saveOutputReserveMaxTokens", value: "128" }, ok.deps);
+        assert.deepStrictEqual(ok.updates, [["outputReserveMaxTokens", 128000]], "K is converted to tokens (decimal)");
     });
 
     test("clearKey deletes the secret and re-renders via the no-key refresh path", async () => {
@@ -788,7 +869,7 @@ suite("handlePanelMessage", () => {
         for (const value of ["../etc", "a b", "x/y", "{}"]) {
             const s = spyDeps();
             await handlePanelMessage({ type: "selectPreset", value }, s.deps);
-            assert.deepStrictEqual(s.errors, ["invalid preset"], `value ${JSON.stringify(value)}`);
+            assert.deepStrictEqual(s.errors, ["Enter a valid preset slug."], `value ${JSON.stringify(value)}`);
             assert.strictEqual(s.templates.length, 0);
             assert.strictEqual(s.clearedTemplates, 0);
             assert.strictEqual(s.refreshes, 0);
@@ -810,7 +891,7 @@ suite("renderPanelHtml presets section", () => {
     ];
 
     test("renders a preset dropdown whose default option loads no preset", () => {
-        const html = renderPanelHtml(undefined, 10, "daily", true, 5, undefined, undefined, undefined, undefined, undefined, PRESETS);
+        const html = render({ presets: PRESETS });
         assert.ok(html.includes(">Presets</div>"), "section title is just Presets");
         assert.ok(html.includes('id="presetSelect"'), "dropdown present");
         assert.ok(html.includes("<option value=\"\" selected>No preset loaded</option>"), "no-preset default selected");
@@ -821,43 +902,33 @@ suite("renderPanelHtml presets section", () => {
     });
 
     test("pre-selects the preset referenced by the saved template", () => {
-        const html = renderPanelHtml(
-            undefined, 10, "daily", true, 5,
-            undefined, undefined, undefined, undefined,
-            { preset: "faster-glm-flash" },
-            PRESETS
-        );
+        const html = render({ template: { preset: "faster-glm-flash" }, presets: PRESETS });
         assert.ok(html.includes('<option value="faster-glm-flash" selected>'), "loaded preset selected");
         assert.ok(!html.includes('<option value="" selected>'), "default option not selected");
     });
 
     test("keeps a template preset that is missing from the list selectable", () => {
-        const html = renderPanelHtml(
-            undefined, 10, "daily", true, 5,
-            undefined, undefined, undefined, undefined,
-            { preset: "gone-preset" },
-            PRESETS
-        );
+        const html = render({ template: { preset: "gone-preset" }, presets: PRESETS });
         assert.ok(html.includes('<option value="gone-preset" selected>gone-preset (not in list)</option>'));
     });
 
     test("an empty preset list says so; no presets never renders options", () => {
-        const empty = renderPanelHtml(undefined, 10, "daily", true, 5, undefined, undefined, undefined, undefined, undefined, []);
+        const empty = render({ presets: [] });
         assert.ok(empty.includes("No presets found for this key."));
         assert.ok(!empty.includes('value="faster-glm-flash"'));
-        const none = renderPanelHtml(undefined, 10, "daily", true, 5);
+        const none = render();
         assert.ok(!none.includes("No presets found for this key."));
         assert.ok(!none.includes('value="faster-glm-flash"'));
     });
 
     test("distinguishes a failed presets fetch from a legitimately empty list", () => {
-        const failed = renderPanelHtml(undefined, 10, "daily", true, 5, undefined, undefined, undefined, undefined, undefined, undefined);
+        const failed = render();
         assert.ok(failed.includes("Presets could not be loaded for this key."), "a failed fetch says so");
         assert.ok(!failed.includes("No presets found for this key."), "a failed fetch is not reported as an empty key");
-        const empty = renderPanelHtml(undefined, 10, "daily", true, 5, undefined, undefined, undefined, undefined, undefined, []);
+        const empty = render({ presets: [] });
         assert.ok(empty.includes("No presets found for this key."), "an empty list keeps the empty wording");
         assert.ok(!empty.includes("Presets could not be loaded for this key."));
-        const listed = renderPanelHtml(undefined, 10, "daily", true, 5, undefined, undefined, undefined, undefined, undefined, PRESETS);
+        const listed = render({ presets: PRESETS });
         assert.ok(!listed.includes("Presets could not be loaded for this key."), "a list renders no failure hint");
         assert.ok(!listed.includes("No presets found for this key."), "a list renders no empty hint");
     });
@@ -868,21 +939,15 @@ suite("renderPanelHtml presets section", () => {
             { slug: "skipped", name: "skipped", lookupSkipped: true },
             { slug: "no-model", name: "no-model" },
         ];
-        const html = renderPanelHtml(undefined, 10, "daily", true, 5, undefined, undefined, undefined, undefined, undefined, presets);
-        assert.ok(html.includes("skipped (lookup skipped)"), "a lookup-skipped preset is labelled distinctly");
+        const html = render({ presets });
+        assert.ok(html.includes("skipped (model not checked)"), "a lookup-skipped preset is labelled distinctly");
         assert.ok(html.includes("no-model (routing profile)"), "a genuinely model-less preset keeps the routing-profile label");
         assert.ok(!html.includes("skipped (routing profile)"), "a skipped lookup is not mislabelled as a routing profile");
     });
 
     test("prefills the textarea with the JSON first and the resolved preset config as comments after it", () => {
         const config = { model: "z-ai/glm-5.3-flash-20260826", provider: { order: ["baseten", "makora"] } };
-        const html = renderPanelHtml(
-            undefined, 10, "daily", true, 5,
-            undefined, undefined, undefined, undefined,
-            { preset: "faster-glm-flash" },
-            PRESETS,
-            config
-        );
+        const html = render({ template: { preset: "faster-glm-flash" }, presets: PRESETS, presetConfig: config });
         const prefill = html.match(/templateEl\.value = (.*);/);
         assert.ok(prefill, "template textarea is populated via script");
         const value = JSON.parse(prefill![1]) as string;
@@ -900,46 +965,30 @@ suite("renderPanelHtml presets section", () => {
     });
 
     test("no comment block without a preset reference or without a resolved config", () => {
-        const plain = renderPanelHtml(
-            undefined, 10, "daily", true, 5,
-            undefined, undefined, undefined, undefined,
-            { temperature: 0.2 },
-            PRESETS,
-            { model: "x" }
-        );
+        const plain = render({ template: { temperature: 0.2 }, presets: PRESETS, presetConfig: { model: "x" } });
         const plainValue = JSON.parse(plain.match(/templateEl\.value = (.*);/)![1]) as string;
         assert.ok(!plainValue.includes("//"), "no comments when the template has no preset reference");
-        const unresolved = renderPanelHtml(
-            undefined, 10, "daily", true, 5,
-            undefined, undefined, undefined, undefined,
-            { preset: "faster-glm-flash" },
-            PRESETS
-        );
+        const unresolved = render({ template: { preset: "faster-glm-flash" }, presets: PRESETS });
         const unresolvedValue = JSON.parse(unresolved.match(/templateEl\.value = (.*);/)![1]) as string;
         assert.ok(!unresolvedValue.includes("//"), "no comments when the preset config could not be resolved");
         assert.strictEqual(JSON.parse(unresolvedValue).preset, "faster-glm-flash");
     });
 
     test("a whitespace-only template preset is not treated as a loaded preset", () => {
-        const html = renderPanelHtml(
-            undefined, 10, "daily", true, 5,
-            undefined, undefined, undefined, undefined,
-            { preset: " " },
-            PRESETS
-        );
+        const html = render({ template: { preset: " " }, presets: PRESETS });
         assert.ok(html.includes('<option value="" selected>'), "the dropdown stays on the no-preset default");
         assert.ok(!html.includes('value=" "'), "no option is rendered for the whitespace slug");
     });
 
     test("the sync script adds a missing preset option so a saved preset is never silently unselected", () => {
-        const html = renderPanelHtml(undefined, 10, "daily", true, 5);
+        const html = render();
         assert.ok(html.includes("appendChild(option)"), "the presetSelection handler appends a not-in-list option");
     });
 
     test("preset guidance explains replacement and picker precedence", () => {
-        const html = renderPanelHtml(undefined, 10, "daily", true, 5);
-        assert.ok(html.includes('Selecting a preset replaces the saved request with <code>{"preset": "&lt;slug&gt;"}</code>'));
-        assert.ok(html.includes('Selecting “No preset loaded” clears it.'));
+        const html = render();
+        assert.ok(html.includes('<strong>Preset selection:</strong> Selecting a preset replaces the saved request with <code>{"preset": "&lt;slug&gt;"}</code>'));
+        assert.ok(html.includes('Selecting "No preset loaded" clears it.'));
         assert.ok(html.includes("<code>@preset/&lt;slug&gt;</code>"), "picker entry form documented");
         assert.ok(html.includes("takes precedence over a different template preset"), "picker preset precedence documented");
     });

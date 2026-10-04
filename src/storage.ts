@@ -10,38 +10,50 @@ export function setSecretStorageForTesting(s: vscode.SecretStorage | undefined):
     overrideSecrets = s;
 }
 
-async function readSecret(secrets: vscode.SecretStorage, key: string): Promise<string | undefined> {
+const READ_TIMED_OUT = Symbol('secretReadTimedOut');
+
+type SecretRead = { value: string | undefined } | 'failed';
+
+async function readSecret(secrets: vscode.SecretStorage, key: string): Promise<SecretRead> {
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const value = await Promise.race([
-        secrets.get(key),
-        new Promise<undefined>((resolve) => {
-            timer = setTimeout(() => resolve(undefined), SECRET_TIMEOUT_MS);
-        }),
-    ]).catch(() => undefined);
-    if (timer) clearTimeout(timer);
-    return value;
+    try {
+        const outcome = await Promise.race([
+            secrets.get(key),
+            new Promise<typeof READ_TIMED_OUT>((resolve) => {
+                timer = setTimeout(() => resolve(READ_TIMED_OUT), SECRET_TIMEOUT_MS);
+            }),
+        ]);
+        if (outcome === READ_TIMED_OUT) return 'failed';
+        return { value: typeof outcome === 'string' && outcome !== '' ? outcome : undefined };
+    } catch {
+        return 'failed';
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
 }
 
 export async function readKey(secrets: vscode.SecretStorage): Promise<string | undefined> {
     const store = overrideSecrets ?? secrets;
-    const value = await readSecret(store, KEY_SECRET);
-    if (value) {
-        return value;
-    }
+    const primary = await readSecret(store, KEY_SECRET);
+    if (primary === 'failed') return undefined;
+    if (primary.value !== undefined) return primary.value;
     const legacy = await readSecret(store, LEGACY_KEY_SECRET);
-    if (legacy) {
-        await store.store(KEY_SECRET, legacy);
+    if (legacy === 'failed') return undefined;
+    if (legacy.value !== undefined) {
+        await store.store(KEY_SECRET, legacy.value);
         await store.delete(LEGACY_KEY_SECRET);
     }
-    return legacy;
+    return legacy.value;
 }
 
 export async function storeKey(secrets: vscode.SecretStorage, value: string): Promise<void> {
-    await secrets.store(KEY_SECRET, value);
-    await secrets.delete(LEGACY_KEY_SECRET);
+    const store = overrideSecrets ?? secrets;
+    await store.store(KEY_SECRET, value);
+    await store.delete(LEGACY_KEY_SECRET);
 }
 
 export async function clearStoredKey(secrets: vscode.SecretStorage): Promise<void> {
-    await secrets.delete(KEY_SECRET);
-    await secrets.delete(LEGACY_KEY_SECRET);
+    const store = overrideSecrets ?? secrets;
+    await store.delete(KEY_SECRET);
+    await store.delete(LEGACY_KEY_SECRET);
 }

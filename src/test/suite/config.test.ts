@@ -16,6 +16,10 @@ function fakeCfg(
         creditIncludeByok: true,
         creditRefreshIntervalMinutes: 5,
         sanitizeBase64Content: true,
+        hideUnavailableModels: true,
+        outputReservePercent: 12.5,
+        outputReserveMinTokens: 16384,
+        outputReserveMaxTokens: 262144,
     };
     const cfg = {
         get: (key: string, fallback?: unknown) =>
@@ -39,27 +43,12 @@ suite("readConfig", () => {
             resetPeriod: "daily",
             includeByok: true,
             refreshIntervalMinutes: 5,
-            contextPolicy: "auto",
-            contextMarginPercent: 0,
             sanitizeBase64Content: true,
+            hideUnavailableModels: true,
+            outputReservePercent: 12.5,
+            outputReserveMinTokens: 16384,
+            outputReserveMaxTokens: 262144,
         });
-    });
-
-    test("contextPolicy: only 'full' opts out; anything else is auto", () => {
-        assert.strictEqual(readConfig(fakeCfg({ contextWindowPolicy: "full" })).contextPolicy, "full");
-        assert.strictEqual(readConfig(fakeCfg({ contextWindowPolicy: "AUTO" })).contextPolicy, "auto");
-        assert.strictEqual(readConfig(fakeCfg()).contextPolicy, "auto");
-    });
-
-    test("contextMarginPercent: clamps to 0-50 and falls back to 0", () => {
-        assert.strictEqual(readConfig(fakeCfg({ contextSafetyMarginPercent: -1 })).contextMarginPercent, 0);
-        assert.strictEqual(readConfig(fakeCfg({ contextSafetyMarginPercent: 200 })).contextMarginPercent, 50);
-        assert.strictEqual(readConfig(fakeCfg({ contextSafetyMarginPercent: 10 })).contextMarginPercent, 10);
-        assert.strictEqual(readConfig(fakeCfg({ contextSafetyMarginPercent: NaN })).contextMarginPercent, 0);
-        assert.strictEqual(
-            readConfig(fakeCfg({ contextSafetyMarginPercent: "x" as unknown as number })).contextMarginPercent,
-            0
-        );
     });
 
     test("limit coercion: non-finite -> 0, negative -> 0, valid numbers pass", () => {
@@ -82,6 +71,15 @@ suite("readConfig", () => {
         assert.strictEqual(readConfig(fakeCfg({ creditIncludeByok: true })).includeByok, true);
     });
 
+    test("hideUnavailableModels: non-boolean values fall back to true", () => {
+        assert.strictEqual(
+            readConfig(fakeCfg({ hideUnavailableModels: "false" as unknown as boolean })).hideUnavailableModels,
+            true
+        );
+        assert.strictEqual(readConfig(fakeCfg({ hideUnavailableModels: false })).hideUnavailableModels, false);
+        assert.strictEqual(readConfig(fakeCfg({ hideUnavailableModels: true })).hideUnavailableModels, true);
+    });
+
     test("refreshIntervalMinutes: clamps to 1-1440 and falls back to 5", () => {
         assert.strictEqual(readConfig(fakeCfg({ creditRefreshIntervalMinutes: 0 })).refreshIntervalMinutes, 5);
         assert.strictEqual(readConfig(fakeCfg({ creditRefreshIntervalMinutes: 0.5 })).refreshIntervalMinutes, 1);
@@ -93,6 +91,19 @@ suite("readConfig", () => {
         );
         assert.strictEqual(readConfig(fakeCfg({ creditRefreshIntervalMinutes: 1440 })).refreshIntervalMinutes, 1440);
         assert.strictEqual(readConfig(fakeCfg({ creditRefreshIntervalMinutes: 1 })).refreshIntervalMinutes, 1);
+    });
+
+    test("output reserve settings: invalid values fall back to the defaults", () => {
+        const cfg = readConfig(
+            fakeCfg({ outputReservePercent: 80, outputReserveMinTokens: 0, outputReserveMaxTokens: -1 })
+        );
+        assert.strictEqual(cfg.outputReservePercent, 12.5);
+        assert.strictEqual(cfg.outputReserveMinTokens, 16384);
+        assert.strictEqual(cfg.outputReserveMaxTokens, 262144);
+        const set = readConfig(fakeCfg({ outputReservePercent: 25, outputReserveMinTokens: 65536, outputReserveMaxTokens: 262144 }));
+        assert.strictEqual(set.outputReservePercent, 25);
+        assert.strictEqual(set.outputReserveMinTokens, 65536);
+        assert.strictEqual(set.outputReserveMaxTokens, 262144);
     });
 
     test("workspace overrides are ignored (global scope only)", () => {
