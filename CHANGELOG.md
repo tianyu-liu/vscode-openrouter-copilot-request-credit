@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.1
+
+Localization release:
+
+- **In-UI localization:** the panel, status bar, model picker cards, and error messages now use VS Code's `l10n` API, with `l10n/bundle.l10n.ja.json` and `l10n/bundle.l10n.zh-cn.json`; English remains the source language and the fallback.
+- **Manifest localization:** display name, description, command titles, and setting descriptions are localized through `package.nls.json` plus `package.nls.ja.json` and `package.nls.zh-cn.json`.
+- **Translated READMEs:** added [README.ja.md](README.ja.md) and [README.zh-CN.md](README.zh-CN.md), with a language switcher on every README.
+- **Fix:** the panel's mode line ("No limit — …", "Local-set limit — …", "Key limit — …") is now translated; it stayed English even when a bundle was loaded.
+
 ## 0.4.0
 
 Highlights since 0.3.x:

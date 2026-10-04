@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { promises as fsp } from 'fs';
+import { setTranslator, t } from './i18n';
 import { buildStatus, KeyInfo, maskKey, AccountCredits, parseSessionTitle } from './logic';
 import {
     getConfig,
@@ -116,24 +117,24 @@ async function getJson(url: string, apiKey: string, signal?: AbortSignal, timeou
             signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs),
         });
         if (typeof res.url === 'string' && /^http:/i.test(res.url)) {
-            throw new Error(`Blocked insecure redirect to ${res.url}`);
+            throw new Error(t('Blocked insecure redirect to {0}', res.url));
         }
         const text = await res.text();
         if (!res.ok) {
-            throw new Error(`HTTP ${res.status}: ${text.slice(0, 500)}`);
+            throw new Error(t('HTTP {0}: {1}', res.status, text.slice(0, 500)));
         }
         if (!text.trim()) {
-            throw new Error(`Empty response body (HTTP ${res.status})`);
+            throw new Error(t('Empty response body (HTTP {0})', res.status));
         }
         try {
             return JSON.parse(text);
         } catch {
-            throw new Error(`Invalid JSON response (HTTP ${res.status}): ${text.slice(0, 200)}`);
+            throw new Error(t('Invalid JSON response (HTTP {0}): {1}', res.status, text.slice(0, 200)));
         }
     } catch (err) {
         if (err instanceof Error && err.message === 'fetch failed' && err.cause) {
             const cause = err.cause as Error;
-            throw new Error(cause.message || 'Request failed');
+            throw new Error(cause.message || t('Request failed'));
         }
         throw err;
     }
@@ -142,7 +143,7 @@ async function getJson(url: string, apiKey: string, signal?: AbortSignal, timeou
 function asDataObject(json: unknown, endpoint: string): Record<string, unknown> {
     const data = (json as { data?: unknown } | null)?.data;
     if (typeof json !== 'object' || json === null || typeof data !== 'object' || data === null) {
-        throw new Error(`Unexpected response shape from ${endpoint}`);
+        throw new Error(t('Unexpected response shape from {0}', endpoint));
     }
     return data as Record<string, unknown>;
 }
@@ -266,7 +267,7 @@ function openPanel(secrets: vscode.SecretStorage): void {
     } else {
         panel = vscode.window.createWebviewPanel(
             'openrouterCopilot',
-            'OpenRouter for Copilot',
+            t('OpenRouter for Copilot'),
             vscode.ViewColumn.One,
             { enableScripts: true }
         );
@@ -285,8 +286,8 @@ function openPanel(secrets: vscode.SecretStorage): void {
 
 function showNoKey(): void {
     setStatus(
-        '$(key) OR: no key',
-        `${APP_PREFIX}set your API key.  \nOpen the panel (click) and paste your key to begin.`
+        t('$(key) OR: no key'),
+        t('{0}set your API key.  \nOpen the panel (click) and paste your key to begin.', APP_PREFIX)
     );
 }
 
@@ -305,7 +306,7 @@ export function doRefresh(secrets: vscode.SecretStorage): Promise<KeyInfo | unde
 async function doRefreshRun(secrets: vscode.SecretStorage, signal: AbortSignal): Promise<KeyInfo | undefined> {
     const { limit, resetPeriod, includeByok } = readConfig();
 
-    setStatus('$(sync~spin) OR …', 'Refreshing OpenRouter key info…');
+    setStatus('$(sync~spin) OR …', t('Refreshing OpenRouter key info…'));
 
     const apiKey = await readKey(secrets);
     if (signal.aborted) return undefined;
@@ -350,8 +351,8 @@ async function doRefreshRun(secrets: vscode.SecretStorage, signal: AbortSignal):
     } catch (err) {
         if (signal.aborted) return undefined;
         const message = errorMessage(err);
-        lastErrorMessage = `Refresh failed: ${message}`;
-        setStatus('$(error) OR error', `OpenRouter error: ${message}`);
+        lastErrorMessage = t('Refresh failed: {0}', message);
+        setStatus(t('$(error) OR error'), t('OpenRouter error: {0}', message));
         await updatePanel(secrets, lastInfo, signal, apiKey);
         return undefined;
     }
@@ -362,6 +363,7 @@ export function refresh(secrets: vscode.SecretStorage): Promise<KeyInfo | undefi
 }
 
 export function activate(context: vscode.ExtensionContext): void {
+    setTranslator((message, ...args) => vscode.l10n.t(message, ...args));
     provider = new OpenRouterChatProvider(context.secrets, context.globalState);
     sessionTitleDir = chatSessionsDir(context.storageUri);
 
@@ -374,7 +376,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
     statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
     context.subscriptions.push(statusBarItem);
-    setStatus('$(sync~spin) OR …', 'OpenRouter: loading…');
+    setStatus('$(sync~spin) OR …', t('OpenRouter: loading…'));
 
     const openAndRefresh = (): void => {
         openPanel(context.secrets);
@@ -392,7 +394,7 @@ export function activate(context: vscode.ExtensionContext): void {
                     provider
                 );
                 if (result.applied) {
-                    void vscode.window.showInformationMessage(`${APP_PREFIX}Custom request saved from clipboard.`);
+                    void vscode.window.showInformationMessage(t('{0}Custom request saved from clipboard.', APP_PREFIX));
                 } else if (result.error) {
                     void vscode.window.showErrorMessage(`${APP_PREFIX}${result.error}`);
                 }
@@ -407,7 +409,7 @@ export function activate(context: vscode.ExtensionContext): void {
                 return;
             }
             await provider?.clearTemplate();
-            void vscode.window.showInformationMessage(`${APP_PREFIX}Request template cleared.`);
+            void vscode.window.showInformationMessage(t('{0}Request template cleared.', APP_PREFIX));
         })
     );
 

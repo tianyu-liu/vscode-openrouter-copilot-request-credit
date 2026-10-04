@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { randomBytes } from 'crypto';
+import { t } from './i18n';
 import {
     presetSlugFromPickerValue,
     stripTemplateComments,
@@ -50,7 +51,7 @@ const PANEL_NOTES = {
     },
     sessionList: {
         term: 'Session list',
-        text: `One entry per Copilot chat session (<code>session_id</code>), newest first, up to the ${MAX_TRACKED_SESSIONS} most recent. Named from the chat title when VS Code has one, otherwise the id; times are local. Stored locally and kept across window reloads.`,
+        text: 'One entry per Copilot chat session (<code>session_id</code>), newest first, up to the {0} most recent. Named from the chat title when VS Code has one, otherwise the id; times are local. Stored locally and kept across window reloads.',
     },
     hideUnavailable: {
         term: 'Hide unavailable models',
@@ -87,7 +88,7 @@ const PANEL_NOTES = {
     },
     outputReserve: {
         term: 'Output reserve',
-        text: `The reply budget held back from the window for the picker\u2019s context budget. With the default ${DEFAULT_OUTPUT_RESERVE_PERCENT}%, ~${DEFAULT_RESERVE_K}K on a 1M-token window, bounded by the lower and upper limits so tiny windows stay sane and huge ones are capped. Limits are entered in K (1 K = 1000 tokens). A real published cap is reserved as-is unless the upper limit is smaller; it is never inflated to the lower limit. The per-model Context size menu still sets the prompt budget itself.`,
+        text: 'The reply budget held back from the window for the picker\u2019s context budget. With the default {0}%, ~{1}K on a 1M-token window, bounded by the lower and upper limits so tiny windows stay sane and huge ones are capped. Limits are entered in K (1 K = 1000 tokens). A real published cap is reserved as-is unless the upper limit is smaller; it is never inflated to the lower limit. The per-model Context size menu still sets the prompt budget itself.',
     },
     autoLimit: {
         term: 'Server-side limit',
@@ -97,10 +98,16 @@ const PANEL_NOTES = {
 
 type PanelNoteId = keyof typeof PANEL_NOTES;
 
+/** Positional arguments (`{0}`, `{1}`, …) for the notes that carry dynamic values. */
+const PANEL_NOTE_ARGS: Partial<Record<PanelNoteId, Array<string | number>>> = {
+    sessionList: [MAX_TRACKED_SESSIONS],
+    outputReserve: [DEFAULT_OUTPUT_RESERVE_PERCENT, DEFAULT_RESERVE_K],
+};
+
 function renderNoteList(ids: PanelNoteId[]): string {
     const items = ids.map((id) => {
         const { term, text } = PANEL_NOTES[id];
-        return `<li><strong>${term}:</strong> ${text}</li>`;
+        return `<li><strong>${t(term)}:</strong> ${t(text, ...(PANEL_NOTE_ARGS[id] ?? []))}</li>`;
     });
     return `<ul class="helptext">${items.join('')}</ul>`;
 }
@@ -206,7 +213,7 @@ export function renderSessionCosts(sessions: SessionCost[] | undefined): string 
     const chats = withSpend.filter(s => s.sessionId !== UNATTRIBUTED_SESSION_ID);
     const unattributed = withSpend.find(s => s.sessionId === UNATTRIBUTED_SESSION_ID);
     if (chats.length === 0 && unattributed === undefined) {
-        return emptyState('No OpenRouter spend recorded yet. Totals appear here once a turn reports a cost. Spend that carried no chat identifier is collected under the <strong>Unattributed</strong> entry.');
+        return emptyState(t('No OpenRouter spend recorded yet. Totals appear here once a turn reports a cost. Spend that carried no chat identifier is collected under the <strong>Unattributed</strong> entry.'));
     }
     const rows = chats.map((session, index) => renderSessionDetails(session, index === 0)).join('');
     const unattributedHtml = unattributed ? renderSessionDetails(unattributed, chats.length === 0) : '';
@@ -218,7 +225,7 @@ function renderSessionDetails(session: SessionCost, open: boolean): string {
     const short = session.sessionId.replace(/^copilot-chat:/, '');
     const label =
         session.sessionId === UNATTRIBUTED_SESSION_ID
-            ? 'Unattributed (no chat id)'
+            ? t('Unattributed (no chat id)')
             : session.title ?? `${short.slice(0, 8)}${short.length > 8 ? '\u2026' : ''}`;
     const routeRows = session.routes
         .map(r => {
@@ -234,7 +241,7 @@ function renderSessionDetails(session: SessionCost, open: boolean): string {
         .join('');
     const cacheShare = cacheShareSuffix(session);
     const updated = session.updatedAt >= 1e12 ? formatReset(new Date(session.updatedAt), true) : undefined;
-    const calls = `${session.calls} call${session.calls === 1 ? '' : 's'}`;
+    const calls = session.calls === 1 ? t('{0} call', session.calls) : t('{0} calls', session.calls);
     return `<details class="session"${open ? ' open' : ''}>
                         <summary>
                             <span class="sessioncost">${esc(formatUsdPrecise(session.paid))}</span>
@@ -245,13 +252,13 @@ function renderSessionDetails(session: SessionCost, open: boolean): string {
                         <div class="sessionbody">
                             <table class="routes">
                                 <thead>
-                                    <tr><th>Cost</th><th>Provider</th><th>Model</th><th>Calls</th><th>Cached</th></tr>
+                                    <tr><th>${t('Cost')}</th><th>${t('Provider')}</th><th>${t('Model')}</th><th>${t('Calls')}</th><th>${t('Cached')}</th></tr>
                                 </thead>
                                 <tbody>${routeRows}</tbody>
                             </table>
                             ${session.sessionId === UNATTRIBUTED_SESSION_ID
                                 ? renderNote('unattributed')
-                                : `<p class="muted">OpenRouter session <code>${esc(session.sessionId)}</code></p>`}
+                                : `<p class="muted">${t('OpenRouter session <code>{0}</code>', esc(session.sessionId))}</p>`}
                         </div>
                     </details>`;
 }
@@ -294,8 +301,8 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
     const detail = info ? buildDetail(info, limit, resetPeriod, includeByok, accountCredits) : undefined;
     const usageTable = detail
         ? `<table class="rows">
-               <caption class="tabletitle">Usage</caption>
-               <thead><tr><th class="col">OpenRouter</th><th class="col">BYOK</th><th class="col">Sum</th><th class="label">Period</th></tr></thead>
+               <caption class="tabletitle">${t('Usage')}</caption>
+               <thead><tr><th class="col">${t('OpenRouter')}</th><th class="col">${t('BYOK')}</th><th class="col">${t('Sum')}</th><th class="label">${t('Period')}</th></tr></thead>
                <tbody>${detail.rows
             .map((r, i) => {
                 const hl = (col: 'or' | 'sum'): string =>
@@ -313,13 +320,13 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
         : '';
     const rollingWeekly = detail?.resetPeriod === 'weekly' && detail.highlight !== null;
     const resetText = rollingWeekly
-        ? 'Rolling 7-day window'
-        : `Next reset: ${detail?.resetDate ?? 'No reset'}`;
+        ? t('Rolling 7-day window')
+        : t('Next reset: {0}', detail?.resetDate ?? t('No reset'));
     const remainingLine = detail
-        ? `<div class="remainingline${detail.background === 'error' ? ' exhausted' : ''}"><span class="label">Remaining</span><span class="limitvalue">${esc(detail.remaining)} / ${esc(detail.limitValue)}</span><span class="muted">${esc(resetText)}</span></div>`
+        ? `<div class="remainingline${detail.background === 'error' ? ' exhausted' : ''}"><span class="label">${t('Remaining')}</span><span class="limitvalue">${esc(detail.remaining)} / ${esc(detail.limitValue)}</span><span class="muted">${esc(resetText)}</span></div>`
         : '';
     const freeTierLine = detail
-        ? `<p class="freetier">Free tier: ${esc(detail.freeTier)}</p>`
+        ? `<p class="freetier">${t('Free tier: {0}', detail.freeTier)}</p>`
         : '';
     const modeLine = detail
         ? `<div class="modeline">${esc(detail.modeText)}</div>`
@@ -328,8 +335,8 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
         ? `<div class="errbanner">${esc(errorMessage)}</div>`
         : '';
     const keyState = maskedKey
-        ? `<span class="ok">\u2713 Key set</span>`
-        : `<span class="warn">No API key set</span>`;
+        ? `<span class="ok">\u2713 ${t('Key set')}</span>`
+        : `<span class="warn">${t('No API key set')}</span>`;
     const autoMode = detail?.mode === 'auto';
     const includeByokShown = autoMode && info ? effectiveIncludeByok(info, includeByok) : includeByok;
     const limitFieldValue = autoMode
@@ -337,21 +344,21 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
         : String(limit);
     const periodSelection = autoMode ? detail?.resetPeriod ?? resetPeriod : resetPeriod;
     const limitLine = `<div class="limitline">
-               <label class="limitlabel" for="limit">Spending limit</label>
+               <label class="limitlabel" for="limit">${t('Spending limit')}</label>
                <span>$</span>
                 <input type="number" id="limit" min="0" step="0.01" value="${esc(limitFieldValue)}"${autoMode ? ' disabled' : ''} />
-               <select id="resetPeriod" aria-label="Spending limit reset period" title="How often the local spending limit resets"${autoMode ? ' disabled' : ''}>
+               <select id="resetPeriod" aria-label="${t('Spending limit reset period')}" title="${t('How often the local spending limit resets')}"${autoMode ? ' disabled' : ''}>
                    ${RESET_PERIODS.map((p) => `<option value="${p}" ${periodSelection === p ? 'selected' : ''}>${resetPeriodLabel(p)}</option>`).join('')}
                </select>
-                <label class="optlabel"><input type="checkbox" id="includeByok" ${includeByokShown ? 'checked' : ''}${autoMode ? ' disabled' : ''} title="${autoMode ? 'Set on the API key; local controls apply only when the key has none' : 'Count bring-your-own-key usage in the remaining balance'}" /> Include BYOK usage${autoMode ? ' (set on the key)' : ''}</label>
+                <label class="optlabel"><input type="checkbox" id="includeByok" ${includeByokShown ? 'checked' : ''}${autoMode ? ' disabled' : ''} title="${autoMode ? t('Set on the API key; local controls apply only when the key has none') : t('Count bring-your-own-key usage in the remaining balance')}" /> ${t('Include BYOK usage')}${autoMode ? t(' (set on the key)') : ''}</label>
            </div>
            ${autoMode ? renderNote('autoLimit') : ''}`;
     const sessionCostHtml = renderSessionCosts(sessions);
     const updatedLine = `<div class="keyline updatedline">
-            <label class="optlabel" for="refreshInterval">Usage refresh interval (minutes)</label>
-            <input type="number" id="refreshInterval" min="1" max="${MAX_REFRESH_INTERVAL_MINUTES}" step="1" aria-label="Usage refresh interval in minutes" title="Refresh usage data every 1 to ${MAX_REFRESH_INTERVAL_MINUTES} minutes" value="${esc(String(refreshIntervalMinutes))}" class="intervalinput" />
-            ${fetchedAt ? `<span class="muted">Updated ${esc(formatReset(fetchedAt, true))}</span>` : ''}
-            <button id="refresh">Refresh</button>
+            <label class="optlabel" for="refreshInterval">${t('Usage refresh interval (minutes)')}</label>
+            <input type="number" id="refreshInterval" min="1" max="${MAX_REFRESH_INTERVAL_MINUTES}" step="1" aria-label="${t('Usage refresh interval in minutes')}" title="${t('Refresh usage data every 1 to {0} minutes', MAX_REFRESH_INTERVAL_MINUTES)}" value="${esc(String(refreshIntervalMinutes))}" class="intervalinput" />
+            ${fetchedAt ? `<span class="muted">${t('Updated {0}', esc(formatReset(fetchedAt, true)))}</span>` : ''}
+            <button id="refresh">${t('Refresh')}</button>
         </div>`;
     const templateValue = template ? JSON.stringify(template, null, 2) : '';
     const selectedPreset = templatePresetSlug(template) ?? '';
@@ -365,13 +372,13 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
     const currentPreset = selectedPreset;
     const presetOptions: Array<{ slug: string; label: string }> = (presets ?? []).map(p => ({
         slug: p.slug,
-        label: `${p.name}${p.model ? ` \u2192 ${p.model}` : p.lookupSkipped ? ' (model not checked)' : ' (routing profile)'}`,
+        label: `${p.name}${p.model ? ` \u2192 ${p.model}` : p.lookupSkipped ? t(' (model not checked)') : t(' (routing profile)')}`,
     }));
     if (currentPreset !== '' && !presetOptions.some(p => p.slug === currentPreset)) {
-        presetOptions.push({ slug: currentPreset, label: `${currentPreset} (not in list)` });
+        presetOptions.push({ slug: currentPreset, label: `${currentPreset}${t(' (not in list)')}` });
     }
     const presetSelectHtml = `<select id="presetSelect">
-            <option value="" ${currentPreset === '' ? 'selected' : ''}>No preset loaded</option>
+            <option value="" ${currentPreset === '' ? 'selected' : ''}>${t('No preset loaded')}</option>
             ${presetOptions
             .map(
                 (p) => `<option value="${esc(p.slug)}" ${p.slug === currentPreset ? 'selected' : ''}>${esc(p.label)}</option>`
@@ -379,9 +386,9 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
             .join('')}
         </select>`;
     const presetsHint = presets === undefined
-        ? emptyState('Presets could not be loaded for this key.')
+        ? emptyState(t('Presets could not be loaded for this key.'))
         : presets.length === 0
-            ? emptyState('No presets found for this key.')
+            ? emptyState(t('No presets found for this key.'))
             : '';
     const sanitizeBase64Content = settings.sanitizeBase64Content ?? true;
     const hideUnavailableModels = settings.hideUnavailableModels ?? true;
@@ -391,7 +398,7 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
     const ktok = (tokens: number): string => String(parseFloat((tokens / 1000).toFixed(3)));
 
     return `<!DOCTYPE html>
-<html lang="en">
+<html lang="${esc(vscode.env.language)}">
 <head>
 <meta charset="UTF-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'">
@@ -496,40 +503,40 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
 </head>
 <body>
 <div class="wrap">
-    <div class="tabs" role="tablist" aria-label="OpenRouter settings">
-        <button class="tab" id="tab-key-info" role="tab" aria-selected="true" aria-controls="panel-key-info" tabindex="0">Key Info</button>
-        <button class="tab" id="tab-session-spend" role="tab" aria-selected="false" aria-controls="panel-session-spend" tabindex="-1">Session Spend</button>
-        <button class="tab" id="tab-configurations" role="tab" aria-selected="false" aria-controls="panel-configurations" tabindex="-1">Configurations</button>
+    <div class="tabs" role="tablist" aria-label="${t('OpenRouter settings')}">
+        <button class="tab" id="tab-key-info" role="tab" aria-selected="true" aria-controls="panel-key-info" tabindex="0">${t('Key Info')}</button>
+        <button class="tab" id="tab-session-spend" role="tab" aria-selected="false" aria-controls="panel-session-spend" tabindex="-1">${t('Session Spend')}</button>
+        <button class="tab" id="tab-configurations" role="tab" aria-selected="false" aria-controls="panel-configurations" tabindex="-1">${t('Configurations')}</button>
     </div>
 
     <section class="tab-panel" id="panel-key-info" role="tabpanel" aria-labelledby="tab-key-info" tabindex="0">
     <div class="section">
-        <div class="section-title">OpenRouter API key</div>
+        <div class="section-title">${t('OpenRouter API key')}</div>
         <div class="keyline">
-            <input type="${maskedKey ? 'text' : 'password'}" id="key" aria-label="OpenRouter API key" placeholder="OpenRouter API key (sk-or-v1-...)" />
-            <button id="saveKey">Save key</button>
-            ${maskedKey ? '<button id="clearKey">Clear key</button>' : ''}
+            <input type="${maskedKey ? 'text' : 'password'}" id="key" aria-label="${t('OpenRouter API key')}" placeholder="${t('OpenRouter API key (sk-or-v1-...)')}" />
+            <button id="saveKey">${t('Save key')}</button>
+            ${maskedKey ? `<button id="clearKey">${t('Clear key')}</button>` : ''}
             ${keyState}
         </div>
         ${errorBanner}
         ${renderNote('storage')}
     </div>
     <div class="section">
-        <div class="section-title">Credit usage</div>
-        ${detail ? `${modeLine}${usageTable}${freeTierLine}${remainingLine}` : emptyState('No usage information yet. Save an API key to load account details.')}
+        <div class="section-title">${t('Credit usage')}</div>
+        ${detail ? `${modeLine}${usageTable}${freeTierLine}${remainingLine}` : emptyState(t('No usage information yet. Save an API key to load account details.'))}
         ${limitLine}
         ${updatedLine}
     </div>
     <div class="section">
-        <div class="section-title">Model availability</div>
-        <label class="optlabel"><input type="checkbox" id="hideUnavailableModels" ${hideUnavailableModels ? 'checked' : ''} /> Hide models this key cannot use</label>
+        <div class="section-title">${t('Model availability')}</div>
+        <label class="optlabel"><input type="checkbox" id="hideUnavailableModels" ${hideUnavailableModels ? 'checked' : ''} /> ${t('Hide models this key cannot use')}</label>
         ${renderNote('hideUnavailable')}
     </div>
     </section>
 
     <section class="tab-panel" id="panel-session-spend" role="tabpanel" aria-labelledby="tab-session-spend" tabindex="0" hidden>
     <div class="section">
-        <div class="section-title">Session spend</div>
+        <div class="section-title">${t('Session spend')}</div>
         ${sessionCostHtml}
         ${renderNote('byokRoutes')}
     </div>
@@ -537,37 +544,37 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
 
     <section class="tab-panel" id="panel-configurations" role="tabpanel" aria-labelledby="tab-configurations" tabindex="0" hidden>
     <div class="section">
-        <div class="section-title">Output reserve</div>
+        <div class="section-title">${t('Output reserve')}</div>
         <div class="keyline">
             <span class="fieldgroup">
-                <label class="optlabel" for="outputReservePercent">Target:</label>
-                <input type="number" id="outputReservePercent" min="${OUTPUT_RESERVE_PERCENT_MIN}" max="${OUTPUT_RESERVE_PERCENT_MAX}" step="0.5" aria-label="Output reserve as percent of window" value="${esc(String(outputReservePercent))}" />
+                <label class="optlabel" for="outputReservePercent">${t('Target:')}</label>
+                <input type="number" id="outputReservePercent" min="${OUTPUT_RESERVE_PERCENT_MIN}" max="${OUTPUT_RESERVE_PERCENT_MAX}" step="0.5" aria-label="${t('Output reserve as percent of window')}" value="${esc(String(outputReservePercent))}" />
                 <span class="muted">%</span>
             </span>
             <span class="sep">.</span>
             <span class="fieldgroup">
-                <label class="optlabel" for="outputReserveMinTokens">Lower limit:</label>
-                <input type="number" id="outputReserveMinTokens" min="0.5" step="0.5" aria-label="Lower bound on the output reserve in K" value="${esc(ktok(outputReserveMinTokens))}" />
+                <label class="optlabel" for="outputReserveMinTokens">${t('Lower limit:')}</label>
+                <input type="number" id="outputReserveMinTokens" min="0.5" step="0.5" aria-label="${t('Lower bound on the output reserve in K')}" value="${esc(ktok(outputReserveMinTokens))}" />
                 <span class="muted">K</span>
             </span>
             <span class="sep">.</span>
             <span class="fieldgroup">
-                <label class="optlabel" for="outputReserveMaxTokens">Upper limit:</label>
-                <input type="number" id="outputReserveMaxTokens" min="0.5" step="0.5" aria-label="Upper bound on the output reserve in K" value="${esc(ktok(outputReserveMaxTokens))}" />
+                <label class="optlabel" for="outputReserveMaxTokens">${t('Upper limit:')}</label>
+                <input type="number" id="outputReserveMaxTokens" min="0.5" step="0.5" aria-label="${t('Upper bound on the output reserve in K')}" value="${esc(ktok(outputReserveMaxTokens))}" />
                 <span class="muted">K</span>
             </span>
         </div>
         ${renderNote('outputReserve')}
     </div>
     <div class="section">
-        <div class="section-title">Prompt safeguard</div>
-        <label class="optlabel"><input type="checkbox" id="sanitizeBase64" ${sanitizeBase64Content ? 'checked' : ''} /> Remove long base64-like text from prompts</label>
+        <div class="section-title">${t('Prompt safeguard')}</div>
+        <label class="optlabel"><input type="checkbox" id="sanitizeBase64" ${sanitizeBase64Content ? 'checked' : ''} /> ${t('Remove long base64-like text from prompts')}</label>
         ${renderNote('promptSanitization')}
     </div>
     <div class="section">
-        <div class="section-title">Presets</div>
+        <div class="section-title">${t('Presets')}</div>
         <div class="keyline">
-            <label class="optlabel" for="presetSelect">Preset</label>
+            <label class="optlabel" for="presetSelect">${t('Preset')}</label>
             ${presetSelectHtml}
         </div>
         ${presetsHint}
@@ -575,10 +582,10 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
     </div>
 
     <div class="section">
-        <div class="section-title">Custom request</div>
-        <textarea id="template" aria-label="Custom request JSON" rows="10" placeholder="Paste a request body from the OpenRouter Request Builder (or any Chat Completions JSON)."></textarea>
+        <div class="section-title">${t('Custom request')}</div>
+        <textarea id="template" aria-label="${t('Custom request JSON')}" rows="10" placeholder="${t('Paste a request body from the OpenRouter Request Builder (or any Chat Completions JSON).')}"></textarea>
         <div class="keyline">
-            <button id="saveTemplate">Save request</button>
+            <button id="saveTemplate">${t('Save request')}</button>
         </div>
         ${renderNoteList(['streaming', 'liveConversation', 'thinkingEffort', 'providerRouting', 'anthropicCaching'])}
     </div>
@@ -690,7 +697,7 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
             if (!exists && value !== '') {
                 const option = document.createElement('option');
                 option.value = value;
-                option.textContent = value + ' (not in list)';
+                option.textContent = value + ${JSON.stringify(t(' (not in list)'))};
                 presetEl.appendChild(option);
             }
             presetEl.value = value;
@@ -827,7 +834,7 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Pr
             if (!trimmed) {
                 await deps.clearKey();
                 await deps.doRefresh();
-                deps.info('API key cleared.');
+                deps.info(t('API key cleared.'));
                 return;
             }
             if (msg.currentKeyMasked === trimmed) {
@@ -841,7 +848,7 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Pr
             const input = String(msg.value ?? '').trim();
             const n = Number(input);
             if (input === '' || !Number.isFinite(n) || n < 0) {
-                deps.error('Enter a limit of 0 or more.');
+                deps.error(t('Enter a limit of 0 or more.'));
                 return;
             }
             await saveConfig(deps, 'creditLimit', n);
@@ -850,7 +857,7 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Pr
         case 'saveResetPeriod': {
             const value = String(msg.value);
             if (!isResetPeriod(value)) {
-                deps.error('Select a valid reset period.');
+                deps.error(t('Select a valid reset period.'));
                 return;
             }
             await saveConfig(deps, 'creditResetPeriod', value);
@@ -858,7 +865,7 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Pr
         }
         case 'saveIncludeByok': {
             if (typeof msg.value !== 'boolean') {
-                deps.error('Choose whether BYOK usage counts.');
+                deps.error(t('Choose whether BYOK usage counts.'));
                 return;
             }
             await saveConfig(deps, 'creditIncludeByok', msg.value);
@@ -867,7 +874,7 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Pr
         case 'saveRefreshInterval': {
             const n = Math.round(Number(msg.value));
             if (!Number.isFinite(n) || n < 1 || n > MAX_REFRESH_INTERVAL_MINUTES) {
-                deps.error(`Enter a refresh interval from 1 to ${MAX_REFRESH_INTERVAL_MINUTES} minutes.`);
+                deps.error(t('Enter a refresh interval from 1 to {0} minutes.', MAX_REFRESH_INTERVAL_MINUTES));
                 return;
             }
             await saveConfig(deps, 'creditRefreshIntervalMinutes', n);
@@ -875,7 +882,7 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Pr
         }
         case 'saveSanitizeBase64': {
             if (typeof msg.value !== 'boolean') {
-                deps.error('Choose whether long base64-like text is removed.');
+                deps.error(t('Choose whether long base64-like text is removed.'));
                 return;
             }
             await saveConfig(deps, 'sanitizeBase64Content', msg.value);
@@ -883,7 +890,7 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Pr
         }
         case 'saveHideUnavailableModels': {
             if (typeof msg.value !== 'boolean') {
-                deps.error('Choose whether unavailable models are hidden.');
+                deps.error(t('Choose whether unavailable models are hidden.'));
                 return;
             }
             await saveConfig(deps, 'hideUnavailableModels', msg.value);
@@ -892,7 +899,7 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Pr
         case 'saveOutputReservePercent': {
             const n = Number(msg.value);
             if (!Number.isFinite(n) || n < OUTPUT_RESERVE_PERCENT_MIN || n > OUTPUT_RESERVE_PERCENT_MAX) {
-                deps.error(`Enter an output reserve from ${OUTPUT_RESERVE_PERCENT_MIN}% to ${OUTPUT_RESERVE_PERCENT_MAX}%.`);
+                deps.error(t('Enter an output reserve from {0}% to {1}%.', OUTPUT_RESERVE_PERCENT_MIN, OUTPUT_RESERVE_PERCENT_MAX));
                 return;
             }
             await saveConfig(deps, 'outputReservePercent', n);
@@ -901,7 +908,7 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Pr
         case 'saveOutputReserveMinTokens': {
             const n = Math.round(Number(msg.value) * 1000);
             if (!Number.isFinite(n) || n < 1) {
-                deps.error('Enter an output reserve lower limit above 0 K.');
+                deps.error(t('Enter an output reserve lower limit above 0 K.'));
                 return;
             }
             await saveConfig(deps, 'outputReserveMinTokens', n);
@@ -910,7 +917,7 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Pr
         case 'saveOutputReserveMaxTokens': {
             const n = Math.round(Number(msg.value) * 1000);
             if (!Number.isFinite(n) || n < 1) {
-                deps.error('Enter an output reserve upper limit above 0 K.');
+                deps.error(t('Enter an output reserve upper limit above 0 K.'));
                 return;
             }
             await saveConfig(deps, 'outputReserveMaxTokens', n);
@@ -926,17 +933,17 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Pr
             if (raw.trim() === '') {
                 await deps.clearTemplate();
                 deps.syncPresetSelection(undefined);
-                deps.info('Custom request cleared.');
+                deps.info(t('Custom request cleared.'));
                 return;
             }
             const result = await deps.saveTemplate(raw);
             if (!result.ok) {
-                deps.error(result.error ?? 'The request template is not valid.');
+                deps.error(result.error ?? t('The request template is not valid.'));
                 return;
             }
             deps.syncPresetSelection(presetSlugOf(raw));
             await deps.doRefresh();
-            deps.info('Custom request saved.');
+            deps.info(t('Custom request saved.'));
             return;
         }
         case 'clearTemplate':
@@ -949,20 +956,20 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Pr
             if (slug === '') {
                 await deps.clearTemplate();
                 await deps.doRefresh();
-                deps.info('Preset unloaded; custom request cleared.');
+                deps.info(t('Preset unloaded; custom request cleared.'));
                 return;
             }
             if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(slug)) {
-                deps.error('Enter a valid preset slug.');
+                deps.error(t('Enter a valid preset slug.'));
                 return;
             }
             const result = await deps.saveTemplate(JSON.stringify({ preset: slug }));
             if (!result.ok) {
-                deps.error(result.error ?? 'The request template is not valid.');
+                deps.error(result.error ?? t('The request template is not valid.'));
                 return;
             }
             await deps.doRefresh();
-            deps.info(`Preset "${slug}" loaded as the request template.`);
+            deps.info(t('Preset "{0}" loaded as the request template.', slug));
             return;
         }
         case 'refresh':

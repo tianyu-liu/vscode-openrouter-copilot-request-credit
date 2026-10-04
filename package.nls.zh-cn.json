@@ -1,0 +1,17 @@
+{
+  "displayName": "适用于 Copilot 的 OpenRouter：自定义请求与额度检查",
+  "description": "在 Copilot Chat 中注册 OpenRouter 提供程序，并提供统一控制面板：粘贴 OpenRouter Request Builder 的请求体后，所有聊天请求都会应用其中的设置；状态栏会显示密钥额度的使用情况。",
+  "command.manage.title": "OpenRouter：管理提供程序",
+  "command.pasteTemplate.title": "OpenRouter：粘贴自定义请求",
+  "command.clearTemplate.title": "OpenRouter：清除自定义请求",
+  "config.title": "适用于 Copilot 的 OpenRouter",
+  "config.creditLimit.description": "以美元为单位设置本地支出上限。设为 0 会禁用该上限并显示账户余额，且不会改变 OpenRouter 服务器端的护栏。工作区覆盖设置将被忽略。",
+  "config.creditResetPeriod.description": "选择本地支出上限何时重置：每天、每周、每月或从不。工作区覆盖设置将被忽略。",
+  "config.creditIncludeByok.description": "在显示的用量与本地支出上限的计算中计入自带密钥（BYOK）用量。工作区覆盖设置将被忽略。",
+  "config.creditRefreshIntervalMinutes.description": "设置用量和额度数据的刷新间隔，以分钟为单位（1-1440）。工作区覆盖设置将被忽略。",
+  "config.sanitizeBase64Content.description": "发送前从请求文本（消息、推理、工具调用参数）中移除类似 base64 的长字符串。图片附件不受影响。工作区覆盖设置将被忽略。",
+  "config.hideUnavailableModels.description": "查询账户可用的模型，并在模型选择器中隐藏此密钥无法使用的模型。查询失败时回退到完整目录。工作区覆盖设置将被忽略。",
+  "config.outputReservePercent.description": "输出预留目标占上下文窗口的百分比。当 OpenRouter 公布的最大补全上限为占位值或缺失时，会按此比例从窗口中为回复预留预算。在 100 万 token 的窗口上，12.5% 会预留约 131K。预留量受 token 下限与上限约束。工作区覆盖设置将被忽略。",
+  "config.outputReserveMinTokens.description": "输出预留的下限（以 token 计），应用于按比例算出的预留量（默认 16384，即 16.384K），使极小的上下文窗口仍能保留合理的回复预算。真实公布的上限绝不会被抬高到该下限。工作区覆盖设置将被忽略。",
+  "config.outputReserveMaxTokens.description": "输出预留的上限（以 token 计，默认 262144，即 262.144K），使巨大的上下文窗口不会预留过大的比例，同时仍尊重当前一代模型的真实输出上限。真实公布的上限会被限制在此预留上限以内。将两个限制设为相等即可获得固定预留。工作区覆盖设置将被忽略。"
+}

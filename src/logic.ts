@@ -5,6 +5,8 @@
 // here; the vscode-specific bits (SecretStorage, ThemeColor, status bar, HTTP)
 // stay in extension.ts.
 
+import { t } from './i18n';
+
 export interface KeyInfo {
     label?: string | null;
     limit: number | null;
@@ -39,7 +41,16 @@ export interface AccountCredits {
 
 /** "Daily"/"Weekly"/"Monthly"/"All-time" label for a reset period. */
 export function resetPeriodLabel(p: ResetPeriod): string {
-    return p === "never" ? "All-time" : p.charAt(0).toUpperCase() + p.slice(1);
+    switch (p) {
+        case "weekly":
+            return t("Weekly");
+        case "monthly":
+            return t("Monthly");
+        case "never":
+            return t("All-time");
+        default:
+            return t("Daily");
+    }
 }
 
 /**
@@ -49,7 +60,7 @@ export function resetPeriodLabel(p: ResetPeriod): string {
  * generic label.
  */
 export function maskKey(key: string | null | undefined): string {
-    if (!key) return "unknown key";
+    if (!key) return t("unknown key");
     const len = key.length;
     if (len <= 4) return "****";
     if (len < 9) return "****";
@@ -99,14 +110,14 @@ function hugeAmountText(v: number, withUsd: boolean): string {
  *  ("1e+21") for very large values, so those render as a grouped integer. */
 export function formatUsd(n: number): string {
     const v = toNum(n);
-    if (!Number.isFinite(v)) return "n/a";
+    if (!Number.isFinite(v)) return t("n/a");
     if (Math.abs(v) >= HUGE_AMOUNT) return hugeAmountText(v, true);
     return `$${v.toFixed(2)}`;
 }
 
 /** Format a possibly-missing USD amount; returns "n/a" when null/undefined/NaN. */
 export function formatUsdOrNa(n: number | null | undefined): string {
-    if (n == null) return "n/a";
+    if (n == null) return t("n/a");
     return formatUsd(n);
 }
 
@@ -155,7 +166,7 @@ export function formatUsdPrecise(n: number): string {
  */
 export function formatCompact(n: number): string {
     const v = toNum(n);
-    if (!Number.isFinite(v)) return "n/a";
+    if (!Number.isFinite(v)) return t("n/a");
     if (Math.abs(v) >= HUGE_AMOUNT) return hugeAmountText(v, false);
     return parseFloat(v.toFixed(2)).toString();
 }
@@ -347,8 +358,8 @@ function limitResetPeriod(limit_reset: string | null | undefined): ResetPeriod {
  */
 export function describeReset(limit_reset: string | null | undefined): string {
     const period = limitResetPeriod(limit_reset);
-    if (period === "never") return "No reset";
-    if (period === "weekly") return "Rolling 7-day window (Weekly)";
+    if (period === "never") return t("No reset");
+    if (period === "weekly") return t("Rolling 7-day window (Weekly)");
     return `${formatReset(resetBoundary(period))} (${resetPeriodLabel(period)})`;
 }
 
@@ -488,9 +499,9 @@ export function coreView(
     const highlight = unlimited ? null : highlightCell(effectivePeriod, includeByokEffective);
     const resetDate =
         unlimited || effectivePeriod === "never"
-            ? "No reset"
+            ? t("No reset")
             : effectivePeriod === "weekly"
-                ? "Rolling 7-day window"
+                ? t("Rolling 7-day window")
                 : formatReset(resetBoundary(effectivePeriod));
 
     let mode: ViewMode;
@@ -562,21 +573,21 @@ export function buildDetail(
             byokValue: formatUsdOrNa(byok),
             sumValue:
                 !Number.isFinite(o) && !Number.isFinite(b)
-                    ? "n/a"
+                    ? t("n/a")
                     : formatUsdOrNa(sumUsage(or, byok, true)),
         };
     };
     const rows: DetailRow[] = [
-        row("Daily", info.usage_daily, info.byok_usage_daily),
-        row("Weekly", info.usage_weekly, info.byok_usage_weekly),
-        row("Monthly", info.usage_monthly, info.byok_usage_monthly),
-        row("All-time", info.usage, info.byok_usage),
+        row(t("Daily"), info.usage_daily, info.byok_usage_daily),
+        row(t("Weekly"), info.usage_weekly, info.byok_usage_weekly),
+        row(t("Monthly"), info.usage_monthly, info.byok_usage_monthly),
+        row(t("All-time"), info.usage, info.byok_usage),
     ];
 
-    const freeTierStr = info.is_free_tier == null ? "n/a" : info.is_free_tier ? "yes" : "no";
+    const freeTierStr = info.is_free_tier == null ? t("n/a") : info.is_free_tier ? t("yes") : t("no");
     const limitValue =
         view.mode === "unlimited" && !accountCredits
-            ? "No cap"
+            ? t("No cap")
             : formatUsd(view.limitNum);
 
     return {
@@ -589,7 +600,7 @@ export function buildDetail(
         resetPeriod: view.effectivePeriod,
         resetDate: view.resetDate,
         mode: view.mode,
-        modeText: MODE_TEXT[view.mode].long,
+        modeText: t(MODE_TEXT[view.mode].long),
         highlight: view.highlight,
     };
 }
@@ -614,7 +625,7 @@ export function buildStatus(
     accountCredits?: AccountCredits
 ): StatusView {
     const view = coreView(info, limit, resetPeriod, includeByok, accountCredits);
-    const periodLabel = view.mode === "unlimited" ? "All-time" : resetPeriodLabel(view.effectivePeriod);
+    const periodLabel = view.mode === "unlimited" ? t("All-time") : resetPeriodLabel(view.effectivePeriod);
     const usage =
         view.mode === "manual"
             ? view.used
@@ -626,7 +637,7 @@ export function buildStatus(
             ? view.resetDate
             : view.mode === "auto"
                 ? describeReset(info.limit_reset)
-                : "No reset";
+                : t("No reset");
 
     // Status bar: keep the $ on the remaining figure, omit it on the
     // denominator (general format, auto rounding). Only the manual guardrail
@@ -641,13 +652,13 @@ export function buildStatus(
     return {
         text,
         tooltip: [
-            "**OpenRouter key credits**",
-            `*${MODE_TEXT[view.mode].short}*`,
-            `${periodLabel} limit: ${formatUsd(view.limitNum)}`,
-            `${periodLabel} usage: ${formatUsd(usage)}`,
-            `${periodLabel} remaining: ${formatUsdOrNa(view.remainingNum)}`,
-            `Resets: ${resetLine}`,
-            ...(view.mode === "auto" && info.is_free_tier ? ["Free tier: yes"] : []),
+            t("**OpenRouter key credits**"),
+            `*${t(MODE_TEXT[view.mode].short)}*`,
+            t("{0} limit: {1}", periodLabel, formatUsd(view.limitNum)),
+            t("{0} usage: {1}", periodLabel, formatUsd(usage)),
+            t("{0} remaining: {1}", periodLabel, formatUsdOrNa(view.remainingNum)),
+            t("Resets: {0}", resetLine),
+            ...(view.mode === "auto" && info.is_free_tier ? [t("Free tier: yes")] : []),
             // Hard breaks (two trailing spaces) — the status-bar hover markdown
             // renderer collapses soft newlines, so a bare "\n" would join lines.
         ].join("  \n"),

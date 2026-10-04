@@ -1,3 +1,5 @@
+import { t } from './i18n';
+
 export interface PricingOverride {
     min_prompt_tokens?: number;
     prompt?: string;
@@ -106,11 +108,11 @@ function effortProperty(
         properties: {
             reasoningEffort: {
                 type: 'string',
-                title,
+                title: t(title),
                 enum: efforts,
                 enumItemLabels: labels.map((effort) => effortLabel(effort)),
                 enumDescriptions: efforts.map(
-                    (effort) => EFFORT_DESCRIPTIONS[effort] ?? 'Reasoning effort level'
+                    (effort) => t(EFFORT_DESCRIPTIONS[effort] ?? 'Reasoning effort level')
                 ),
                 default: defaultValue,
                 group: 'navigation',
@@ -171,10 +173,10 @@ export function buildReasoningSchema(
         properties: {
             reasoningEnabled: {
                 type: 'string',
-                title: 'Reasoning',
+                title: t('Reasoning'),
                 enum: ['none', 'enabled'],
-                enumItemLabels: ['None', 'Enabled'],
-                enumDescriptions: ['No reasoning', 'Reasoning at the default level'],
+                enumItemLabels: [t('None'), t('Enabled')],
+                enumDescriptions: [t('No reasoning'), t('Reasoning at the default level')],
                 default: reasoning.default_enabled === false ? 'none' : 'enabled',
                 group: 'navigation',
             },
@@ -314,13 +316,13 @@ export function sizeAdvisory(promptTokens: number): SizeAdvisory | undefined {
     if (promptTokens < 64_000) {
         return {
             icon: STOP_ICON,
-            text: 'Too small \u2014 the system prompt and tool definitions alone can exceed this.',
+            text: t('Too small \u2014 the system prompt and tool definitions alone can exceed this.'),
         };
     }
     if (promptTokens <= 128_000) {
         return {
             icon: WARN_ICON,
-            text: 'Tight \u2014 some models need more than 128K with reasoning or agent mode.',
+            text: t('Tight \u2014 some models need more than 128K with reasoning or agent mode.'),
         };
     }
     return undefined;
@@ -342,7 +344,7 @@ export function formatSize(n: number): string {
 
 /** The note under a comfortable Context size entry, mirroring Copilot's native wording. */
 function contextSizeNote(value: string, defaultValue: string): string {
-    return value === defaultValue ? 'Default recommended context size' : 'Longer sessions';
+    return value === defaultValue ? t('Default recommended context size') : t('Longer sessions');
 }
 
 /**
@@ -477,7 +479,7 @@ const EFFORT_LABELS: Record<string, string> = {
 };
 
 function effortLabel(effort: string): string {
-    return EFFORT_LABELS[effort] ?? effort.charAt(0).toUpperCase() + effort.slice(1);
+    return t(EFFORT_LABELS[effort] ?? effort.charAt(0).toUpperCase() + effort.slice(1));
 }
 
 /** `Default/Effort/List` with the default bolded; optional models list None first. */
@@ -492,7 +494,7 @@ function renderEffortList(
         ? ['none', ...efforts.filter((e) => e !== 'none')]
         : efforts;
     const rendered = ordered.map((e) => (e === chosen ? `**${effortLabel(e)}**` : effortLabel(e))).join('/');
-    return `${rendered}${mandatory ? ' (required)' : ''}`;
+    return `${rendered}${mandatory ? t(' (required)') : ''}`;
 }
 
 /** One-line reasoning summary, e.g. `None/Low/Medium/High` with the default bolded. */
@@ -512,7 +514,7 @@ function reasoningSummary(reasoning: ModelReasoning): string {
         return renderEffortList(efforts, reasoning.default_effort, mandatory, fallback);
     }
     if (reasoning.mandatory) {
-        return 'required';
+        return t('required');
     }
     if (reasoning.default_effort) {
         return `**${effortLabel(reasoning.default_effort)}**`;
@@ -535,9 +537,16 @@ function tick(available: boolean): string {
 function capabilityLines(m: ModelCatalogEntry): string[] {
     const input = m.architecture?.input_modalities ?? [];
     const output = m.architecture?.output_modalities ?? [];
-    const lines = [`Tools: ${tick(supportsToolCalling(m))}`];
+    const lines = [t('Tools: {0}', tick(supportsToolCalling(m)))];
     for (const [label, modality] of MEDIA_MODALITIES) {
-        lines.push(`${label}: input ${tick(input.includes(modality))} / output ${tick(output.includes(modality))}`);
+        lines.push(
+            t(
+                '{0}: input {1} / output {2}',
+                t(label),
+                tick(input.includes(modality)),
+                tick(output.includes(modality))
+            )
+        );
     }
     return lines;
 }
@@ -562,7 +571,7 @@ interface PriceColumn extends PriceRow {
 function priceColumns(m: ModelCatalogEntry, base: PriceRow): PriceColumn[] {
     const tiers = longContextTiers(m);
     if (tiers.length === 0) {
-        return [{ header: '$Mtok', ...base }];
+        return [{ header: t('$Mtok'), ...base }];
     }
     const columns: PriceColumn[] = [{ header: `\u2264${formatSize(tiers[0].threshold)}`, ...base }];
     tiers.forEach((tier, index) => {
@@ -590,13 +599,13 @@ function pricingTableMarkdown(columns: PriceColumn[]): string {
         [T_THINK, 'Thinking', (c) => c.pThink],
         [T_OUT, 'Output', (c) => c.pOut],
     ];
-    const header = `| % | Type | ${columns.map((c) => c.header).join(' | ')} |`;
+    const header = `| ${t('%')} | ${t('Type')} | ${columns.map((c) => c.header).join(' | ')} |`;
     const divider = `| --- | --- | ${columns.map(() => '---').join(' | ')} |`;
     const body = rows.map(
-        ([ratio, label, pick]) => `| ${ratio} | ${label} | ${columns.map((c) => formatPerM(pick(c))).join(' | ')} |`
+        ([ratio, label, pick]) => `| ${ratio} | ${t(label)} | ${columns.map((c) => formatPerM(pick(c))).join(' | ')} |`
     );
     const totalWeight = rows.reduce((sum, [ratio]) => sum + ratio, 0);
-    const total = `| **${totalWeight}** | **Blended** | ${columns
+    const total = `| **${totalWeight}** | **${t('Blended')}** | ${columns
         .map((c) => `**${formatPricePerM(blendedOf(c.pIn, c.pCw, c.pCr, c.pThink, c.pOut))}**`)
         .join(' | ')} |`;
     return [header, divider, ...body, total].join('\n');
@@ -777,20 +786,25 @@ export function buildModelInfo(m: ModelCatalogEntry, opts: ContextBudgetOptions 
     if (hasPricing) {
         blocks.push(pricingTableMarkdown(priceColumns(m, basePrices)));
     } else {
-        blocks.push('Pricing: not listed by OpenRouter');
+        blocks.push(t('Pricing: not listed by OpenRouter'));
     }
     const infoLines: string[] = [];
     if (hasContextLength && contextWindow !== undefined) {
-        infoLines.push(`Context window: ${formatSize(contextWindow)}`);
+        infoLines.push(t('Context window: {0}', formatSize(contextWindow)));
     }
     infoLines.push(
-        `Effective prompt cap: ${hasContextLength ? formatSize(maxInputTokens) : `not listed (assuming ${formatSize(maxInputTokens)})`}`
+        t(
+            'Effective prompt cap: {0}',
+            hasContextLength
+                ? formatSize(maxInputTokens)
+                : t('not listed (assuming {0})', formatSize(maxInputTokens))
+        )
     );
-    infoLines.push(`Effective completion cap: ${formatSize(maxOutputTokens)}`);
-    infoLines.push(`Max completion: ${listedCap !== undefined ? formatSize(listedCap) : 'not listed'}`);
+    infoLines.push(t('Effective completion cap: {0}', formatSize(maxOutputTokens)));
+    infoLines.push(t('Max completion: {0}', listedCap !== undefined ? formatSize(listedCap) : t('not listed')));
     infoLines.push(...capabilityLines(m));
     if (m.reasoning) {
-        infoLines.push(`Reasoning: ${reasoningSummary(m.reasoning)}`);
+        infoLines.push(t('Reasoning: {0}', reasoningSummary(m.reasoning)));
     }
     blocks.push(infoLines.join('\n\n'));
 
@@ -801,7 +815,7 @@ export function buildModelInfo(m: ModelCatalogEntry, opts: ContextBudgetOptions 
     const cappedToBase = tier !== undefined && maxInputTokens <= tier.threshold && maxInputTokens < uncappedBudget;
 
     const detail = hasPricing
-        ? `~${formatPricePerM(pAvgM)}/1M${cappedToBase && tier ? ` \u00b7 \u2264${formatSize(maxInputTokens)}` : ''}`
+        ? `${t('~{0}/1M', formatPricePerM(pAvgM))}${cappedToBase && tier ? ` \u00b7 \u2264${formatSize(maxInputTokens)}` : ''}`
         : undefined;
 
     return { detail, tooltip: blocks.join('\n\n'), maxInputTokens, maxOutputTokens };

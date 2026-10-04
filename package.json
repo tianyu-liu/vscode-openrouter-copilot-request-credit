@@ -1,8 +1,9 @@
 {
   "name": "openrouter-copilot-request-credit",
-  "displayName": "OpenRouter for Copilot with Custom Request & Credit Check",
-  "description": "OpenRouter provider for Copilot Chat with one control panel: paste a request body from the OpenRouter Request Builder and every chat request follows it, while the status bar tracks your key's credit usage.",
-  "version": "0.4.0",
+  "displayName": "%displayName%",
+  "description": "%description%",
+  "l10n": "./l10n",
+  "version": "0.4.1",
   "publisher": "tianyu-liu",
   "license": "MIT",
   "repository": {
@@ -45,27 +46,27 @@
     "commands": [
       {
         "command": "openrouterCopilot.manage",
-        "title": "OpenRouter: Manage provider"
+        "title": "%command.manage.title%"
       },
       {
         "command": "openrouterCopilot.pasteTemplate",
-        "title": "OpenRouter: Paste custom request"
+        "title": "%command.pasteTemplate.title%"
       },
       {
         "command": "openrouterCopilot.clearTemplate",
-        "title": "OpenRouter: Clear custom request"
+        "title": "%command.clearTemplate.title%"
       }
     ],
     "configuration": [
       {
-        "title": "OpenRouter for Copilot",
+        "title": "%config.title%",
         "properties": {
           "openrouterCopilot.creditLimit": {
             "type": "number",
             "default": 0,
             "minimum": 0,
             "scope": "application",
-            "description": "Set the local spending limit in USD. Zero disables this limit and shows the account balance; it does not change OpenRouter's server-side guardrail. Workspace overrides are ignored."
+            "description": "%config.creditLimit.description%"
           },
           "openrouterCopilot.creditResetPeriod": {
             "type": "string",
@@ -77,13 +78,13 @@
             ],
             "default": "daily",
             "scope": "application",
-            "description": "Choose when the local spending limit resets: daily, weekly, monthly, or never. Workspace overrides are ignored."
+            "description": "%config.creditResetPeriod.description%"
           },
           "openrouterCopilot.creditIncludeByok": {
             "type": "boolean",
             "default": true,
             "scope": "application",
-            "description": "Include bring-your-own-key (BYOK) usage in the displayed usage and local spending-limit calculation. Workspace overrides are ignored."
+            "description": "%config.creditIncludeByok.description%"
           },
           "openrouterCopilot.creditRefreshIntervalMinutes": {
             "type": "number",
@@ -91,19 +92,19 @@
             "minimum": 1,
             "maximum": 1440,
             "scope": "application",
-            "description": "Set how often usage and credit data refresh, in minutes (1-1440). Workspace overrides are ignored."
+            "description": "%config.creditRefreshIntervalMinutes.description%"
           },
           "openrouterCopilot.sanitizeBase64Content": {
             "type": "boolean",
             "default": true,
             "scope": "application",
-            "description": "Remove long base64-like strings from request text (messages, reasoning, tool-call arguments) before sending. Image attachments are unchanged. Workspace overrides are ignored."
+            "description": "%config.sanitizeBase64Content.description%"
           },
           "openrouterCopilot.hideUnavailableModels": {
             "type": "boolean",
             "default": true,
             "scope": "application",
-            "description": "Query the account's available models and hide models this key cannot use from the model picker. Falls back to the full catalog when the query fails. Workspace overrides are ignored."
+            "description": "%config.hideUnavailableModels.description%"
           },
           "openrouterCopilot.outputReservePercent": {
             "type": "number",
@@ -111,21 +112,21 @@
             "minimum": 1,
             "maximum": 50,
             "scope": "application",
-            "description": "Output reserve target as a share of the context window, in percent. The reserve is held back for the reply when OpenRouter's published max-completion cap is a synthetic placeholder or absent. 12.5% reserves ~131K on a 1M-token window. Bounded by the lower/upper token limits. Workspace overrides are ignored."
+            "description": "%config.outputReservePercent.description%"
           },
           "openrouterCopilot.outputReserveMinTokens": {
             "type": "number",
             "default": 16384,
             "minimum": 1,
             "scope": "application",
-            "description": "Lower bound on the output reserve, in tokens, applied to the ratio (default 16384, 16.384K), so tiny context windows still hold back a sane reply budget. A real published cap is never inflated up to this bound. Workspace overrides are ignored."
+            "description": "%config.outputReserveMinTokens.description%"
           },
           "openrouterCopilot.outputReserveMaxTokens": {
             "type": "number",
             "default": 262144,
             "minimum": 1,
             "scope": "application",
-            "description": "Upper bound on the output reserve, in tokens (default 262144, 262.144K), so huge context windows do not reserve an absurd share while a current-generation model's real output cap is still honored. A real published cap is capped at this bound. Set both limits equal for a fixed reserve. Workspace overrides are ignored."
+            "description": "%config.outputReserveMaxTokens.description%"
           }
         }
       }

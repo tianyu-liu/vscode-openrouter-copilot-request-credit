@@ -1,5 +1,7 @@
 # OpenRouter for Copilot with Custom Request & Credit Check
 
+**English** | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
+
 A VS Code extension that registers a **customizable OpenRouter provider** in Copilot Chat. Copilot's built-in OpenRouter provider cannot send OpenRouter's `provider` routing object or a `session_id` (microsoft/vscode#283201; microsoft/vscode-copilot-release#11420). This extension calls OpenRouter directly instead of through Copilot's CAPI proxy, so every Chat request can carry whatever request-body options you paste — and it tracks your key's credit usage while you work.
 
 ## What it does

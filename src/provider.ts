@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { t } from './i18n';
 import { clearStoredKey, readKey, storeKey } from './storage';
 import {
     ASSUMED_CONTEXT_TOKENS,
@@ -127,7 +128,7 @@ export function sanitizeBase64Text(text: string): { text: string; removed: numbe
     let removed = 0;
     const out = text.replace(BASE64_RUN_REGEX, (match) => {
         removed += match.length;
-        return `[base64 content removed: ${match.length} chars]`;
+        return t('[base64 content removed: {0} chars]', match.length);
     });
     return { text: out, removed };
 }
@@ -754,7 +755,7 @@ export function cacheSharePercent(bucket: { promptTokens: number; cachedTokens: 
 /** Share of a bucket's prompt tokens served from cache, e.g. `82.3% cached`. */
 export function cacheShareText(bucket: { promptTokens: number; cachedTokens: number }): string | undefined {
     const percent = cacheSharePercent(bucket);
-    return percent ? `${percent} cached` : undefined;
+    return percent ? t('{0} cached', percent) : undefined;
 }
 
 /** `cacheShareText` with its inline separator, e.g. ` · 82.3% cached`; empty
@@ -781,9 +782,10 @@ export interface CostRouteCells {
 }
 
 export function routeCostCells(route: CostRoute): CostRouteCells {
+    const providerName = route.provider === 'unknown' ? t('unknown') : route.provider;
     return {
         cost: formatUsdPrecise(route.paid),
-        provider: route.byok ? `${route.provider} (BYOK)` : route.provider,
+        provider: route.byok ? t('{0} (BYOK)', providerName) : providerName,
         model: route.model || undefined,
         calls: String(route.calls),
         cached: cacheSharePercent(route),
@@ -833,7 +835,7 @@ export function retryBaseDelayMs(attempt: number): number {
 function assertSecureResponse(response: Response): void {
     const finalUrl = typeof response.url === 'string' ? response.url : '';
     if (finalUrl !== '' && !/^https:/i.test(finalUrl)) {
-        throw new Error(`OpenRouter: blocked insecure redirect to ${finalUrl}.`);
+        throw new Error(t('OpenRouter: blocked insecure redirect to {0}.', finalUrl));
     }
 }
 
@@ -924,16 +926,16 @@ export function mapResponseError(status: number, body: string, generationId?: st
     const snippet = body.trim().slice(0, 200);
     let message: string;
     if (status === 401) {
-        message = 'OpenRouter rejected your API key (401): it is invalid or expired. Paste a fresh key in the OpenRouter panel.';
+        message = t('OpenRouter rejected your API key (401): it is invalid or expired. Paste a fresh key in the OpenRouter panel.');
     } else if (status === 402) {
-        message = 'OpenRouter: not enough credits (402). Check your balance in the status bar or the usage dashboard.';
+        message = t('OpenRouter: not enough credits (402). Check your balance in the status bar or the usage dashboard.');
     } else if (status === 429) {
-        message = 'OpenRouter: rate limited (429) after retries. Try again in a moment.';
+        message = t('OpenRouter: rate limited (429) after retries. Try again in a moment.');
     } else {
-        message = `OpenRouter request failed (${status}): ${snippet || 'no error body'}`;
+        message = t('OpenRouter request failed ({0}): {1}', status, snippet || t('no error body'));
     }
     if (generationId) {
-        message += ` [generation ${generationId}]`;
+        message += t(' [generation {0}]', generationId);
     }
     if (status === 401) {
         return vscode.LanguageModelError.NoPermissions(message);
@@ -951,21 +953,23 @@ export function mapStreamedError(json: unknown, generationId?: string): Error | 
     }
     const e = raw as { message?: unknown; code?: unknown; metadata?: { provider_name?: unknown } };
     const message =
-        typeof e.message === 'string' && e.message.trim() !== '' ? e.message.trim().slice(0, 200) : 'unknown stream error';
+        typeof e.message === 'string' && e.message.trim() !== ''
+            ? e.message.trim().slice(0, 200)
+            : t('unknown stream error');
     const code = typeof e.code === 'string' || typeof e.code === 'number' ? String(e.code) : undefined;
     const providerName =
         typeof e.metadata === 'object' && e.metadata !== null && typeof e.metadata.provider_name === 'string'
             ? e.metadata.provider_name
             : undefined;
-    let text = `OpenRouter stream error: ${message}`;
+    let text = t('OpenRouter stream error: {0}', message);
     if (code) {
-        text += ` (code: ${code})`;
+        text += t(' (code: {0})', code);
     }
     if (providerName) {
-        text += ` [provider: ${providerName}]`;
+        text += t(' [provider: {0}]', providerName);
     }
     if (generationId) {
-        text += ` [generation ${generationId}]`;
+        text += t(' [generation {0}]', generationId);
     }
     const codeText = (code ?? '').toLowerCase();
     if (codeText.includes('auth') || codeText.includes('permission') || codeText.includes('key')) {
@@ -1316,10 +1320,10 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         try {
             parsed = JSON.parse(cleaned);
         } catch {
-            return { ok: false, error: 'The pasted text is not valid JSON.' };
+            return { ok: false, error: t('The pasted text is not valid JSON.') };
         }
         if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-            return { ok: false, error: 'The template must be a JSON object (a request body).' };
+            return { ok: false, error: t('The template must be a JSON object (a request body).') };
         }
         const body = parsed as Record<string, unknown>;
         const { messages, prompt, model, tools, stream, session_id, ...params } = body;
@@ -1354,7 +1358,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             return undefined;
         }
         const value = await vscode.window.showInputBox({
-            prompt: 'Paste your OpenRouter key (sk-or-...)',
+            prompt: t('Paste your OpenRouter key (sk-or-...)'),
             password: true,
             ignoreFocusOut: true,
         });
@@ -1576,7 +1580,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         const key = await this.getKey(true);
         if (!key) {
             throw vscode.LanguageModelError.NoPermissions(
-                'OpenRouter key not configured. Run "OpenRouter: Manage provider".'
+                t('OpenRouter key not configured. Run "OpenRouter: Manage provider".')
             );
         }
 
@@ -1686,7 +1690,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
                 const cleaned = sanitizeRequestBody(body);
                 if (cleaned.removed > 0) {
                     await response.body?.cancel();
-                    trackedProgress.report(new vscode.LanguageModelTextPart(GUARDRAIL_RETRY_NOTICE));
+                    trackedProgress.report(new vscode.LanguageModelTextPart(t(GUARDRAIL_RETRY_NOTICE)));
                     response = await fetchWithRetry(
                         `${OPENROUTER_API_BASE_URL}/chat/completions`,
                         init(cleaned.body),
@@ -1697,7 +1701,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             clearTimeout(timeoutId);
             await throwIfNotOk(response);
             if (!response.body) {
-                throw new Error('OpenRouter returned no response body.');
+                throw new Error(t('OpenRouter returned no response body.'));
             }
 
             const generationId = response.headers.get('x-generation-id') ?? undefined;
@@ -1736,7 +1740,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
                 }
                 const chunk = await readChunk();
                 if (stallExpired) {
-                    throw new Error(`OpenRouter stopped sending data after ${postTimeoutMs / 1000} seconds.`);
+                    throw new Error(t('OpenRouter stopped sending data after {0} seconds.', postTimeoutMs / 1000));
                 }
                 if (chunk.done) {
                     finishTurn();
@@ -1744,7 +1748,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
                 }
                 buffer += decoder.decode(chunk.value, { stream: true });
                 if (buffer.length > MAX_SSE_BUFFER_CHARS) {
-                    throw new Error('OpenRouter: oversized SSE line in the stream response.');
+                    throw new Error(t('OpenRouter: oversized SSE line in the stream response.'));
                 }
                 let newline: number;
                 while ((newline = buffer.indexOf('\n')) >= 0) {
@@ -1765,10 +1769,10 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
                     try {
                         json = JSON.parse(data);
                     } catch {
-                        throw new Error('OpenRouter: malformed SSE data line in the stream response.');
+                        throw new Error(t('OpenRouter: malformed SSE data line in the stream response.'));
                     }
                     if (json.error !== undefined) {
-                        throw mapStreamedError(json, generationId) ?? new Error('OpenRouter stream error.');
+                        throw mapStreamedError(json, generationId) ?? new Error(t('OpenRouter stream error.'));
                     }
                     if (typeof json.provider === 'string' && json.provider.trim() !== '') {
                         provider = json.provider;
@@ -1801,8 +1805,8 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             if (controller.signal.aborted && !token.isCancellationRequested) {
                 throw new Error(
                     stallExpired
-                        ? `OpenRouter stopped sending data after ${postTimeoutMs / 1000} seconds.`
-                        : `OpenRouter did not respond within ${postTimeoutMs / 1000} seconds.`
+                        ? t('OpenRouter stopped sending data after {0} seconds.', postTimeoutMs / 1000)
+                        : t('OpenRouter did not respond within {0} seconds.', postTimeoutMs / 1000)
                 );
             }
             throw err;
@@ -1846,10 +1850,10 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             try {
                 json = (await response.json()) as { data?: unknown };
             } catch {
-                throw new Error('OpenRouter /models returned an unexpected (non-JSON) response body.');
+                throw new Error(t('OpenRouter /models returned an unexpected (non-JSON) response body.'));
             }
             if (!Array.isArray(json.data)) {
-                throw new Error('OpenRouter /models returned an unexpected response body (missing the data array).');
+                throw new Error(t('OpenRouter /models returned an unexpected response body (missing the data array).'));
             }
             return json.data as ModelCatalogEntry[];
         } finally {
@@ -2022,10 +2026,10 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         const base = this.resolvePresetBase(preset.model, models);
         const baseInfo = base ? buildModelInfo(base, this.contextBudgetFor(base.id)) : undefined;
         const tooltip = [
-            `**Preset: ${preset.name}**`,
-            `\`${id}\` → \`${preset.model}\` with the preset's pinned provider routing.`,
-            'The extension adds no default provider routing; a pasted `provider` still overrides the preset.',
-            baseInfo?.tooltip ?? 'The preset\u2019s model is not in the public catalog; token limits are assumed defaults.',
+            t('**Preset: {0}**', preset.name),
+            t('`{0}` → `{1}` with the preset\u2019s pinned provider routing.', id, preset.model),
+            t('The extension adds no default provider routing; a pasted `provider` still overrides the preset.'),
+            baseInfo?.tooltip ?? t('The preset\u2019s model is not in the public catalog; token limits are assumed defaults.'),
         ].join('\n\n');
         const info: ChatModelInfo = {
             id,
@@ -2034,7 +2038,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             version: id,
             maxInputTokens: baseInfo?.maxInputTokens ?? ASSUMED_CONTEXT_TOKENS,
             maxOutputTokens: baseInfo?.maxOutputTokens ?? outputReservePolicy().maxTokens,
-            detail: baseInfo?.detail ? `preset · ${baseInfo.detail}` : 'preset',
+            detail: baseInfo?.detail ? t('preset \u00b7 {0}', baseInfo.detail) : t('preset'),
             tooltip,
             capabilities: {
                 toolCalling: base ? supportsToolCalling(base) : true,
@@ -2234,7 +2238,7 @@ export function finishStream(
         return;
     }
     if (state.sawReasoning) {
-        throw new Error(REASONING_ONLY_ERROR);
+        throw new Error(t(REASONING_ONLY_ERROR));
     }
     progress.report(new vscode.LanguageModelTextPart(EMPTY_RESPONSE_FALLBACK));
 }
