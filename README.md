@@ -2,11 +2,11 @@
 
 **English** | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
 
-A VS Code extension that registers a **customizable OpenRouter provider** in Copilot Chat. Copilot's built-in OpenRouter provider cannot send OpenRouter's `provider` routing object or a `session_id` (microsoft/vscode#283201; microsoft/vscode-copilot-release#11420). This extension calls OpenRouter directly instead of through Copilot's CAPI proxy, so every Chat request can carry whatever request-body options you paste — and it tracks your key's credit usage while you work.
+A VS Code extension for **named OpenRouter and OpenAI-compatible connections** in Copilot Chat. Each connection has its own key, endpoint, request JSON, model group, and usage history. OpenRouter connections also track credit and support routing and presets through direct API calls.
 
 ## What it does
 
-- **Model picker:** adds an "OpenRouter: RC" group to the Copilot Chat model picker with the OpenRouter catalog. By default it hides models your key cannot use (nothing else is model-restricted client-side).
+- **Model picker:** each connection appears as a named model group. The same upstream model can be selected independently through different connections. OpenRouter connections show the full catalog, hiding models the key cannot use by default.
 - **Paste-apply request:** paste a request body from the [OpenRouter Request Builder](https://openrouter.ai/request-builder); its settings — `provider` routing, sampling params, `response_format`, `plugins`, `transforms`, `cache_control`, etc. — apply verbatim to every request until you clear or replace it.
 - **Presets:** pick a preset from your OpenRouter account and its routing applies to every request; a preset that pins a model is also offered as an `@preset/<slug>` picker entry (only model-pinned presets get picker entries; configurations are resolved for up to 25 presets per picker query).
 - **Hide models this key cannot use** (on by default): the model picker drops models the account cannot reach, using the account's own available-model list. Turn it off to show the whole catalog.
@@ -19,11 +19,17 @@ A VS Code extension that registers a **customizable OpenRouter provider** in Cop
 - **One OpenRouter session per chat:** the `session_id` is the chat's own persisted id, so turns stay grouped in one OpenRouter session (sticky routing + the Logs → Sessions view) even after a window reload (a full restart is expected by design but was not exercised). A new chat is a new OpenRouter session. Background/internal calls (sub-agents, and Copilot's own utility flows) join the chat that triggered them; when there is no such chat, no `session_id` is sent, so no stray session is created.
 - **Status bar:** shows credit remaining; the panel has a usage dashboard.
 
-Host-managed fields are always replaced: `model`, `messages`, and `tools` come from Copilot, `stream` is always `true`, and `session_id` is the extension's own per-chat id (keeps the prompt cache warm); a pasted `prompt` is dropped. Every other pasted field applies. Thinking effort/enabled come from the picker and overwrite only `reasoning.effort` / `reasoning.enabled`.
+Host-managed fields are always replaced: `model`, `messages`, and `tools` come from Copilot, `stream` is always `true`, and a pasted `prompt` is dropped. OpenRouter connections also manage `session_id`, caching, and the picker's reasoning options. Compatible endpoints receive the pasted request options without those automatic OpenRouter additions.
 
 ## The panel
 
-One webview, **"OpenRouter for Copilot"**, with three tabs: **Key Info**, **Session Spend**, and **Configurations**. Open it from the status bar item (OpenRouter icon and remaining credit) or the "OpenRouter: Manage provider" command. Context size for long-context-priced models is set in the model picker's **Context size** menu, not the panel.
+Open **OpenRouter for Copilot** from the status bar or the **OpenRouter: Manage provider** command.
+
+- **Settings → Keys:** add, name, enable, disable, or delete connections; set each endpoint and credential.
+- **Settings → shared settings:** output reserve, text sanitization, and usage refresh interval apply to all connections.
+- **Each named connection tab:** view its usage and session spend, set its budget/model visibility, and paste its request JSON or choose an OpenRouter preset.
+
+Panel selection controls editing and the status bar display. The model selected in Copilot determines which connection sends a request. Renaming a group may require selecting its model again.
 
 ## Install (from VSIX)
 
@@ -31,36 +37,36 @@ This extension is distributed as a VSIX only: it uses proposed VS Code APIs (`ch
 
 1. Build: `npm install && npm run package` → `openrouter-copilot-request-credit-<version>.vsix`.
 2. VS Code → Extensions → "…" → **Install from VSIX…** → select the file.
-3. Open the panel and paste your OpenRouter key (kept in your OS keychain).
-4. In Chat, pick a model from the **OpenRouter: RC** group and use it like any Copilot model.
+3. Open **Settings → Keys**, choose or add a connection, and set its credential (kept in VS Code SecretStorage).
+4. In Chat, pick a model from that connection's named group.
+
+Existing keys, request settings, context choices, and history migrate into one **OpenRouter** connection.
 
 ## Usage
 
 1. Build a request at [openrouter.ai/request-builder](https://openrouter.ai/request-builder) and copy the JSON body.
-2. Paste it into the **Custom Request** box, then select **Save request** (validated; errors are reported).
-3. Every subsequent Copilot Chat request follows it until you clear or replace it.
+2. Open the intended connection's tab, paste it into **Custom request**, then select **Save request**.
+3. Requests using that connection follow its saved settings until you clear or replace them.
+
+For an OpenAI-compatible endpoint, set its API base URL (for example `https://example.com/v1`). HTTPS is required except for loopback HTTP servers. Such connections support streaming Chat Completions; Responses-only APIs are not supported. Manual model IDs and optional context/capability metadata can fill gaps in `/models`. Missing prices are shown as unknown. To request token counts from a server that supports it, paste `"stream_options": {"include_usage": true}` into the request JSON. Gateway-specific allowance APIs are not supported yet.
 
 ## Settings
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `openrouterCopilot.creditLimit` | `0` | Local cap in USD (`0` disables it and shows the account-wide balance). |
-| `openrouterCopilot.creditResetPeriod` | `daily` | Guardrail reset cadence: `daily` / `weekly` / `monthly` / `never`. |
-| `openrouterCopilot.creditIncludeByok` | `true` | Count BYOK spend toward the guardrail. |
 | `openrouterCopilot.creditRefreshIntervalMinutes` | `5` | Usage refresh interval (1–1440 minutes). |
 | `openrouterCopilot.sanitizeBase64Content` | `true` | Strip long base64-like runs from request text (messages, reasoning, tool-call arguments; never image attachments) so an org guardrail does not block the request. |
-| `openrouterCopilot.hideUnavailableModels` | `true` | Hide models this key cannot use from the model picker. Falls back to the full catalog when the availability query fails. |
 | `openrouterCopilot.outputReservePercent` | `12.5` | Output reserve target as a share of the context window (%), used when OpenRouter publishes no real max-completion cap (1–50). |
 | `openrouterCopilot.outputReserveMinTokens` | `16384` | Lower bound for the output reserve in tokens: tiny windows still hold back a sane reply budget. |
 | `openrouterCopilot.outputReserveMaxTokens` | `262144` | Upper bound for the output reserve in tokens: a real published cap is capped here. Set both limits equal for a fixed reserve. |
 
-All nine settings are application-scoped: workspace settings cannot change these provider or usage preferences. Provider and credit requests use the fixed OpenRouter API endpoint.
+These shared settings are application-scoped; workspace settings cannot change them. Credit limits, reset periods, BYOK inclusion, and model visibility are now saved per connection in the panel. Their old VS Code settings are imported during migration and deprecated afterward. Direct OpenRouter connections always use OpenRouter's API; custom endpoints keep separate credentials.
 
 **Output reserve:** the reply budget held back from the context window. When OpenRouter publishes no real max-completion cap (or only a synthetic placeholder), the extension reserves `outputReservePercent` of the window, clamped between the lower and upper token limits; a real published cap is trusted and only capped at the upper limit. The rest of the window is reported to Copilot as the model's input budget.
 
 ## Session spend, in the panel
 
-The panel's **Session spend** section shows what each Copilot chat session has cost (persisted across window reloads). Each session is one collapsible row; expanding it shows a `Cost | Provider | Model | Calls | Cached` row per provider/model route.
+Each connection's **Session spend** section has its own history, persisted across reloads. Expanding a session shows provider/model routes. Compatible endpoints also show reported input/output tokens; missing cost is labeled unavailable, and mixed known/unknown cost stays visibly incomplete.
 
 - **One entry per chat session** (its OpenRouter `session_id`): newest first, newest expanded. Click to collapse/expand — implemented with `<details>`, so it needs no script.
 - **Named like Copilot names it:** a row is labelled with the Copilot chat title when VS Code has one (read locally from VS Code's own chat-session store — nothing is sent to OpenRouter), otherwise a short id; each row also shows the session's last-update time.

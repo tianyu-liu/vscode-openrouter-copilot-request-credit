@@ -2,14 +2,30 @@
 
 ## What is verified
 
-Build and tests: compiles (`tsc --strict`), the full test suite passes (`npm test` is the source of
-truth for the current count — **449** at the last run; it also passes on the Windows development host,
-and on a WSL host with `libnss3`/`libnspr4`/`libasound2t64` installed so the Electron test host
-launches), packages to a VSIX, API usage matches `node_modules/@types/vscode` plus the local
-structural types for the proposed fields, and the runtime `LanguageModelThinkingPart` class exists on the stable test host
-despite the proposed-API warning. The P10 usage-reporting and P11/P12 session-id and per-turn cost
-behavior were verified against the installed VS Code Copilot bundle (see [Provider internals](provider.md)) plus a
-stubbed-`vscode` Node harness for the stream loop.
+**0.5.0-test.2:** strict compilation passes, **504 integration tests** pass on the Linux client, and
+VSIX packaging succeeds. The suite covers migration/rotation/deletion failure recovery, connection
+routing and accounting, stale handles/caches, captured retry bodies, conservative generic metadata,
+unknown costs, native JSONC edits, and panel message/draft isolation. Tests stub fetch and credentials.
+Earlier Windows/WSL runs cover the prior baseline, not the new connection implementation.
+
+A normal isolated VS Code 1.143.1 host also exercised the production manifest and copied compiled
+modules using fake SecretStorage and fetch responses: Settings/named tabs, scoped key/template saves,
+native group rename, restart persistence, duplicate upstream models, and generic streaming through a
+real `vscode.lm` handle. The captured generic request used its intended URL/key/template and original
+upstream model ID, without automatic OpenRouter fields. The panel was also browser-reviewed, including
+a narrow viewport. See [native grouping evidence](native-model-groups.md) for the initial prototype and
+remaining picker/menu checks.
+
+Read-only live access was subsequently verified: management API authentication, strict-TLS gateway
+health/discovery, unauthenticated refusal, and both gateway allowance lane schemas. No inference calls
+or deployment changes were made. The [gateway contract](gateway-allowance.md) is available for the next
+milestone; its adapter remains unimplemented.
+
+The new multi-connection inference path has not been tested with live credentials or deployed from its
+packaged VSIX. API usage matches the installed types plus local
+structural fields; the runtime `LanguageModelThinkingPart` class exists despite the proposed-API warning.
+Earlier P10 usage-reporting and P11/P12 session/cost behavior was checked against the installed Copilot
+bundle (see [Provider internals](provider.md)) and a stubbed stream harness.
 
 **Live pilot, closed 2026-10-04** — Windows checkout, installed VSIX plus an `F5` dev host with a real
 key. Evidence was the request dump and the account API, deliberately not the extension's own numbers:

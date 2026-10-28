@@ -1,6 +1,17 @@
 # Multi-provider endpoint update plan
 
-Status: proposed; implementation has not started.
+Status: in progress for **0.5.0**. Current development build: **0.5.0-test.2**.
+
+Implemented: recoverable connection migration, multiple OpenRouter connections, generic streaming
+Chat Completions endpoints, connection-scoped model IDs/accounting, and the regrouped panel. The
+existing package/vendor identifiers are retained. The isolated grouping prototype remains available as
+`npm run test:groups`; see [native grouping verification](agent/native-model-groups.md).
+
+A normal isolated host also exercised the production panel, native groups, key rotation, per-connection
+template saves, rename, restart persistence, and generic inference through `vscode.lm`, with fake keys
+and stubbed fetch responses. Subsequent read-only checks verified real management access and gateway
+HTTPS health, discovery, and both allowance lanes. Live inference through the extension and the gateway
+allowance adapter remain pending; see [the located contract](agent/gateway-allowance.md).
 
 Use **named connections, each appearing as a separate Copilot model group**. Users can configure several
 OpenRouter keys, custom OpenAI-compatible endpoints, or both—for example, “Personal OpenRouter,”
@@ -18,6 +29,15 @@ do not infer support from a release number.
 Keep the existing extension vendor ID and package identifiers. Give every connection a permanent internal
 ID independent of its name. Verify how renaming affects VS Code’s saved model selection; preserve
 extension-owned preferences by connection ID.
+
+Prototype findings: configured groups work on the checked installed runtime. Native model identifiers
+include the group name, so rename retires previously acquired model handles even when the provider model
+ID stays constant. Native model-settings updates can select an existing same-vendor settings entry by
+provider model ID before resolving its group. Expose connection-scoped model IDs and retain the upstream
+ID separately. A normal isolated host verified preference durability across restart/rename, and its
+management UI rendered separate groups and completed a native rename. Do not promise preservation of
+native saved selection or pins across rename; verify those surfaces and the remaining menu actions in
+an isolated UI before completing the grouping gate.
 
 ## 2. Introduce a connection registry and safe migration
 
@@ -90,7 +110,12 @@ logic in [logic.ts](../src/logic.ts).
 
 ## 7. Extend the existing management panel
 
-Add a connection selector and Add/Edit/Disable/Delete actions to [panel.ts](../src/panel.ts).
+The panel now has **Settings** and one tab per named connection.
+
+- **Settings → Keys:** connection list, Add/Edit/Enable/Disable/Delete, API type/base URL, name, and key.
+- **Settings → shared settings:** output reserve, usage refresh frequency, and text sanitization.
+- **Connection tab:** key usage, session spend, local budget, model availability, presets/request JSON,
+  and manual model metadata for compatible endpoints.
 
 The selected connection controls its credentials, allowance display, and request configuration. Panel
 selection affects editing; the model selected in Copilot determines routing.
@@ -103,12 +128,16 @@ and documentation.
 
 Implement in this order:
 
-1. Grouping prototype.
-2. Registry and migration.
-3. Multiple OpenRouter connections.
-4. Generic endpoint adapter.
-5. Gateway allowance support.
-6. UI completion.
+1. Grouping prototype — implemented; saved picker selection/pins and full native menu checks remain.
+2. Registry and migration — implemented with failure-injection coverage.
+3. Multiple OpenRouter connections — implemented and exercised in the real client using fixtures.
+4. Generic endpoint adapter — implemented for streaming Chat Completions and manual metadata.
+5. Gateway allowance support — pending; [contract located](agent/gateway-allowance.md) and read-only
+   deployment access verified. Implement the adapter and lane semantics next.
+6. UI completion — shared/per-connection regrouping implemented, localized, and browser/client checked.
+
+Direct OpenRouter credit behavior is retained per connection. Effective inherited account budgets and
+gateway lane accounting still need their adapter/contract work; they are not inferred by summing limits.
 
 Regression coverage should include migration failures, duplicate model IDs, concurrent requests,
 credential rotation, stale refreshes, deletion, missing metadata, and connection-isolated accounting.

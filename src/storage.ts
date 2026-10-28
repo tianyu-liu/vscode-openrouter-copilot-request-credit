@@ -10,6 +10,10 @@ export function setSecretStorageForTesting(s: vscode.SecretStorage | undefined):
     overrideSecrets = s;
 }
 
+export function resolveSecretStorage(secrets: vscode.SecretStorage): vscode.SecretStorage {
+    return overrideSecrets ?? secrets;
+}
+
 const READ_TIMED_OUT = Symbol('secretReadTimedOut');
 
 type SecretRead = { value: string | undefined } | 'failed';

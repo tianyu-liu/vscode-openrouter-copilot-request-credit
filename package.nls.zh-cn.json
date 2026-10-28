@@ -13,5 +13,6 @@
   "config.hideUnavailableModels.description": "查询账户可用的模型，并在模型选择器中隐藏此密钥无法使用的模型。查询失败时回退到完整目录。工作区覆盖设置将被忽略。",
   "config.outputReservePercent.description": "输出预留目标占上下文窗口的百分比。当 OpenRouter 公布的最大补全上限为占位值或缺失时，会按此比例从窗口中为回复预留预算。在 100 万 token 的窗口上，12.5% 会预留约 131K。预留量受 token 下限与上限约束。工作区覆盖设置将被忽略。",
   "config.outputReserveMinTokens.description": "输出预留的下限（以 token 计），应用于按比例算出的预留量（默认 16384，即 16.384K），使极小的上下文窗口仍能保留合理的回复预算。真实公布的上限绝不会被抬高到该下限。工作区覆盖设置将被忽略。",
-  "config.outputReserveMaxTokens.description": "输出预留的上限（以 token 计，默认 262144，即 262.144K），使巨大的上下文窗口不会预留过大的比例，同时仍尊重当前一代模型的真实输出上限。真实公布的上限会被限制在此预留上限以内。将两个限制设为相等即可获得固定预留。工作区覆盖设置将被忽略。"
+  "config.outputReserveMaxTokens.description": "输出预留的上限（以 token 计，默认 262144，即 262.144K），使巨大的上下文窗口不会预留过大的比例，同时仍尊重当前一代模型的真实输出上限。真实公布的上限会被限制在此预留上限以内。将两个限制设为相等即可获得固定预留。工作区覆盖设置将被忽略。",
+  "config.connectionScoped.deprecation": "请在面板中每个连接对应的选项卡内管理此设置。仅在迁移到连接时导入现有值。"
 }

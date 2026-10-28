@@ -2,13 +2,26 @@
 
 ## Paste-apply semantics
 
+Each named connection owns its template. The selected panel tab chooses which template is edited;
+the model selected in Copilot chooses the connection used for a request. The router's public `rc:`
+model ID encodes connection and upstream IDs, while its version carries the connection revision.
+The upstream API receives the original model ID. At request start the child clones the template,
+captures its credential and endpoint, and verifies its revision; a later panel edit cannot reroute
+an operation already sending requests. Retries retain the same captured endpoint/key/body and use
+`redirect: 'error'`.
+
 - The pasted body's **`messages`/`prompt` fields are ignored** — Copilot supplies the live conversation and tools each turn; they are merged with the saved template.
-- The template applies to every request until cleared/replaced. Default when nothing is pasted: no `provider` object — OpenRouter's own routing applies and nothing is assumed.
+- The template applies to that connection's requests until cleared/replaced. With an empty template,
+  no `provider` object is added; direct OpenRouter uses its normal routing.
 - A template `provider` object is sent **verbatim**: no default is merged in and none is added, so routing comes entirely from the pasted `provider`. No separate setting exists (the former P7 floor and its merge are gone).
-- `reasoning.effort`/`reasoning.enabled` always come from the picker's Thinking Effort selector and are spread into the template's `reasoning` object — they overwrite only `effort`/`enabled`; other keys like `max_tokens`/`exclude` survive.
+- On direct OpenRouter, `reasoning.effort`/`reasoning.enabled` come from the picker's Thinking Effort selector and are spread into the template's `reasoning` object — they overwrite only `effort`/`enabled`; other keys like `max_tokens`/`exclude` survive.
 - Validate the pasted JSON before saving: bad input is rejected with a clear error, never partially applied.
 
 ## Reasoning passthrough (P1)
+
+The OpenRouter-specific echo/cache behavior below is retained for direct connections. Generic
+connections share thinking-stream conversion and echo existing traces, but omit the synthetic empty
+`reasoning_content` field and receive no automatic OpenRouter reasoning or cache configuration.
 
 DeepSeek V4 has thinking mode **on by default**, so every reply carries `reasoning_content`
 (OpenRouter treats it as an alias of `reasoning`). The echo rule is conditional: when a
@@ -36,7 +49,7 @@ These are not user-configurable; the escape hatch, where one exists, is the past
 The panel's short, context-specific notes are the user-facing version of this list.
 
 - `stream: true` on every request (the provider API is progress-callback based).
-- `session_id` = `copilot-chat:<Copilot chat-session id>` so OpenRouter sticky routing and
+- On direct OpenRouter, `session_id` = `copilot-chat:<Copilot chat-session id>` so sticky routing and
 the Sessions view follow the Copilot chat session, not the window (cache warmth + grouping;
 no content). With no known parent (an internal/utility call before any chat turn, or one long after
 the last) **no `session_id` is sent at all**, so no orphan OpenRouter session is ever created.
@@ -53,25 +66,34 @@ the last) **no `session_id` is sent at all**, so no orphan OpenRouter session is
 - No default `provider` object is ever added; a template `provider` passes through verbatim
   in every case, so routing is decided by the pasted `provider`, never by a built-in default
   (the former P7 floor is gone).
-- Reasoning effort/enabled from the picker, merged over the template's `reasoning`; a picker
+- Direct OpenRouter reasoning effort/enabled from the picker, merged over the template's `reasoning`; a picker
   effort of `none` is sent as `reasoning.enabled: false`.
-- Anthropic-family models (`anthropic/*`, `~anthropic/*`) get a top-level `cache_control`
+- On direct OpenRouter, Anthropic-family models (`anthropic/*`, `~anthropic/*`) get a top-level `cache_control`
   (5-min ephemeral, advancing) unless the template sets its own `cache_control` (P6).
-- Attribution headers `HTTP-Referer`/`X-Title` hardcoded, and sent only on `/chat/completions` (not on `/models`).
-- Endpoints are fixed to `https://openrouter.ai/api/v1`; there is no `baseUrl` setting.
-- Key in SecretStorage only, never settings.json.
-- Template applies to every request until cleared (the picker's model switch back to a
-  Copilot model is the per-turn escape).
-- Usage accounting needs no field: every Chat Completions stream ends with an automatic
-  `usage` chunk (P5) — nothing to paste or request.
-- That chunk is forwarded to Copilot as a `usage` data part on every completed turn (P10), which
+- Direct OpenRouter attribution headers `HTTP-Referer`/`X-Title` are hardcoded and sent only on
+  `/chat/completions`, not `/models`. Generic requests receive neither header.
+- Direct OpenRouter is fixed to `https://openrouter.ai/api/v1`. Generic connections use validated
+  API base URLs; HTTPS is required except for loopback HTTP, and redirect following is disabled.
+- Keys live in isolated per-connection SecretStorage slots, never settings.json.
+- A template applies until cleared/replaced for that connection. Choosing a different connection's
+  model in Copilot uses that connection's template and credential.
+- Direct OpenRouter automatically ends streams with a `usage` chunk (P5). Generic servers may require
+  an explicit pasted `"stream_options": {"include_usage": true}` or report no usage; the extension
+  does not add that field automatically.
+- A valid reported usage chunk is forwarded to Copilot as a `usage` data part on a completed turn (P10), which
   is what puts *used / max tokens* in the context-usage ring. The **Copilot response footer is not
   a supported cost surface** for an extension-contributed provider (see [the P10 correction](provider.md)), and
   cost is deliberately kept out of the chat transcript too — it is reported in the panel's
   **Session spend** section instead (P12), where the figure is OpenRouter's `cost`, or the upstream
-  cost on a BYOK route where OpenRouter charges nothing.
+  cost on a BYOK route where OpenRouter charges nothing. Generic connections also retain token-only
+  history; absent server cost is marked unavailable, and missing catalog pricing is unknown.
 
 ## Canonical request templates
+
+The routing/cache/preset examples below are for direct OpenRouter. Generic connections accept pasted
+Chat Completions fields supported by their server, including explicitly supplied vendor fields; the
+extension does not automatically add OpenRouter session/cache/reasoning options. Preset and credit
+controls are hidden there, and no `/presets`, `/models/user`, or OpenRouter credit request is made.
 
 - Default: the empty template `{}` (paste nothing) — no default `provider` is added,
   so OpenRouter's own routing applies; any pin (`order`, `only`, a `quantizations` floor, …)

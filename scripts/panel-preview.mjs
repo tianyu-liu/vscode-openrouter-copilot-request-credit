@@ -8,7 +8,7 @@
 // The server re-reads out/panel.js on every request and the page polls
 // /__mtime, so after a `tsc` rebuild (or `npm run watch`) a plain browser
 // refresh shows the new markup and styles. Data is a fixed, representative
-// fixture set covering all three tabs; edit buildFixtures() below to change it.
+// fixture set covering Settings and named connection tabs; edit buildFixtures() below to change it.
 //
 // The `vscode` module is stubbed (a recursive proxy) so out/panel.js can be
 // required in Node, the webview CSP is stripped, and a small theme shim
@@ -49,7 +49,7 @@ function anyValue() {
     });
 }
 
-const vscodeStub = new Proxy({}, { get: () => anyValue() });
+const vscodeStub = new Proxy({ env: { language: 'en' } }, { get: (target, key) => target[key] ?? anyValue() });
 
 CJS_MODULE._load = function (request, parent, isMain) {
     if (request === 'vscode') {
@@ -105,9 +105,17 @@ const LIVE_RELOAD_SCRIPT = `
 const HARNESS = `
 <script>
     window.acquireVsCodeApi = () => ({
-        getState: () => ({}),
-        setState: (s) => console.log('setState', s),
-        postMessage: (m) => console.log('postMessage', m),
+        getState: () => JSON.parse(sessionStorage.getItem('panelPreviewState') || '{}'),
+        setState: (s) => sessionStorage.setItem('panelPreviewState', JSON.stringify(s)),
+        postMessage: (m) => {
+            if (m.type === 'selectConnection') {
+                const url = new URL(location.href);
+                url.searchParams.set('connection', m.connectionId);
+                location.href = url;
+            } else if (m.type !== 'saveKey') {
+                console.log('Preview action', m);
+            }
+        },
     });
 </script>${LIVE_RELOAD_SCRIPT}`;
 
@@ -117,7 +125,18 @@ function injectPreviewHarness(html) {
         .replace('<head>', `<head>${THEME_SHIM}${HARNESS}`);
 }
 
-function buildFixtures() {
+function buildFixtures(selectedConnectionId = 'personal') {
+    const settings = { creditLimit: 10, creditResetPeriod: 'daily', creditIncludeByok: true,
+        hideUnavailableModels: true };
+    const connections = [
+        { id: 'personal', name: 'Personal', kind: 'openrouter', baseUrl: 'https://openrouter.ai/api/v1',
+            enabled: true, revision: 1, settings },
+        { id: 'work', name: 'Work', kind: 'openrouter', baseUrl: 'https://openrouter.ai/api/v1',
+            enabled: true, revision: 1, settings: { ...settings, creditLimit: 50 } },
+        { id: 'local', name: 'Local', kind: 'openai-compatible', baseUrl: 'http://localhost:1234/v1',
+            enabled: true, revision: 1, settings,
+            models: [{ id: 'local-model', name: 'Local model', contextLength: 32768, toolCalling: true }] },
+    ];
     const info = {
         label: 'sk-or-v1-preview',
         limit: null,
@@ -212,19 +231,29 @@ function buildFixtures() {
             updatedAt: 1759569800000,
         },
     ];
+    const localUsage = {
+        paid: 0, openRouter: 0, upstream: 0, costUnavailable: true,
+        promptTokens: 1536, completionTokens: 256, cachedTokens: 512, calls: 2,
+        byok: false, updatedAt: 1759569800000,
+    };
     return {
+        connections,
+        selectedConnectionId,
         info,
-        limit: 10,
+        limit: selectedConnectionId === 'work' ? 50 : 10,
         resetPeriod: 'daily',
         includeByok: true,
         refreshIntervalMinutes: 5,
         fetchedAt: new Date(1759570000000),
-        maskedKey: 'sk-or-v1-preview...1234',
+        maskedKey: selectedConnectionId === 'local' ? undefined : 'sk-or-v1-preview...1234',
         accountCredits,
-        template,
-        presets,
-        presetConfig,
-        sessions,
+        template: selectedConnectionId === 'local' ? { temperature: 0.2 } : template,
+        presets: selectedConnectionId === 'local' ? undefined : presets,
+        presetConfig: selectedConnectionId === 'local' ? undefined : presetConfig,
+        sessions: selectedConnectionId === 'local' ? [{
+            ...localUsage, sessionId: 'copilot-chat:local-preview', title: 'Local coding session',
+            routes: [{ ...localUsage, provider: 'Local', model: 'local-model' }],
+        }] : sessions,
         settings: {
             sanitizeBase64Content: true,
             hideUnavailableModels: true,
@@ -461,9 +490,9 @@ ${LIVE_RELOAD_SCRIPT}
 </html>`;
 }
 
-function renderHtml() {
+function renderHtml(selectedConnectionId) {
     const { renderPanelHtml } = freshRequire('panel.js');
-    return injectPreviewHarness(renderPanelHtml(buildFixtures()));
+    return injectPreviewHarness(renderPanelHtml(buildFixtures(selectedConnectionId)));
 }
 
 function outMtime() {
@@ -484,7 +513,7 @@ http.createServer((req, res) => {
         return;
     }
     try {
-        const html = url.pathname === '/model-info' ? renderModelInfoHtml() : renderHtml();
+        const html = url.pathname === '/model-info' ? renderModelInfoHtml() : renderHtml(url.searchParams.get('connection') || 'personal');
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
         res.end(html);
     } catch (error) {

@@ -3,7 +3,7 @@
   "displayName": "%displayName%",
   "description": "%description%",
   "l10n": "./l10n",
-  "version": "0.4.1",
+  "version": "0.5.0-test.2",
   "publisher": "tianyu-liu",
   "license": "MIT",
   "repository": {
@@ -56,7 +56,16 @@
       {
         "vendor": "openrouter-copilot-request-credit",
         "displayName": "OpenRouter: RC",
-        "managementCommand": "openrouterCopilot.manage"
+        "managementCommand": "openrouterCopilot.manage",
+        "configuration": {
+          "type": "object",
+          "properties": {
+            "connectionId": {
+              "type": "string"
+            }
+          },
+          "required": ["connectionId"]
+        }
       }
     ],
     "commands": [
@@ -78,6 +87,7 @@
         "title": "%config.title%",
         "properties": {
           "openrouterCopilot.creditLimit": {
+            "markdownDeprecationMessage": "%config.connectionScoped.deprecation%",
             "type": "number",
             "default": 0,
             "minimum": 0,
@@ -85,6 +95,7 @@
             "description": "%config.creditLimit.description%"
           },
           "openrouterCopilot.creditResetPeriod": {
+            "markdownDeprecationMessage": "%config.connectionScoped.deprecation%",
             "type": "string",
             "enum": [
               "daily",
@@ -97,6 +108,7 @@
             "description": "%config.creditResetPeriod.description%"
           },
           "openrouterCopilot.creditIncludeByok": {
+            "markdownDeprecationMessage": "%config.connectionScoped.deprecation%",
             "type": "boolean",
             "default": true,
             "scope": "application",
@@ -117,6 +129,7 @@
             "description": "%config.sanitizeBase64Content.description%"
           },
           "openrouterCopilot.hideUnavailableModels": {
+            "markdownDeprecationMessage": "%config.connectionScoped.deprecation%",
             "type": "boolean",
             "default": true,
             "scope": "application",
@@ -155,7 +168,8 @@
     "preview": "npm run compile && node scripts/panel-preview.mjs",
     "preview:serve": "node scripts/panel-preview.mjs",
     "package": "vsce package --no-dependencies",
-    "test": "npm run compile && node out/test/runTest.js"
+    "test": "npm run compile && node out/test/runTest.js",
+    "test:groups": "npm run compile && node out/test/runGroupingTest.js"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.6",

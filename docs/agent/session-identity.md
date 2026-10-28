@@ -1,13 +1,25 @@
 # Session identity (P11) — what survives a window reload
 
+Local accounting is scoped to permanent connection IDs. Each production child provider owns its
+ledger and last-active-parent state, persisted under `connections.<id>.sessionCosts` and
+`connections.<id>.parentSession`. The same Copilot chat can appear independently on two connections;
+a utility call can reuse only a parent seen on its own connection. Renaming keeps that state;
+deleting a connection removes it and blocks late callbacks from restoring it. Child replacement
+for a new revision retains the connection's live ledger, including in-flight usage.
+
+The wire `session_id` behavior below applies to **direct OpenRouter**. Generic OpenAI-compatible
+connections retain the same local chat/unattributed accounting rules but receive no automatic
+`session_id`; an explicitly pasted server-supported field is retained. The panel's selected
+connection affects editing/status display; Copilot's selected model determines the accounting route.
+
 VS Code persists a local chat session's data (its `sessionId`, the transcript, thinking parts and each
 response's token/credit usage) in the workspace's chat-session storage, so a reload or restart restores
 the same conversation **with the same id**. The Copilot extension threads that id to
 extension-contributed models as `options.modelOptions._conversationId` (the agent/tool-calling loop
 passes `conversation.sessionId` into `makeChatRequest2`, `ExtensionContributedChatEndpoint` puts it in
 `modelOptions`, and the extension host forwards `modelOptions` verbatim to
-`provideLanguageModelChatResponse`). The extension therefore sends `session_id` =
-`copilot-chat:<conversation id>`: **one OpenRouter session per Copilot chat session**, so sticky
+`provideLanguageModelChatResponse`). For direct OpenRouter, the extension therefore sends `session_id` =
+`copilot-chat:<conversation id>`: **one OpenRouter session per Copilot chat session on the selected connection**, so sticky
 routing and the Logs → Sessions view follow the chat, not the window, and cache warmth carries across
 a reload. `_conversationId` is an internal, underscore-prefixed key with no public constant — always
 read it defensively. Some internal calls do not pass it, and they fall in three families (see [P13](provider.md)
@@ -17,7 +29,7 @@ its turns join the parent's OpenRouter session exactly; the harness's **tool-sty
 (`execution_subagent` for the edit agent, `search_subagent`) and Copilot's **utility flows** (title
 generation, progress messages, the inline-chat intent pass, NES) pass the id only inside
 `telemetryProperties` and therefore have none — those are attributed to the **last active chat**
-instead (persisted to `globalState` under `parentSession` so it survives a reload, bounded by the
+instead (persisted in that connection's scoped state under `parentSession` so it survives a reload, bounded by the
 10-minute `PARENT_ATTRIBUTION_WINDOW_MS`); and an **agent-host / SDK client-BYOK session** ([§Harness
 boundary](harness-boundary.md)) never comes through the harness at all, so it is never attributed to a chat — its spend
 appears in the panel's **Unattributed** entry (**P12b**) instead. For a call with no parent known

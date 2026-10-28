@@ -1,0 +1,7 @@
+{
+  "workbench.colorCustomizations": {
+    "titleBar.activeBackground": "#4d003c",
+    "titleBar.inactiveBackground": "#4d003c9c"
+  },
+  "chat.permissions.default": "autoApprove"
+}

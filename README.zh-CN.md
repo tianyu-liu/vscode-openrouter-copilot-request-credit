@@ -2,11 +2,11 @@
 
 # 适用于 Copilot 的 OpenRouter：自定义请求与额度检查
 
-这是一款 VS Code 扩展，可在 Copilot Chat 中注册**可自定义的 OpenRouter 提供程序**。Copilot 内置的 OpenRouter 提供程序无法发送 OpenRouter 的 `provider` 路由对象或 `session_id`（microsoft/vscode#283201；microsoft/vscode-copilot-release#11420）。本扩展不经 Copilot 的 CAPI 代理，而是直接调用 OpenRouter，因此你粘贴的任何请求体设置都会应用到每个 Chat 请求；扩展还会在使用期间跟踪你的密钥额度用量。
+这是一款 VS Code 扩展，可在 Copilot Chat 中使用**具名的 OpenRouter 和 OpenAI 兼容连接**。每个连接分别管理自己的密钥、端点、请求 JSON、模型组和用量历史。OpenRouter 连接通过直接 API 调用跟踪额度，并支持路由和预设。
 
 ## 功能
 
-- **模型选择器：** 在 Copilot Chat 模型选择器中添加一个 “OpenRouter: RC” 分组，包含 OpenRouter 目录。默认情况下会隐藏你的密钥无法使用的模型（除此之外，客户端不限制任何模型）。
+- **模型选择器：** 每个连接都会显示为一个具名模型组。同一个上游模型也可以通过不同连接独立选择。OpenRouter 连接会显示完整目录，默认隐藏密钥无法使用的模型。
 - **粘贴即应用请求：** 粘贴来自 [OpenRouter Request Builder](https://openrouter.ai/request-builder) 的请求体；其设置——`provider` 路由、采样参数、`response_format`、`plugins`、`transforms`、`cache_control` 等——会原样应用到每个请求，直到你清除或替换它。
 - **预设：** 从你的 OpenRouter 账户中选择一个预设，其路由会应用到每个请求；指定了固定模型的预设还会以 `@preset/<slug>` 条目出现在选择器中（只有固定模型的预设会获得选择器条目；每次选择器查询最多会为 25 个预设解析配置）。
 - **隐藏此密钥无法使用的模型**（默认开启）：模型选择器会使用账户自身的可用模型列表，剔除账户无法访问的模型。关闭后会显示完整目录。
@@ -19,11 +19,17 @@
 - **每个聊天一个 OpenRouter 会话：** `session_id` 是聊天自身持久化的 id，因此即使在窗口重新加载后，各轮仍会归属于同一个 OpenRouter 会话（粘性路由 + Logs → Sessions 视图；按设计，完整重启后也应保留，但尚未验证）。新聊天是新的 OpenRouter 会话。后台/内部调用（子代理以及 Copilot 自身的辅助流程）会并入触发它们的聊天；当不存在这样的聊天时，不发送 `session_id`，因此不会创建多余的会话。
 - **状态栏：** 显示剩余额度；面板中有用量仪表板。
 
-由宿主管理的字段始终会被替换：`model`、`messages` 和 `tools` 来自 Copilot，`stream` 始终为 `true`，`session_id` 是扩展自身按聊天生成的 id（让提示缓存持续发挥作用）；粘贴的 `prompt` 会被丢弃。其他每个粘贴的字段都会生效。思考强度/启用状态来自选择器，且只覆盖 `reasoning.effort` / `reasoning.enabled`。
+由宿主管理的字段始终会被替换：`model`、`messages` 和 `tools` 来自 Copilot，`stream` 始终为 `true`，粘贴的 `prompt` 会被丢弃。OpenRouter 连接还会管理 `session_id`、缓存和选择器中的推理选项。兼容端点会接收粘贴的请求选项，但不会附加这些自动生成的 OpenRouter 专用字段。
 
 ## 面板
 
-这是一个名为“适用于 Copilot 的 OpenRouter”的 Webview，包含三个标签页：**密钥信息**、**会话支出**和**配置**。可从状态栏项（OpenRouter 图标和剩余额度）或“OpenRouter：管理提供程序”命令打开。对于有长上下文价格阶梯的模型，其上下文大小在模型选择器的 **Context size** 菜单中设置，而不是在面板中。
+从状态栏或 **“OpenRouter：管理提供程序”** 命令打开 **“适用于 Copilot 的 OpenRouter”**。
+
+- **设置 → 密钥：** 添加、命名、启用、禁用或删除连接，并为每个连接设置端点和凭据。
+- **设置 → 共享设置：** 输出预留、文本清理和用量刷新间隔适用于所有连接。
+- **每个具名连接的标签页：** 查看其用量和会话支出，设置额度/模型可见性，并粘贴请求 JSON 或选择 OpenRouter 预设。
+
+面板中的选择决定编辑目标和状态栏显示。Copilot 中选定的模型决定请求使用哪个连接。重命名分组后，可能需要重新选择模型。
 
 ## 安装（从 VSIX）
 
@@ -31,36 +37,36 @@
 
 1. 构建：`npm install && npm run package` → `openrouter-copilot-request-credit-<version>.vsix`。
 2. VS Code → 扩展 → “…” → **从 VSIX 安装…** → 选择该文件。
-3. 打开面板并粘贴你的 OpenRouter 密钥（保存在操作系统的密钥链中）。
-4. 在 Chat 中，从 **OpenRouter: RC** 分组选择一个模型，即可像其他 Copilot 模型一样使用。
+3. 打开 **设置 → 密钥**，选择或添加连接并设置凭据（保存在 VS Code SecretStorage 中）。
+4. 在 Chat 中，从该连接的具名分组选择模型。
+
+现有密钥、请求设置、上下文选择和历史记录会在迁移时转入一个 **OpenRouter** 连接。
 
 ## 用法
 
 1. 在 [openrouter.ai/request-builder](https://openrouter.ai/request-builder) 构建一个请求并复制 JSON 请求体。
-2. 将其粘贴到**自定义请求**框中，然后选择**保存请求**（会进行校验并报告错误）。
-3. 之后每个 Copilot Chat 请求都会遵循它，直到你清除或替换它。
+2. 打开目标连接的标签页，将其粘贴到**自定义请求**，然后选择**保存请求**。
+3. 使用该连接的请求会遵循已保存设置，直到你清除或替换它。
+
+对于 OpenAI 兼容端点，请设置 API 基础 URL（例如 `https://example.com/v1`）。除环回 HTTP 服务器外，必须使用 HTTPS。支持流式 Chat Completions；不支持仅提供 Responses API 的服务。可用手动模型 ID 和可选的上下文/能力元数据补充 `/models` 中缺失的信息。没有价格信息时，成本会显示为未知。若服务器支持，可在请求 JSON 中粘贴 `"stream_options": {"include_usage": true}` 以请求 token 数量。暂不支持网关专用的额度查询 API。
 
 ## 设置
 
 | 设置 | 默认值 | 含义 |
 | --- | --- | --- |
-| `openrouterCopilot.creditLimit` | `0` | 以美元计的本地支出上限（`0` 禁用该上限并显示账户总余额）。 |
-| `openrouterCopilot.creditResetPeriod` | `daily` | 本地支出上限的重置周期：`daily` / `weekly` / `monthly` / `never`。 |
-| `openrouterCopilot.creditIncludeByok` | `true` | 将 BYOK 支出计入本地支出上限的计算。 |
 | `openrouterCopilot.creditRefreshIntervalMinutes` | `5` | 用量刷新间隔（1–1440 分钟）。 |
 | `openrouterCopilot.sanitizeBase64Content` | `true` | 从请求文本（消息、推理、工具调用参数；图片附件不受影响）中移除类似 base64 的长字符串，以免组织护栏阻止请求。 |
-| `openrouterCopilot.hideUnavailableModels` | `true` | 在模型选择器中隐藏此密钥无法使用的模型。可用性查询失败时回退到完整目录。 |
 | `openrouterCopilot.outputReservePercent` | `12.5` | 输出预留目标占上下文窗口的比例（%），在 OpenRouter 未公布真实的最大补全上限时使用（1–50）。 |
 | `openrouterCopilot.outputReserveMinTokens` | `16384` | 输出预留的下限（以 token 计）：极小的窗口仍能保留合理的回复预算。 |
 | `openrouterCopilot.outputReserveMaxTokens` | `262144` | 输出预留的上限（以 token 计）：真实公布的上限同样受此值限制。将两个限制设为相等即可获得固定预留。 |
 
-所有九个设置都是应用级设置：工作区设置无法更改这些提供程序或用量偏好。提供程序相关请求和额度查询均发送到固定的 OpenRouter API 端点。
+这些共享设置均为应用级设置，工作区设置无法更改。额度上限、重置周期、BYOK 计入方式和模型可见性现在按连接保存在面板中。旧版 VS Code 设置会在迁移时导入，之后标记为弃用。直接连接 OpenRouter 时始终使用 OpenRouter API；自定义端点则使用独立的凭据。
 
 **输出预留：** 为回复而从上下文窗口中预留的预算。当 OpenRouter 未公布真实的最大补全上限（或仅公布占位值）时，扩展会按 `outputReservePercent` 的比例预留窗口容量，并受 token 下限与上限的约束；真实公布的上限会被直接采用，仅当其超过预留上限时才会按该上限封顶。窗口的其余部分会作为模型的输入预算报告给 Copilot。
 
 ## 面板中的会话支出
 
-面板的**会话支出**部分显示每个 Copilot 聊天会话的花费（窗口重新加载后仍会保留）。每个会话占一行，可折叠；展开后，每个提供程序/模型路由会显示一行：`成本 | 提供程序 | 模型 | 调用 | 缓存占比`。
+每个连接的**会话支出**部分都有各自的历史记录，并会在重新加载后保留。展开会话可查看提供程序/模型路由。兼容端点还会显示服务器报告的输入/输出 token 数。缺少成本时标为不可用；已知和未知成本混合时，会明确显示总额不完整。
 
 - **每个聊天会话一条记录**（其 OpenRouter `session_id`）：最新在前，最新的默认展开。点击可折叠/展开——使用 `<details>` 实现，因此无需脚本。
 - **按 Copilot 的命名方式命名：** 当 VS Code 有 Copilot 聊天标题时（从 VS Code 自身的聊天会话存储本地读取——不会向 OpenRouter 发送任何内容），该行会以标题标注，否则使用短 id；每行还会显示会话的最后更新时间。

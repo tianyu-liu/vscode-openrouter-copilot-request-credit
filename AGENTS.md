@@ -9,37 +9,32 @@
 
 ## What this is
 
-A small **VS Code extension** that registers an OpenRouter provider in **Copilot Chat**
-as **"OpenRouter: RC"**. It exists because Copilot's built-in OpenRouter
-provider cannot send OpenRouter's `provider` routing object or a `session_id`
-(microsoft/vscode#283201; feature request microsoft/vscode-copilot-release#11420
-still open). The extension makes its own HTTP calls to OpenRouter instead of going
-through Copilot's CAPI proxy, so it can apply **any request-body option** OpenRouter
-accepts.
+A small **VS Code extension** that registers the **"OpenRouter: RC"** provider vendor in
+**Copilot Chat**, with a native model group for each named connection. Connections support direct
+OpenRouter keys and OpenAI-compatible Chat Completions endpoints. The package/vendor identifiers stay
+unchanged; connection names and permanent internal IDs are separate.
 
-It also **tracks the same key's credit usage** (absorbed from the retired
-`tianyu-liu.openrouter-key-credit-check` extension): a status-bar item and the
-usage dashboard live in the same control panel.
+Direct OpenRouter requests bypass Copilot's CAPI proxy so the extension can send OpenRouter's
+`provider` routing object, `session_id`, and other request-body options. Credit tracking from the retired
+`tianyu-liu.openrouter-key-credit-check` extension remains fully merged and is scoped to each direct
+OpenRouter connection.
 
-**Core flow (paste-apply):** the user builds a request at the
-[OpenRouter Request Builder](https://openrouter.ai/request-builder), copies the JSON
-body, pastes it into the extension's **one panel**, and every Copilot Chat request to
-OpenRouter then follows those settings (`provider` routing,
-sampling params, `response_format`, `plugins`, `transforms`, `session_id`, …). The
-extension provides **no complex parameter UI of its own** — it applies what is pasted.
+**Core flow (paste-apply):** add a connection and its key in **Settings**, then use the named connection
+tab to paste request JSON, inspect usage, and configure its request. For OpenRouter, build the JSON at
+the [OpenRouter Request Builder](https://openrouter.ai/request-builder). Shared Settings holds the
+refresh interval, prompt safeguard, and output reserve. The selected panel connection controls editing
+and the status bar; the model selected in Copilot determines request routing.
 
-The extension still sends:
+The shared transport supports tools, image input, SSE streaming, cancellation, and thinking traces.
+Direct OpenRouter connections additionally send per-chat `session_id`, picker reasoning options, and
+Anthropic cache markers, and expose account credits and presets. Generic endpoints get no automatic
+OpenRouter additions or credit/preset API calls; unsupported metadata is conservative, with manual model
+configuration available. See [Request pipeline](docs/agent/request-pipeline.md).
 
-- a **per-chat-session `session_id`** so OpenRouter keeps the prompt cache warm and groups
-the chat's turns in one session (see [Session identity](docs/agent/session-identity.md));
-- **tools** (agent mode) and **image input** for vision models;
-- **thinking traces** — `delta.reasoning` is reported as `LanguageModelThinkingPart` and
-  prior turns' reasoning is echoed back on assistant messages (DeepSeek thinking-mode
-  requirement; see [Reasoning passthrough](docs/agent/request-pipeline.md)).
-
-**Model choice is intentionally open:** the full OpenRouter catalog is exposed. This
-extension adds no provider or model restrictions; any org-side allowlist still
-applies at the OpenRouter account level.
+**Model choice is intentionally open:** each direct OpenRouter connection exposes the full catalog,
+with its optional account-availability filter. Generic endpoints expose their catalog plus manual
+model definitions. The extension adds no model allowlist; account/server restrictions still apply.
+Gateway-specific allowance discovery is planned, not implemented.
 
 ## Repo naming and origin
 
@@ -51,8 +46,9 @@ applies at the OpenRouter account level.
   provider vendor id `openrouter-copilot-request-credit`, command ids
   `openrouterCopilot.*`, config namespace `openrouterCopilot.*` (the four credit
   settings folded in as `openrouterCopilot.credit*`; nine `openrouterCopilot.*`
-  settings in total). The key secret
-  (`openrouterApiKey` in SecretStorage) is unaffected.
+  settings retained). Four former global connection settings are now deprecated migration inputs;
+  the panel edits their per-connection equivalents. Migration moves the old `openrouterApiKey` into
+  an isolated SecretStorage slot.
 - This repository originated inside a private skill repository and later
   absorbed the standalone `openrouter-key-credit-check` extension (status bar +
   usage dashboard). The credit check is **fully merged** — do not split it back
@@ -87,7 +83,7 @@ and iterated on **without installing the VSIX or reloading the VS Code extension
 the `vscode` module with a recursive proxy so `out/panel.js` can be `require`d in plain Node, strips
 the webview CSP, injects a `--vscode-*` theme shim and an `acquireVsCodeApi` stub (so tabs and
 controls work), and serves a fixed representative fixture set. `GET /` renders `renderPanelHtml`
-(all three tabs); `GET /model-info` renders `buildModelInfo` for a representative catalog as the
+(Settings and representative named connection tabs); `GET /model-info` renders `buildModelInfo` for a representative catalog as the
 picker tooltip and detail line. The server re-reads `out/*.js` on every request and the page polls
 `/__mtime`, so after `tsc` (or `npm run watch`) a browser refresh shows the new build. Override the
 port with `PANEL_PREVIEW_PORT` or an argument, and edit `buildFixtures()` / `buildModelFixtures()`
@@ -107,17 +103,28 @@ scoped**, so a dev host started from a launch config that does not set it writes
 (ask which launch config/window the run used before suspecting the extension), and a line is written
 **before** the POST, so a failed request still leaves one. When no dump is available, the same facts
 can be read from the extension's persisted ledger — `globalStorage/state.vscdb`, `ItemTable`, key =
-this extension's id, one JSON object holding `sessionCosts` / `parentSession` / `requestTemplate` /
-`contextCaps`. VS Code holds a lock on that database, so copy the file first and open the
-copy read-only (Node's built-in `node:sqlite` `DatabaseSync` is enough).
+this extension's id, one JSON object holding `connectionRegistry.v1` and per-connection state under
+`connections.<id>.*` (`sessionCosts`, `parentSession`, `requestTemplate`, `contextCaps`). The registry
+contains credential slot references, never raw keys. VS Code holds a lock on that database, so copy
+the file first and open the copy read-only (Node's built-in `node:sqlite` `DatabaseSync` is enough).
 
 ## Architecture
 
-- `src/extension.ts` — activation: registers the `openrouter-copilot-request-credit` provider, the credit status bar and refresh lifecycle, the unified webview panel, the config-change listener and the auto-refresh timer. Details: [architecture.md](docs/agent/architecture.md).
-- `src/panel.ts` — the single webview control panel (Key Info / Session Spend / Configurations). Details: [architecture.md](docs/agent/architecture.md).
-- `src/provider.ts` — the `LanguageModelChatProvider`: catalog/picker, request building and streaming, usage, session spend, attribution. Details: [Provider internals](docs/agent/provider.md).
-- `src/modelInfo.ts` — pure model-card/tooltip rendering, reasoning and context-cap picker schemas, context-budget math. Details: [Context window sizing](docs/agent/context-window.md) and [architecture.md](docs/agent/architecture.md).
-- `src/storage.ts` — the single shared key secret; `src/logic.ts` — pure credit/cost math; `src/test/` — mocha integration suite. Details: [architecture.md](docs/agent/architecture.md).
+- [extension.ts](src/extension.ts) — activation, the registry/router registration, per-connection credit refresh, status bar,
+  panel selection, native group lifecycle, commands, and shared-setting listeners.
+- [connections.ts](src/connections.ts) — connection definitions, validation, isolated state/credentials, recoverable migration,
+  and mutation revisions. Details: [architecture.md](docs/agent/architecture.md).
+- [connectionProvider.ts](src/connectionProvider.ts) — the registered `LanguageModelChatProvider`; dispatches native groups by
+  connection ID, scopes model IDs, and rejects stale model revisions.
+- [nativeGroups.ts](src/nativeGroups.ts) — explicit native group add/rename/remove and initial migration through the active
+  client's profile. Details: [architecture.md](docs/agent/architecture.md).
+- [panel.ts](src/panel.ts) — the single webview with shared **Settings** and one tab per named connection.
+- [provider.ts](src/provider.ts) — per-connection child provider: discovery, request building/streaming, caches,
+  usage, spend ledger, and parent attribution. Details: [Provider internals](docs/agent/provider.md).
+- [modelInfo.ts](src/modelInfo.ts) — pure model-card/tooltip rendering, reasoning and context-cap picker schemas, context-budget math. Details: [Context window sizing](docs/agent/context-window.md) and [architecture.md](docs/agent/architecture.md).
+- [storage.ts](src/storage.ts) — bounded legacy-compatible key helpers; production uses the registry's isolated
+  SecretStorage facade. [logic.ts](src/logic.ts) — pure credit/cost math; [src/test/](src/test/) — mocha integration suite.
+  Details: [architecture.md](docs/agent/architecture.md).
 
 ## Detailed docs
 
@@ -138,8 +145,8 @@ copy read-only (Node's built-in `node:sqlite` `DatabaseSync` is enough).
   ("install from VSIX, open the panel, paste key and template").
 - Commit `package-lock.json`; never commit `node_modules/`, `out/`, `.vscode-test/`,
   or `*.vsix` (already gitignored).
-- **Never commit secrets.** The key exists only at runtime in VS Code
-  SecretStorage; there is no key material anywhere in the repo.
+- **Never commit secrets.** Keys live in VS Code SecretStorage, one isolated credential per connection;
+  there is no key material in repository files or settings.
 - Commit and push are the user's call in this repo.
 - Tests must never hit the network or the real keychain (see `extension.test.ts`
   fetch stub). Keep `logic.ts` free of `vscode` imports.

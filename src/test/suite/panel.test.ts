@@ -1,5 +1,7 @@
 import * as assert from "assert";
 import * as vscode from "vscode";
+import { runInNewContext } from "vm";
+import type { ConnectionDefinition } from "../../connections";
 import { handlePanelMessage, PanelDeps, PanelRenderOptions, renderPanelHtml, renderSessionCosts } from "../../panel";
 import { SessionCost, stripTemplateComments, UNATTRIBUTED_SESSION_ID } from "../../provider";
 import { KEY_SECRET } from "../../storage";
@@ -252,18 +254,16 @@ suite("renderSessionCosts", () => {
 });
 
 suite("renderPanelHtml", () => {
-    test("renders ordered accessible tabs with Key Info selected and session spend second", () => {
+    test("renders Settings followed by accessible named connection tabs", () => {
         const html = render();
-        assert.ok(!html.includes("<h1>OpenRouter for Copilot</h1>"));
-        assert.match(html, /id="tab-key-info" role="tab" aria-selected="true" aria-controls="panel-key-info" tabindex="0">Key Info<\/button>/);
-        assert.match(html, /id="tab-session-spend" role="tab" aria-selected="false" aria-controls="panel-session-spend" tabindex="-1">Session Spend<\/button>/);
-        assert.match(html, /id="tab-configurations" role="tab" aria-selected="false" aria-controls="panel-configurations" tabindex="-1">Configurations<\/button>/);
-        assert.match(html, /id="panel-key-info" role="tabpanel" aria-labelledby="tab-key-info" tabindex="0">[\s\S]*id="key"[\s\S]*Credit usage/);
-        assert.match(html, /id="panel-session-spend" role="tabpanel" aria-labelledby="tab-session-spend" tabindex="0" hidden>[\s\S]*Session spend/);
-        assert.match(html, /id="panel-configurations" role="tabpanel" aria-labelledby="tab-configurations" tabindex="0" hidden>[\s\S]*Custom request/);
-        assert.ok(html.indexOf('id="tab-key-info"') < html.indexOf('id="tab-configurations"'));
-        assert.ok(html.indexOf('id="tab-session-spend"') < html.indexOf('id="tab-configurations"'));
-        assert.ok(!html.includes('id="tab-context"'), "the Context tab is retired");
+        assert.match(html, /id="tab-settings" role="tab" aria-selected="true" aria-controls="panel-settings" tabindex="0">Settings<\/button>/);
+        assert.match(html, /id="tab-connection-default" data-connection-id="default" role="tab" aria-selected="false" aria-controls="panel-connection" tabindex="-1">OpenRouter<\/button>/);
+        const settings = html.slice(html.indexOf('id="panel-settings"'), html.indexOf('id="panel-connection"'));
+        const connection = html.slice(html.indexOf('id="panel-connection"'), html.indexOf('<script nonce='));
+        assert.ok(settings.includes('id="key"') && settings.includes('id="connectionForm"'));
+        assert.ok(settings.includes('id="outputReservePercent"') && settings.includes('id="refreshInterval"'));
+        for (const text of ['Credit usage', 'Session spend', 'Custom request']) assert.ok(connection.includes(text));
+        assert.ok(!connection.includes('id="key"') && !connection.includes('id="outputReservePercent"'));
     });
 
     test("restores the active tab from VS Code webview state, falling back to the first tab", () => {
@@ -346,13 +346,13 @@ suite("renderPanelHtml", () => {
     test("offers a Clear key action wired to the clearKey message only when a key is set", () => {
         const withKey = render({ maskedKey: "sk-or-v1-12\u2026456" });
         assert.ok(withKey.includes('<button id="clearKey">Clear key</button>'));
-        assert.ok(withKey.includes("vsc.postMessage({ type: 'clearKey' })"));
+        assert.ok(withKey.includes("post('clearKey')"));
         assert.ok(!render().includes('id="clearKey"'), "nothing to clear without a stored key");
     });
 
     test("persists unsaved drafts through webview state, debounced, and restores them", () => {
         const html = render();
-        for (const field of ["draftTemplate", "draftPreset", "draftReservePercent", "draftReserveMin", "draftReserveMax"]) {
+        for (const field of ["connectionDrafts", "sharedDraft", "templateBase", "presetBase", "reservePercent", "reserveMin", "reserveMax"]) {
             assert.ok(html.includes(field), `${field} is persisted`);
         }
         assert.ok(!html.includes("draftKey"), "the unsaved key is never persisted into webview state");
@@ -444,23 +444,18 @@ suite("renderPanelHtml", () => {
 
     test("places concise guidance with the relevant panel sections", () => {
         const html = render();
-        const keyInfoStart = html.indexOf('<section class="tab-panel" id="panel-key-info"');
-        const sessionSpendStart = html.indexOf('<section class="tab-panel" id="panel-session-spend"');
-        const requestStart = html.indexOf('<section class="tab-panel" id="panel-configurations"');
+        const settingsStart = html.indexOf('<section class="tab-panel" id="panel-settings"');
+        const connectionStart = html.indexOf('<section class="tab-panel" id="panel-connection"');
         const scriptStart = html.indexOf('<script nonce=');
-        const keyInfo = html.slice(keyInfoStart, sessionSpendStart);
-        const sessionSpend = html.slice(sessionSpendStart, requestStart);
-        const request = html.slice(requestStart, scriptStart);
-        assert.ok(keyInfo.includes("SecretStorage"), "key storage note stays with key controls");
-        assert.ok(!keyInfo.includes('id="outputReservePercent"'), "output reserve controls moved out of Key Info");
-        const reserveIndex = request.indexOf("Output reserve");
-        assert.ok(reserveIndex > -1 && reserveIndex < request.indexOf(">Custom request</div>"), "output reserve is the first section of the Configurations tab");
-        assert.ok(request.includes('id="outputReservePercent"'), "reserve ratio control lives in Configurations");
-        assert.ok(request.includes('class="fieldgroup"'), "reserve fields are grouped");
-        assert.strictEqual(request.match(/<span class="sep">\.<\/span>/g)?.length, 2, "the three groups are dot-separated");
-        assert.ok(sessionSpend.includes("BYOK routes:</strong> When OpenRouter reports zero"), "BYOK note stays with session spend");
-        assert.ok(request.includes("Responses stream automatically"), "request behavior notes stay by the template");
-        assert.ok(request.includes("No routing is added automatically"), "provider routing is accurately described");
+        const settings = html.slice(settingsStart, connectionStart);
+        const request = html.slice(connectionStart, scriptStart);
+        assert.ok(settings.includes("SecretStorage"), "key storage note stays with key controls");
+        assert.ok(settings.includes('id="outputReservePercent"'), "reserve controls live in Settings");
+        assert.ok(settings.includes('class="fieldgroup"'), "reserve fields are grouped");
+        assert.strictEqual(settings.match(/<span class="sep">\.<\/span>/g)?.length, 2);
+        assert.ok(request.includes("BYOK routes:</strong> When OpenRouter reports zero"));
+        assert.ok(request.includes("Responses stream automatically"));
+        assert.ok(request.includes("No routing is added automatically"));
         assert.ok(html.includes('aria-label="OpenRouter API key"'), "key input has an accessible name");
         assert.ok(html.includes('aria-label="Custom request JSON"'), "request editor has an accessible name");
         assert.ok(!html.includes("id=\"fn-"), "numbered internal footnote anchors are removed");
@@ -991,5 +986,225 @@ suite("renderPanelHtml presets section", () => {
         assert.ok(html.includes('Selecting "No preset loaded" clears it.'));
         assert.ok(html.includes("<code>@preset/&lt;slug&gt;</code>"), "picker entry form documented");
         assert.ok(html.includes("takes precedence over a different template preset"), "picker preset precedence documented");
+    });
+});
+
+function connectionFixture(id: string, kind: ConnectionDefinition['kind'] = 'openrouter'): ConnectionDefinition {
+    return {
+        id, name: id.toUpperCase(), kind,
+        baseUrl: kind === 'openrouter' ? 'https://openrouter.ai/api/v1' : 'http://localhost:1234/v1',
+        enabled: true, revision: 1,
+        settings: { creditLimit: 10, creditResetPeriod: 'daily', creditIncludeByok: true, hideUnavailableModels: true },
+    };
+}
+
+/** Run the actual webview script with a small DOM seam; no extension host messages leave this harness. */
+function webviewHarness(options: Partial<PanelRenderOptions>, savedState: unknown = {}) {
+    class Element {
+        value = '';
+        type = '';
+        hidden = false;
+        disabled = false;
+        tabIndex = -1;
+        dataset: Record<string, string> = {};
+        attributes: Record<string, string> = {};
+        options: Element[] = [];
+        listeners: Record<string, Array<(event: unknown) => void>> = {};
+        textContent = '';
+        constructor(readonly id: string) {}
+        addEventListener(type: string, fn: (event: unknown) => void) {
+            (this.listeners[type] ??= []).push(fn);
+        }
+        setAttribute(name: string, value: string) { this.attributes[name] = value; }
+        getAttribute(name: string) { return this.attributes[name]; }
+        appendChild(element: Element) { this.options.push(element); }
+        focus() {}
+        fire(type: string, event = {}) { for (const listener of this.listeners[type] ?? []) listener(event); }
+    }
+    const html = render(options);
+    const elements = new Map<string, Element>();
+    const decode = (text: string) => text.replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+    for (const match of html.matchAll(/<\w+\b([^>]*?\sid="([^"]+)"[^>]*)>/g)) {
+        const element = new Element(match[2]);
+        for (const attr of match[1].matchAll(/([\w-]+)="([^"]*)"/g)) element.attributes[attr[1]] = decode(attr[2]);
+        element.value = element.attributes.value ?? '';
+        element.type = element.attributes.type ?? '';
+        if (element.attributes['data-connection-id']) element.dataset.connectionId = element.attributes['data-connection-id'];
+        elements.set(element.id, element);
+    }
+    const tabs = [...elements.values()].filter(element => element.attributes.role === 'tab');
+    const messages: Array<Record<string, unknown>> = [];
+    const timers = new Map<number, () => void>();
+    const incomingListeners: Array<(event: unknown) => void> = [];
+    let state = savedState;
+    let timerId = 0;
+    runInNewContext(html.match(/<script nonce="[^"]+">([\s\S]*?)<\/script>/)![1], {
+        acquireVsCodeApi: () => ({
+            getState: () => state,
+            setState: (value: unknown) => { state = JSON.parse(JSON.stringify(value)); },
+            postMessage: (value: Record<string, unknown>) => messages.push(JSON.parse(JSON.stringify(value))),
+        }),
+        document: {
+            getElementById: (id: string) => elements.get(id),
+            querySelectorAll: () => tabs,
+            createElement: () => new Element(''),
+        },
+        window: { addEventListener: (type: string, listener: (event: unknown) => void) => {
+            if (type === 'message') incomingListeners.push(listener);
+        } },
+        setTimeout: (fn: () => void) => { timers.set(++timerId, fn); return timerId; },
+        clearTimeout: (id: number) => timers.delete(id),
+    });
+    return {
+        get state() { return state; },
+        messages,
+        receive: (data: unknown) => { for (const listener of incomingListeners) listener({ data }); },
+        element: (id: string) => elements.get(id)!,
+        flush: () => { for (const fn of [...timers.values()]) fn(); timers.clear(); },
+    };
+}
+
+suite('connection panel', () => {
+    const connections = [connectionFixture('a'), connectionFixture('b')];
+    test('per-connection messages retain their rendered origin after selecting another tab', () => {
+        const view = webviewHarness({ connections, selectedConnectionId: 'a' });
+        view.element('tab-connection-b').fire('click');
+        view.element('saveTemplate').fire('click');
+        view.element('outputReservePercent').fire('change');
+        assert.deepStrictEqual(view.messages[0], { type: 'selectConnection', connectionId: 'b' });
+        assert.deepStrictEqual(view.messages[1], { type: 'saveTemplate', value: '', connectionId: 'a' });
+        assert.strictEqual(view.messages[2].type, 'saveOutputReservePercent');
+        assert.ok(!('connectionId' in view.messages[2]), 'shared setting does not carry a connection scope');
+    });
+
+    test('request drafts remain separate through connection switches and refreshes', () => {
+        const a = webviewHarness({ connections, selectedConnectionId: 'a', template: { temperature: 0.1 } });
+        a.element('template').value = '{"temperature":0.8}';
+        a.element('template').fire('input');
+        a.flush();
+        const b = webviewHarness({ connections, selectedConnectionId: 'b', template: { temperature: 0.2 } }, a.state);
+        assert.ok(b.element('template').value.includes('0.2'), 'A draft is not shown for B');
+        b.element('template').value = '{"temperature":0.9}';
+        b.element('template').fire('input');
+        b.flush();
+        const restored = webviewHarness({ connections, selectedConnectionId: 'a', template: { temperature: 0.1 } }, b.state);
+        assert.strictEqual(restored.element('template').value, '{"temperature":0.8}');
+        const updated = webviewHarness({ connections, selectedConnectionId: 'a', template: { temperature: 0.3 } }, b.state);
+        assert.ok(updated.element('template').value.includes('0.3'), 'new saved template replaces a stale draft');
+    });
+
+    test('incoming clear and preset events cannot change another connection’s request draft', () => {
+        const view = webviewHarness({ connections, selectedConnectionId: 'a' });
+        view.element('template').value = '{"temperature":0.8}';
+        view.element('template').fire('input');
+        view.flush();
+        const before = JSON.stringify(view.state);
+        view.receive({ type: 'templateCleared', connectionId: 'b' });
+        view.receive({ type: 'presetSelection', connectionId: 'b', value: 'other-preset' });
+        view.receive({ type: 'templateCleared' });
+        view.receive({ type: 'presetSelection', value: 'unscoped-preset' });
+        view.flush();
+        assert.strictEqual(view.element('template').value, '{"temperature":0.8}');
+        assert.strictEqual(view.element('presetSelect').value, '');
+        assert.strictEqual(JSON.stringify(view.state), before, 'foreign and unscoped events leave drafts unchanged');
+        view.receive({ type: 'presetSelection', connectionId: 'a', value: 'own-preset' });
+        view.flush();
+        assert.strictEqual(view.element('presetSelect').value, 'own-preset');
+        view.receive({ type: 'templateCleared', connectionId: 'a' });
+        assert.strictEqual(view.element('template').value, '');
+        assert.strictEqual(view.element('presetSelect').value, '');
+        assert.ok(!JSON.stringify(view.state).includes('temperature'));
+        const legacy = webviewHarness({});
+        legacy.element('template').value = '{}';
+        legacy.receive({ type: 'templateCleared' });
+        assert.strictEqual(legacy.element('template').value, '', 'legacy event seams retain unscoped behavior');
+    });
+
+    test('unsent credentials never enter persisted state and clear when switching tabs', () => {
+        const view = webviewHarness({ connections, selectedConnectionId: 'a', maskedKey: 'masked…key' });
+        view.element('key').value = 'secret-unsent-key';
+        view.element('key').fire('input');
+        view.element('template').value = '{}';
+        view.element('template').fire('input');
+        view.flush();
+        assert.ok(!JSON.stringify(view.state).includes('secret-unsent-key'));
+        view.element('tab-connection-a').fire('click');
+        assert.strictEqual(view.element('key').value, 'masked…key');
+        view.element('saveKey').fire('click');
+        assert.deepStrictEqual(view.messages.at(-1), {
+            type: 'saveKey', value: 'masked…key', currentKeyMasked: 'masked…key', connectionId: 'a',
+        });
+    });
+
+    test('Settings connection selector stays in Settings and identifies the connection being edited', () => {
+        const view = webviewHarness({ connections, selectedConnectionId: 'a' });
+        view.element('connectionSelect').value = 'b';
+        view.element('connectionSelect').fire('change');
+        assert.deepStrictEqual(view.messages.at(-1), { type: 'selectConnection', connectionId: 'b', value: 'settings' });
+        assert.strictEqual((view.state as { activeTab: string }).activeTab, 'tab-settings');
+    });
+
+    test('escapes connection metadata and renders only one detail editor', () => {
+        const hostile = { ...connectionFixture('a'), name: '</script><img src=x>', baseUrl: 'https://example.com/" onmouseover="bad' };
+        const html = render({ connections: [hostile, connectionFixture('b')], selectedConnectionId: 'a' });
+        assert.ok(!html.includes('</script><img'));
+        assert.ok(html.includes('&lt;/script&gt;&lt;img src=x&gt;'));
+        assert.ok(html.includes('https://example.com/&quot; onmouseover=&quot;bad'));
+        assert.strictEqual((html.match(/id="template"/g) ?? []).length, 1);
+    });
+
+    test('compatible APIs show manual models and honest cost availability without OpenRouter controls', () => {
+        const html = render({ connections: [connectionFixture('local', 'openai-compatible')], selectedConnectionId: 'local' });
+        assert.ok(html.includes('id="manualModels"') && html.includes('id="saveManualModels"'));
+        assert.ok(html.includes('does not provide OpenRouter credits or authoritative cost data'));
+        assert.ok(!html.includes('id="presetSelect"') && !html.includes('id="limit"'));
+        assert.ok(!html.includes('id="hideUnavailableModels"'));
+        assert.ok(html.includes('id="connectionKind" disabled'));
+        assert.ok(html.includes('&quot;stream_options&quot;: {&quot;include_usage&quot;: true}'));
+        assert.ok(!render().includes('To request token usage from servers that support it'));
+
+    });
+
+    test('generic session history shows calls and tokens when cost is missing or zero', () => {
+        const session = sessionFixture({ paid: 0, openRouter: 0, upstream: 0, costUnavailable: true,
+            routes: [{ ...sessionFixture().routes[0], paid: 0, costUnavailable: true }] });
+        const html = renderSessionCosts([session], true);
+        assert.ok(html.includes('Unavailable'), 'missing cost is labelled');
+        assert.ok(html.includes('class="sessioncost">Unavailable</span>'), 'missing cost never appears free');
+        assert.ok(html.includes('Input tokens') && html.includes('Output tokens'));
+        assert.ok(html.includes('1,000') && html.includes('2 calls'));
+        assert.ok(html.includes('Session <code>copilot-chat:'));
+        assert.ok(!html.includes('OpenRouter session'));
+        const free = renderSessionCosts([{ ...session, costUnavailable: false, routes: [] }], true);
+        assert.ok(free.includes('2 calls'), 'known zero-cost usage is retained');
+        assert.ok(renderSessionCosts([], true).includes('No session usage recorded yet'));
+        const mixed = renderSessionCosts([{ ...session, paid: 0.1 }], true);
+        assert.ok(mixed.includes('$0.1000 + unavailable'), 'partial totals do not claim complete cost');
+    });
+
+    test('dispatches connection CRUD to the supplied immutable id and validates manual models', async () => {
+        const state = spyDeps();
+        const actions: unknown[] = [];
+        state.deps.addConnection = async input => { actions.push(['add', input]); };
+        state.deps.updateConnection = async (id, patch) => { actions.push(['update', id, patch]); };
+        state.deps.deleteConnection = async id => { actions.push(['delete', id]); };
+        state.deps.selectConnection = async id => { actions.push(['select', id]); };
+        await handlePanelMessage({ type: 'addConnection', value: { name: ' Local ', kind: 'openai-compatible', baseUrl: 'http://localhost:1234/v1' } }, state.deps);
+        await handlePanelMessage({ type: 'setConnectionEnabled', connectionId: 'a', value: false }, state.deps);
+        await handlePanelMessage({ type: 'saveManualModels', connectionId: 'b', value: '[{"id":"m","contextLength":32768,"toolCalling":true}]' }, state.deps);
+        await handlePanelMessage({ type: 'deleteConnection', connectionId: 'a' }, state.deps);
+        await handlePanelMessage({ type: 'selectConnection', connectionId: 'b' }, state.deps);
+        assert.deepStrictEqual(actions, [
+            ['add', { name: 'Local', kind: 'openai-compatible', baseUrl: 'http://localhost:1234/v1' }],
+            ['update', 'a', { enabled: false }],
+            ['update', 'b', { models: [{ id: 'm', contextLength: 32768, toolCalling: true }] }],
+            ['delete', 'a'], ['select', 'b'],
+        ]);
+        for (const value of ['{}', '[{"id":"m"},{"id":"m"}]', '[{"id":"m","contextLength":-1}]', '[{"id":"m","toolCalling":"yes"}]']) {
+            await handlePanelMessage({ type: 'saveManualModels', connectionId: 'b', value }, state.deps);
+        }
+        await handlePanelMessage({ type: 'addConnection', value: { name: 'bad', kind: 'openai-compatible', baseUrl: 'https://user:pass@example.com/v1' } }, state.deps);
+        assert.strictEqual(actions.length, 5, 'invalid input never reaches persistence');
+        assert.strictEqual(state.errors.length, 5);
     });
 });

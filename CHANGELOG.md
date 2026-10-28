@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Add named OpenRouter and OpenAI-compatible connections with isolated credentials, request settings,
+  model identities, and session accounting; migrate the existing setup into one default connection.
+- Regroup the panel into shared **Settings** and connection-name tabs. Settings manages connections,
+  output reserve, refresh frequency, and text sanitization; each connection tab owns usage and requests.
+- Support generic Chat Completions endpoints, manual model metadata, unknown pricing, and token-only
+  usage history. Keep OpenRouter-specific routing, presets, session IDs, and credit APIs scoped to OpenRouter.
+- Block request redirects and stale connection selection; preserve captured request settings across retries.
+- Use `0.5.0-test.2` for this development build. Gateway allowance support remains pending.
 - Replace the status bar's `OR` label with the official OpenRouter glyph, using Ink for light themes
   and Cloud for dark themes, including high-contrast variants and live theme changes.
 - Remove the exact VS Code API-types pin, allow newer clients through an open-ended compatibility

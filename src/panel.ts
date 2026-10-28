@@ -1,10 +1,12 @@
 import * as vscode from 'vscode';
 import { randomBytes } from 'crypto';
 import { t } from './i18n';
+import type { ConnectionDefinition, ConnectionInput, ConnectionPatch, ManualModel } from './connections';
 import {
     presetSlugFromPickerValue,
     stripTemplateComments,
     routeCostCells,
+    costAmountText,
     cacheShareSuffix,
     UNATTRIBUTED_SESSION_ID,
     MAX_TRACKED_SESSIONS,
@@ -14,7 +16,6 @@ import {
     buildDetail,
     effectiveIncludeByok,
     formatReset,
-    formatUsdPrecise,
     KeyInfo,
     ResetPeriod,
     resetPeriodLabel,
@@ -208,20 +209,21 @@ export interface PresetRow {
  * The markup is `<details>`, so expansion works without any script and survives
  * the panel being re-rendered on every message.
  */
-export function renderSessionCosts(sessions: SessionCost[] | undefined): string {
-    const withSpend = (sessions ?? []).filter(s => s.paid > 0);
+export function renderSessionCosts(sessions: SessionCost[] | undefined, generic = false): string {
+    const withSpend = (sessions ?? []).filter(s => s.paid > 0 || s.costUnavailable || (generic && s.calls > 0));
     const chats = withSpend.filter(s => s.sessionId !== UNATTRIBUTED_SESSION_ID);
     const unattributed = withSpend.find(s => s.sessionId === UNATTRIBUTED_SESSION_ID);
     if (chats.length === 0 && unattributed === undefined) {
+        if (generic) return emptyState(t('No session usage recorded yet. Calls and token counts appear when the server reports usage.'));
         return emptyState(t('No OpenRouter spend recorded yet. Totals appear here once a turn reports a cost. Spend that carried no chat identifier is collected under the <strong>Unattributed</strong> entry.'));
     }
-    const rows = chats.map((session, index) => renderSessionDetails(session, index === 0)).join('');
-    const unattributedHtml = unattributed ? renderSessionDetails(unattributed, chats.length === 0) : '';
+    const rows = chats.map((session, index) => renderSessionDetails(session, index === 0, generic)).join('');
+    const unattributedHtml = unattributed ? renderSessionDetails(unattributed, chats.length === 0, generic) : '';
     return `${rows}${unattributedHtml}${renderNote('sessionList')}`;
 }
 
 /** One collapsible spend entry; the unattributed bucket explains itself. */
-function renderSessionDetails(session: SessionCost, open: boolean): string {
+function renderSessionDetails(session: SessionCost, open: boolean, generic = false): string {
     const short = session.sessionId.replace(/^copilot-chat:/, '');
     const label =
         session.sessionId === UNATTRIBUTED_SESSION_ID
@@ -236,15 +238,17 @@ function renderSessionDetails(session: SessionCost, open: boolean): string {
                                 <td>${esc(c.model ?? '\u2014')}</td>
                                 <td class="num">${esc(c.calls)}</td>
                                 <td class="num">${esc(c.cached ?? '\u2014')}</td>
+                                ${generic ? `<td class="num">${r.promptTokens.toLocaleString()}</td><td class="num">${r.completionTokens.toLocaleString()}</td>` : ''}
                             </tr>`;
         })
         .join('');
     const cacheShare = cacheShareSuffix(session);
     const updated = session.updatedAt >= 1e12 ? formatReset(new Date(session.updatedAt), true) : undefined;
+    const cost = costAmountText(session);
     const calls = session.calls === 1 ? t('{0} call', session.calls) : t('{0} calls', session.calls);
     return `<details class="session"${open ? ' open' : ''}>
                         <summary>
-                            <span class="sessioncost">${esc(formatUsdPrecise(session.paid))}</span>
+                            <span class="sessioncost">${esc(cost)}</span>
                             <span class="sessionname">${esc(label)}</span>
                             <span class="muted">${esc(calls)}${esc(cacheShare)}</span>
                             ${updated ? `<span class="muted sessiontime">${esc(updated)}</span>` : ''}
@@ -252,18 +256,20 @@ function renderSessionDetails(session: SessionCost, open: boolean): string {
                         <div class="sessionbody">
                             <table class="routes">
                                 <thead>
-                                    <tr><th>${t('Cost')}</th><th>${t('Provider')}</th><th>${t('Model')}</th><th>${t('Calls')}</th><th>${t('Cached')}</th></tr>
+                                    <tr><th>${t('Cost')}</th><th>${t('Provider')}</th><th>${t('Model')}</th><th>${t('Calls')}</th><th>${t('Cached')}</th>${generic ? `<th>${t('Input tokens')}</th><th>${t('Output tokens')}</th>` : ''}</tr>
                                 </thead>
                                 <tbody>${routeRows}</tbody>
                             </table>
                             ${session.sessionId === UNATTRIBUTED_SESSION_ID
-                                ? renderNote('unattributed')
-                                : `<p class="muted">${t('OpenRouter session <code>{0}</code>', esc(session.sessionId))}</p>`}
+                                ? generic ? emptyState(t('Usage without a Copilot chat identifier is kept here, separate from named chats.')) : renderNote('unattributed')
+                                : `<p class="muted">${t(generic ? 'Session <code>{0}</code>' : 'OpenRouter session <code>{0}</code>', esc(session.sessionId))}</p>`}
                         </div>
                     </details>`;
 }
 
 export interface PanelRenderOptions {
+    connections?: ConnectionDefinition[];
+    selectedConnectionId?: string;
     info?: KeyInfo;
     limit?: number;
     resetPeriod?: ResetPeriod;
@@ -297,6 +303,16 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
         sessions,
         settings = {},
     } = options;
+    const connections = options.connections ?? [{
+        id: 'default', name: 'OpenRouter', kind: 'openrouter', baseUrl: 'https://openrouter.ai/api/v1',
+        enabled: true, revision: 1,
+        settings: { creditLimit: limit, creditResetPeriod: resetPeriod, creditIncludeByok: includeByok,
+            hideUnavailableModels: settings.hideUnavailableModels ?? true },
+    }];
+    const connection = connections.find(item => item.id === options.selectedConnectionId) ?? connections[0];
+    const connectionId = connection?.id ?? '';
+    const isOpenRouter = connection?.kind !== 'openai-compatible';
+    const jsonForScript = (value: unknown): string => JSON.stringify(value).replace(/</g, '\\u003c');
     const nonce = randomBytes(16).toString('hex');
     const detail = info ? buildDetail(info, limit, resetPeriod, includeByok, accountCredits) : undefined;
     const usageTable = detail
@@ -353,10 +369,8 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
                 <label class="optlabel"><input type="checkbox" id="includeByok" ${includeByokShown ? 'checked' : ''}${autoMode ? ' disabled' : ''} title="${autoMode ? t('Set on the API key; local controls apply only when the key has none') : t('Count bring-your-own-key usage in the remaining balance')}" /> ${t('Include BYOK usage')}${autoMode ? t(' (set on the key)') : ''}</label>
            </div>
            ${autoMode ? renderNote('autoLimit') : ''}`;
-    const sessionCostHtml = renderSessionCosts(sessions);
+    const sessionCostHtml = renderSessionCosts(sessions, !isOpenRouter);
     const updatedLine = `<div class="keyline updatedline">
-            <label class="optlabel" for="refreshInterval">${t('Usage refresh interval (minutes)')}</label>
-            <input type="number" id="refreshInterval" min="1" max="${MAX_REFRESH_INTERVAL_MINUTES}" step="1" aria-label="${t('Usage refresh interval in minutes')}" title="${t('Refresh usage data every 1 to {0} minutes', MAX_REFRESH_INTERVAL_MINUTES)}" value="${esc(String(refreshIntervalMinutes))}" class="intervalinput" />
             ${fetchedAt ? `<span class="muted">${t('Updated {0}', esc(formatReset(fetchedAt, true)))}</span>` : ''}
             <button id="refresh">${t('Refresh')}</button>
         </div>`;
@@ -403,9 +417,17 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
 <meta charset="UTF-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'">
 <style>
+    .wrap { max-width: 1100px; }
+    .connection-form { display: grid; gap: 10px; max-width: 700px; }
+    .connection-form label { display: grid; gap: 5px; }
+    .connection-form input[type=text], .connection-form select { width: 100%; box-sizing: border-box; }
+    .connection-form .optlabel { display: flex; }
+    .connection-url { overflow-wrap: anywhere; }
+    .table-scroll { overflow-x: auto; }
+    @media (max-width: 480px) { body { padding: 12px; } input[type=password], input[type=text] { max-width: 100%; } .keyline { align-items: stretch; } .sessionbody { padding-left: 0; overflow-x: auto; } }
     body { font-family: var(--vscode-font-family); padding: 16px 20px; color: var(--vscode-foreground); }
     .section { margin-bottom: 22px; }
-    .tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--vscode-panel-border, rgba(0,0,0,0.15)); margin: 0 0 16px; }
+    .tabs { display: flex; overflow-x: auto; gap: 2px; border-bottom: 1px solid var(--vscode-panel-border, rgba(0,0,0,0.15)); margin: 0 0 16px; }
     .tab { color: var(--vscode-descriptionForeground, #888); background: transparent; border-bottom: 2px solid transparent; }
     .tab[aria-selected="true"] { color: var(--vscode-foreground); border-bottom-color: var(--vscode-focusBorder); }
     .tab:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -2px; }
@@ -423,7 +445,7 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
         font-size: inherit; white-space: pre; resize: vertical; }
     input[type=password], input[type=text] {
         background: var(--vscode-input-background); color: var(--vscode-input-foreground);
-        border: 1px solid var(--vscode-input-border, transparent); padding: 4px 8px; width: 320px;
+        border: 1px solid var(--vscode-input-border, transparent); padding: 4px 8px; width: 320px; box-sizing: border-box;
         font: inherit; }
     input[type=number] {
         background: var(--vscode-input-background); color: var(--vscode-input-foreground);
@@ -434,6 +456,7 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
     #outputReservePercent { width: 52px; }
     #outputReserveMinTokens, #outputReserveMaxTokens { width: 60px; }
     select {
+        max-width: 100%;
         background: var(--vscode-dropdown-background); color: var(--vscode-dropdown-foreground);
         border: 1px solid var(--vscode-dropdown-border, transparent); padding: 4px 8px;
         font: inherit; }
@@ -451,7 +474,7 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
                  background: var(--vscode-inputValidation-errorBackground, rgba(255, 0, 0, 0.1));
                  border: 1px solid var(--vscode-inputValidation-errorBorder, rgba(255, 0, 0, 0.4));
                  padding: 6px 10px; margin: 0 0 10px; border-radius: 4px; }
-    .limitline { display: flex; align-items: baseline; gap: 12px; margin-bottom: 10px; }
+    .limitline { display: flex; flex-wrap: wrap; align-items: baseline; gap: 12px; margin-bottom: 10px; }
     .limitlabel { color: var(--vscode-descriptionForeground, #888); }
     .limitvalue { font-size: 1.5em; font-weight: 600; }
     .updatedline { justify-content: flex-start; gap: 12px; align-items: baseline; }
@@ -488,7 +511,7 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
     details.session summary::marker { color: var(--vscode-descriptionForeground, #888); }
     .sessionname { flex: 1; font-family: var(--vscode-editor-font-family, monospace); font-size: 12px; }
     .sessiontime { white-space: nowrap; font-size: 11px; }
-    .sessionbody { padding: 0 0 4px 18px; }
+    .sessionbody { padding: 0 0 4px 18px; overflow-x: auto; }
     .sessionbody p { margin: 0; }
     table.routes { margin: 2px 0 6px; border-collapse: collapse; font-size: 12px;
                    font-family: var(--vscode-editor-font-family, monospace); }
@@ -503,46 +526,46 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
 </head>
 <body>
 <div class="wrap">
-    <div class="tabs" role="tablist" aria-label="${t('OpenRouter settings')}">
-        <button class="tab" id="tab-key-info" role="tab" aria-selected="true" aria-controls="panel-key-info" tabindex="0">${t('Key Info')}</button>
-        <button class="tab" id="tab-session-spend" role="tab" aria-selected="false" aria-controls="panel-session-spend" tabindex="-1">${t('Session Spend')}</button>
-        <button class="tab" id="tab-configurations" role="tab" aria-selected="false" aria-controls="panel-configurations" tabindex="-1">${t('Configurations')}</button>
+    <div class="tabs" role="tablist" aria-label="${t('Connections and settings')}">
+        <button class="tab" id="tab-settings" role="tab" aria-selected="true" aria-controls="panel-settings" tabindex="0">${t('Settings')}</button>
+        ${connections.map(item => `<button class="tab" id="tab-connection-${esc(encodeURIComponent(item.id))}" data-connection-id="${esc(item.id)}" role="tab" aria-selected="false" aria-controls="panel-connection" tabindex="-1">${esc(item.name)}${item.enabled ? '' : ` (${t('Disabled')})`}</button>`).join('')}
     </div>
-
-    <section class="tab-panel" id="panel-key-info" role="tabpanel" aria-labelledby="tab-key-info" tabindex="0">
+    ${errorBanner}
+    <section class="tab-panel" id="panel-settings" role="tabpanel" aria-labelledby="tab-settings" tabindex="0">
     <div class="section">
-        <div class="section-title">${t('OpenRouter API key')}</div>
+        <div class="section-title">${t('Keys')}</div>
+        <p class="helptext">${t('Manage named connections here. Choose a model from its connection group in Copilot to route a request.')}</p>
         <div class="keyline">
-            <input type="${maskedKey ? 'text' : 'password'}" id="key" aria-label="${t('OpenRouter API key')}" placeholder="${t('OpenRouter API key (sk-or-v1-...)')}" />
-            <button id="saveKey">${t('Save key')}</button>
+            <label class="optlabel" for="connectionSelect">${t('Connection')}</label>
+            <select id="connectionSelect">${connections.map(item => `<option value="${esc(item.id)}"${item.id === connectionId ? ' selected' : ''}>${esc(item.name)}${item.enabled ? '' : ` (${t('Disabled')})`}</option>`).join('')}</select>
+            <button id="addConnection">${t('Add connection')}</button>
+            ${connection ? `<button id="toggleConnection">${connection.enabled ? t('Disable') : t('Enable')}</button><button id="deleteConnection">${t('Delete connection')}</button>` : ''}
+        </div>
+        <form id="connectionForm" class="connection-form">
+            <label>${t('Connection name')}<input id="connectionName" type="text" required value="${esc(connection?.name ?? '')}" placeholder="${t('For example: Personal, Work, Local')}" /></label>
+            <label>${t('API type')}<select id="connectionKind"${connection ? ' disabled' : ''}><option value="openrouter"${isOpenRouter ? ' selected' : ''}>OpenRouter</option><option value="openai-compatible"${isOpenRouter ? '' : ' selected'}>${t('OpenAI compatible')}</option></select></label>
+            <label>${t('Base URL')}<input id="connectionUrl" type="text" required value="${esc(connection?.baseUrl ?? 'https://openrouter.ai/api/v1')}" placeholder="http://localhost:1234/v1" /></label>
+            <div class="keyline"><button id="saveConnection" type="submit">${t('Save connection')}</button><button id="cancelConnection" type="button" hidden>${t('Cancel')}</button><span id="newConnectionHint" class="helptext" hidden>${t('Enter the new connection details, then save.')}</span></div>
+        </form>
+        ${maskedKey && !isOpenRouter ? `<p class="helptext">${t('Clear the saved key before changing this connection’s base URL.')}</p>` : ''}
+    </div>
+    <div class="section">
+        <div class="section-title">${isOpenRouter ? t('OpenRouter API key') : t('API key')}</div>
+        <div class="keyline">
+            <input type="${maskedKey ? 'text' : 'password'}" id="key" aria-label="${isOpenRouter ? t('OpenRouter API key') : t('API key')}" placeholder="${isOpenRouter ? t('OpenRouter API key (sk-or-v1-...)') : t('API key (optional for local servers)')}" />
+            <button id="saveKey"${connection ? '' : ' disabled'}>${t('Save key')}</button>
             ${maskedKey ? `<button id="clearKey">${t('Clear key')}</button>` : ''}
             ${keyState}
         </div>
-        ${errorBanner}
         ${renderNote('storage')}
     </div>
     <div class="section">
-        <div class="section-title">${t('Credit usage')}</div>
-        ${detail ? `${modeLine}${usageTable}${freeTierLine}${remainingLine}` : emptyState(t('No usage information yet. Save an API key to load account details.'))}
-        ${limitLine}
-        ${updatedLine}
+        <div class="section-title">${t('Shared settings')}</div>
+        <div class="keyline">
+            <label class="optlabel" for="refreshInterval">${t('Usage refresh interval (minutes)')}</label>
+            <input type="number" id="refreshInterval" min="1" max="${MAX_REFRESH_INTERVAL_MINUTES}" step="1" aria-label="${t('Usage refresh interval in minutes')}" title="${t('Refresh usage data every 1 to {0} minutes', MAX_REFRESH_INTERVAL_MINUTES)}" value="${esc(String(refreshIntervalMinutes))}" />
+        </div>
     </div>
-    <div class="section">
-        <div class="section-title">${t('Model availability')}</div>
-        <label class="optlabel"><input type="checkbox" id="hideUnavailableModels" ${hideUnavailableModels ? 'checked' : ''} /> ${t('Hide models this key cannot use')}</label>
-        ${renderNote('hideUnavailable')}
-    </div>
-    </section>
-
-    <section class="tab-panel" id="panel-session-spend" role="tabpanel" aria-labelledby="tab-session-spend" tabindex="0" hidden>
-    <div class="section">
-        <div class="section-title">${t('Session spend')}</div>
-        ${sessionCostHtml}
-        ${renderNote('byokRoutes')}
-    </div>
-    </section>
-
-    <section class="tab-panel" id="panel-configurations" role="tabpanel" aria-labelledby="tab-configurations" tabindex="0" hidden>
     <div class="section">
         <div class="section-title">${t('Output reserve')}</div>
         <div class="keyline">
@@ -571,7 +594,32 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
         <label class="optlabel"><input type="checkbox" id="sanitizeBase64" ${sanitizeBase64Content ? 'checked' : ''} /> ${t('Remove long base64-like text from prompts')}</label>
         ${renderNote('promptSanitization')}
     </div>
+    </section>
+    <section class="tab-panel" id="panel-connection" role="tabpanel" aria-labelledby="tab-connection-${esc(encodeURIComponent(connectionId))}" tabindex="0" hidden>
+    ${connection ? `<p class="helptext connection-url">${esc(connection.name)} · ${esc(connection.baseUrl)}</p>${connection.enabled ? '' : `<p class="warn">${t('This connection is disabled. Enable it in Settings to show its models in Copilot.')}</p>`}` : emptyState(t('Add a connection in Settings to get started.'))}
+    ${isOpenRouter ? `    <div class="section">
+        <div class="section-title">${t('Credit usage')}</div>
+        ${detail ? `${modeLine}<div class="table-scroll">${usageTable}</div>${freeTierLine}${remainingLine}` : emptyState(t('No usage information yet. Save an API key to load account details.'))}
+        ${limitLine}
+        ${updatedLine}
+    </div>
     <div class="section">
+        <div class="section-title">${t('Model availability')}</div>
+        <label class="optlabel"><input type="checkbox" id="hideUnavailableModels" ${hideUnavailableModels ? 'checked' : ''} /> ${t('Hide models this key cannot use')}</label>
+        ${renderNote('hideUnavailable')}
+    </div>
+` : `<div class="section"><div class="section-title">${t('Usage')}</div>${emptyState(t('This API does not provide OpenRouter credits or authoritative cost data. Token counts may be reported by the server.'))}</div>
+    <div class="section"><div class="section-title">${t('Manual models')}</div>
+        <p class="helptext">${t('Optional model definitions override or supplement /models. Use an array with id, name, contextLength, maxOutputTokens, toolCalling, and imageInput.')}</p>
+        <textarea id="manualModels" rows="6" aria-label="${t('Manual model definitions JSON')}">${esc(JSON.stringify(connection?.models ?? [], null, 2))}</textarea>
+        <button id="saveManualModels">${t('Save models')}</button>
+    </div>`}
+    <div class="section">
+        <div class="section-title">${t('Session spend')}</div>
+        ${sessionCostHtml}
+        ${isOpenRouter ? renderNote('byokRoutes') : ''}
+    </div>
+    ${isOpenRouter ? `<div class="section">
         <div class="section-title">${t('Presets')}</div>
         <div class="keyline">
             <label class="optlabel" for="presetSelect">${t('Preset')}</label>
@@ -579,75 +627,76 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
         </div>
         ${presetsHint}
         ${renderNoteList(['presetSelection', 'pickerPresets'])}
-    </div>
+    </div>` : ''}
 
     <div class="section">
         <div class="section-title">${t('Custom request')}</div>
+        ${isOpenRouter ? '' : `<p class="helptext">${esc(t('To request token usage from servers that support it, include "stream_options": {"include_usage": true} in the request JSON.'))}</p>`}
         <textarea id="template" aria-label="${t('Custom request JSON')}" rows="10" placeholder="${t('Paste a request body from the OpenRouter Request Builder (or any Chat Completions JSON).')}"></textarea>
         <div class="keyline">
             <button id="saveTemplate">${t('Save request')}</button>
         </div>
-        ${renderNoteList(['streaming', 'liveConversation', 'thinkingEffort', 'providerRouting', 'anthropicCaching'])}
+        ${renderNoteList(isOpenRouter ? ['streaming', 'liveConversation', 'thinkingEffort', 'providerRouting', 'anthropicCaching'] : ['streaming', 'liveConversation'])}
     </div>
     </section>
 
     <script nonce="${nonce}">
         const vsc = acquireVsCodeApi();
         const savedState = vsc.getState() || {};
-        const draft = {
-            activeTab: savedState.activeTab,
-            template: typeof savedState.draftTemplate === 'string' ? savedState.draftTemplate : undefined,
-            templateBase: savedState.draftTemplateBase,
-            preset: typeof savedState.draftPreset === 'string' ? savedState.draftPreset : undefined,
-            presetBase: savedState.draftPresetBase,
-            reservePercent: savedState.draftReservePercent,
-            reservePercentBase: savedState.draftReservePercentBase,
-            reserveMin: savedState.draftReserveMin,
-            reserveMinBase: savedState.draftReserveMinBase,
-            reserveMax: savedState.draftReserveMax,
-            reserveMaxBase: savedState.draftReserveMaxBase,
-        };
+        const connectionId = ${jsonForScript(connectionId)};
+        const requireConnectionScope = ${JSON.stringify(options.connections !== undefined)};
+        const connectionEnabled = ${JSON.stringify(connection?.enabled ?? false)};
+        const connectionDrafts = savedState.connectionDrafts || {};
+        const draft = { ...(connectionDrafts[connectionId] || {}), activeTab: savedState.activeTab };
+        const sharedDraft = savedState.sharedDraft || {};
+        for (const prop of ['reservePercent', 'reservePercentBase', 'reserveMin', 'reserveMinBase', 'reserveMax', 'reserveMaxBase']) {
+            draft[prop] = sharedDraft[prop];
+        }
         let stateTimer;
         const persistState = () => {
             if (stateTimer) {
                 clearTimeout(stateTimer);
                 stateTimer = undefined;
             }
-            vsc.setState({
-                activeTab: draft.activeTab,
-                draftTemplate: draft.template,
-                draftTemplateBase: draft.templateBase,
-                draftPreset: draft.preset,
-                draftPresetBase: draft.presetBase,
-                draftReservePercent: draft.reservePercent,
-                draftReservePercentBase: draft.reservePercentBase,
-                draftReserveMin: draft.reserveMin,
-                draftReserveMinBase: draft.reserveMinBase,
-                draftReserveMax: draft.reserveMax,
-                draftReserveMaxBase: draft.reserveMaxBase,
-            });
+            connectionDrafts[connectionId] = {
+                template: draft.template, templateBase: draft.templateBase,
+                preset: draft.preset, presetBase: draft.presetBase,
+                manualModels: draft.manualModels, manualModelsBase: draft.manualModelsBase,
+            };
+            const sharedDraft = {};
+            for (const prop of ['reservePercent', 'reservePercentBase', 'reserveMin', 'reserveMinBase', 'reserveMax', 'reserveMaxBase']) {
+                sharedDraft[prop] = draft[prop];
+            }
+            vsc.setState({ activeTab: draft.activeTab, connectionDrafts, sharedDraft });
         };
         const persistStateSoon = () => {
             if (stateTimer) clearTimeout(stateTimer);
             stateTimer = setTimeout(persistState, 250);
         };
+        const post = (type, value) => vsc.postMessage({ type, value, connectionId });
         const bind = (id, event, fn) => {
             const el = document.getElementById(id);
             if (el) el.addEventListener(event, fn);
         };
         const tabs = Array.from(document.querySelectorAll('[role="tab"]'));
-        const activateTab = (tab) => {
+        const activateTab = (tab, notify = true) => {
+            const targetId = tab.dataset.connectionId;
+            const nextKey = document.getElementById('key');
+            if (nextKey) { nextKey.value = currentKeyMask; nextKey.type = currentKeyMask ? 'text' : 'password'; }
             tabs.forEach((item) => {
                 const selected = item === tab;
                 item.setAttribute('aria-selected', String(selected));
                 item.tabIndex = selected ? 0 : -1;
-                document.getElementById(item.getAttribute('aria-controls')).hidden = !selected;
             });
+            document.getElementById('panel-settings').hidden = !!targetId;
+            document.getElementById('panel-connection').hidden = !targetId || targetId !== connectionId;
+            if (targetId) document.getElementById('panel-connection').setAttribute('aria-labelledby', tab.id);
             draft.activeTab = tab.id;
-            persistStateSoon();
+            persistState();
+            if (notify && targetId && targetId !== connectionId) {
+                vsc.postMessage({ type: 'selectConnection', connectionId: targetId });
+            }
         };
-        const initialTab = tabs.find((tab) => tab.id === draft.activeTab) || tabs[0];
-        activateTab(initialTab);
         tabs.forEach((tab, index) => {
             tab.addEventListener('click', () => activateTab(tab));
             tab.addEventListener('keydown', (event) => {
@@ -686,13 +735,14 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
             if (keyEl.value !== currentKeyMask) keyEl.type = 'password';
         });
         bind('saveKey', 'click', () => {
-            vsc.postMessage({ type: 'saveKey', value: keyEl.value, currentKeyMasked: currentKeyMask });
+            vsc.postMessage({ type: 'saveKey', value: keyEl.value, currentKeyMasked: currentKeyMask, connectionId });
         });
         bind('clearKey', 'click', () => {
-            vsc.postMessage({ type: 'clearKey' });
+            post('clearKey');
         });
         const presetEl = document.getElementById('presetSelect');
         const restorePreset = (value) => {
+            if (!presetEl) return;
             const exists = Array.from(presetEl.options).some((o) => o.value === value);
             if (!exists && value !== '') {
                 const option = document.createElement('option');
@@ -702,14 +752,14 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
             }
             presetEl.value = value;
         };
-        if (typeof draft.preset === 'string' && draft.presetBase === rendered.preset) {
+        if (presetEl && typeof draft.preset === 'string' && draft.presetBase === rendered.preset) {
             restorePreset(draft.preset);
         }
         bind('presetSelect', 'change', () => {
             draft.preset = presetEl.value;
             draft.presetBase = rendered.preset;
             persistState();
-            vsc.postMessage({ type: 'selectPreset', value: presetEl.value });
+            post('selectPreset', presetEl.value);
         });
         const bindReserveField = (id, prop, baseProp, messageType) => {
             const el = document.getElementById(id);
@@ -733,16 +783,16 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
         bindReserveField('outputReserveMinTokens', 'reserveMin', 'reserveMinBase', 'saveOutputReserveMinTokens');
         bindReserveField('outputReserveMaxTokens', 'reserveMax', 'reserveMaxBase', 'saveOutputReserveMaxTokens');
         bind('limit', 'change', () => {
-            vsc.postMessage({ type: 'saveLimit', value: document.getElementById('limit').value });
+            post('saveLimit', document.getElementById('limit').value);
         });
         bind('refresh', 'click', () => {
-            vsc.postMessage({ type: 'refresh' });
+            post('refresh');
         });
         bind('resetPeriod', 'change', () => {
-            vsc.postMessage({ type: 'saveResetPeriod', value: document.getElementById('resetPeriod').value });
+            post('saveResetPeriod', document.getElementById('resetPeriod').value);
         });
         bind('includeByok', 'change', () => {
-            vsc.postMessage({ type: 'saveIncludeByok', value: document.getElementById('includeByok').checked });
+            post('saveIncludeByok', document.getElementById('includeByok').checked);
         });
         bind('refreshInterval', 'change', () => {
             vsc.postMessage({ type: 'saveRefreshInterval', value: document.getElementById('refreshInterval').value });
@@ -751,14 +801,81 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
             vsc.postMessage({ type: 'saveSanitizeBase64', value: document.getElementById('sanitizeBase64').checked });
         });
         bind('hideUnavailableModels', 'change', () => {
-            vsc.postMessage({ type: 'saveHideUnavailableModels', value: document.getElementById('hideUnavailableModels').checked });
+            post('saveHideUnavailableModels', document.getElementById('hideUnavailableModels').checked);
         });
         bind('saveTemplate', 'click', () => {
-            vsc.postMessage({ type: 'saveTemplate', value: templateEl.value });
+            post('saveTemplate', templateEl.value);
         });
+        let creatingConnection = false;
+        bind('connectionSelect', 'change', () => {
+            persistState();
+            vsc.postMessage({ type: 'selectConnection', connectionId: document.getElementById('connectionSelect').value, value: 'settings' });
+        });
+        bind('addConnection', 'click', () => {
+            creatingConnection = true;
+            document.getElementById('connectionName').value = '';
+            document.getElementById('connectionUrl').value = 'https://openrouter.ai/api/v1';
+            document.getElementById('connectionKind').value = 'openrouter';
+            document.getElementById('newConnectionHint').hidden = false;
+            document.getElementById('cancelConnection').hidden = false;
+            document.getElementById('connectionKind').disabled = false;
+            document.getElementById('key').value = '';
+            document.getElementById('saveKey').disabled = true;
+            const clear = document.getElementById('clearKey');
+            if (clear) clear.disabled = true;
+            for (const id of ['toggleConnection', 'deleteConnection', 'addConnection']) {
+                const control = document.getElementById(id);
+                if (control) control.disabled = true;
+            }
+            document.getElementById('connectionName').focus();
+        });
+        bind('cancelConnection', 'click', () => {
+            creatingConnection = false;
+            const saved = ${jsonForScript(connection ?? {})};
+            document.getElementById('connectionName').value = saved.name || '';
+            document.getElementById('connectionUrl').value = saved.baseUrl || 'https://openrouter.ai/api/v1';
+            document.getElementById('connectionKind').value = saved.kind || 'openrouter';
+            document.getElementById('connectionKind').disabled = !!connectionId;
+            document.getElementById('newConnectionHint').hidden = true;
+            document.getElementById('cancelConnection').hidden = true;
+            keyEl.value = currentKeyMask;
+            document.getElementById('saveKey').disabled = !connectionId;
+            const clear = document.getElementById('clearKey');
+            if (clear) clear.disabled = false;
+            for (const id of ['toggleConnection', 'deleteConnection', 'addConnection']) {
+                const control = document.getElementById(id);
+                if (control) control.disabled = false;
+            }
+        });
+        bind('connectionForm', 'submit', (event) => {
+            event.preventDefault();
+            const value = {
+                name: document.getElementById('connectionName').value,
+                baseUrl: document.getElementById('connectionUrl').value,
+                kind: document.getElementById('connectionKind').value,
+            };
+            if (creatingConnection || !connectionId) vsc.postMessage({ type: 'addConnection', value });
+            else post('updateConnection', value);
+        });
+        bind('toggleConnection', 'click', () => post('setConnectionEnabled', !connectionEnabled));
+        bind('deleteConnection', 'click', () => post('deleteConnection'));
+        const manualEl = document.getElementById('manualModels');
+        if (manualEl) {
+            const manualBase = manualEl.value;
+            if (typeof draft.manualModels === 'string' && draft.manualModelsBase === manualBase) manualEl.value = draft.manualModels;
+            manualEl.addEventListener('input', () => {
+                draft.manualModels = manualEl.value;
+                draft.manualModelsBase = manualBase;
+                persistStateSoon();
+            });
+            bind('saveManualModels', 'click', () => post('saveManualModels', manualEl.value));
+        }
+        const initialTab = tabs.find((tab) => tab.id === draft.activeTab) || tabs[0];
+        activateTab(initialTab, false);
         window.addEventListener('message', (event) => {
             const m = event.data;
-            if (!m || typeof m !== 'object') {
+            if (!m || typeof m !== 'object') return;
+            if (requireConnectionScope ? m.connectionId !== connectionId : m.connectionId && m.connectionId !== connectionId) {
                 return;
             }
             if (m.type === 'templateCleared') {
@@ -767,7 +884,7 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
                 delete draft.templateBase;
                 delete draft.preset;
                 delete draft.presetBase;
-                presetEl.value = '';
+                if (presetEl) presetEl.value = '';
                 persistState();
                 return;
             }
@@ -795,9 +912,14 @@ export interface PanelMessage {
     type: string;
     value?: unknown;
     currentKeyMasked?: string;
+    connectionId?: string;
 }
 
 export interface PanelDeps {
+    selectConnection?: (id: string) => Promise<void>;
+    addConnection?: (input: ConnectionInput) => Promise<void>;
+    updateConnection?: (id: string, patch: ConnectionPatch) => Promise<void>;
+    deleteConnection?: (id: string) => Promise<void>;
     updateConfig: (key: string, value: unknown) => Thenable<void>;
     error: (message: string) => void;
     info: (message: string) => void;
@@ -827,8 +949,88 @@ async function saveConfig(deps: PanelDeps, key: string, value: unknown): Promise
     await deps.updateConfig(key, value);
 }
 
+function parseConnectionInput(value: unknown): ConnectionInput | undefined {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+    const input = value as Record<string, unknown>;
+    if (typeof input.name !== 'string' || !input.name.trim()
+        || (input.kind !== 'openrouter' && input.kind !== 'openai-compatible')
+        || typeof input.baseUrl !== 'string') return undefined;
+    try {
+        const url = new URL(input.baseUrl.trim());
+        if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+            return undefined;
+        }
+    } catch {
+        return undefined;
+    }
+    return { name: input.name.trim(), kind: input.kind, baseUrl: input.baseUrl.trim() };
+}
+
+function parseManualModels(value: unknown): ManualModel[] | undefined {
+    let parsed: unknown;
+    try {
+        parsed = typeof value === 'string' ? JSON.parse(value) : value;
+    } catch {
+        return undefined;
+    }
+    if (!Array.isArray(parsed)) return undefined;
+    const ids = new Set<string>();
+    const models: ManualModel[] = [];
+    for (const value of parsed) {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+        const model = value as Record<string, unknown>;
+        if (typeof model.id !== 'string' || !model.id.trim() || ids.has(model.id.trim())) return undefined;
+        if (model.name !== undefined && (typeof model.name !== 'string' || !model.name.trim())) return undefined;
+        for (const field of ['contextLength', 'maxOutputTokens']) {
+            if (model[field] !== undefined && (!Number.isSafeInteger(model[field]) || Number(model[field]) <= 0)) {
+                return undefined;
+            }
+        }
+        for (const field of ['toolCalling', 'imageInput']) {
+            if (model[field] !== undefined && typeof model[field] !== 'boolean') return undefined;
+        }
+        if (Object.keys(model).some(field => !['id', 'name', 'contextLength', 'maxOutputTokens', 'toolCalling', 'imageInput'].includes(field))) {
+            return undefined;
+        }
+        ids.add(model.id.trim());
+        models.push({ ...model, id: model.id.trim() } as unknown as ManualModel);
+    }
+    return models;
+}
+
 export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Promise<void> {
     switch (msg.type) {
+        case 'selectConnection':
+            if (msg.connectionId) await deps.selectConnection?.(msg.connectionId);
+            return;
+        case 'addConnection':
+        case 'updateConnection': {
+            const input = parseConnectionInput(msg.value);
+            if (!input) {
+                deps.error(t('Enter a connection name, API type, and an HTTP or HTTPS base URL without credentials, query, or fragment.'));
+                return;
+            }
+            if (msg.type === 'addConnection') await deps.addConnection?.(input);
+            else if (msg.connectionId) await deps.updateConnection?.(msg.connectionId, input);
+            return;
+        }
+        case 'deleteConnection':
+            if (msg.connectionId) await deps.deleteConnection?.(msg.connectionId);
+            return;
+        case 'setConnectionEnabled':
+            if (msg.connectionId && typeof msg.value === 'boolean') {
+                await deps.updateConnection?.(msg.connectionId, { enabled: msg.value });
+            }
+            return;
+        case 'saveManualModels': {
+            const models = parseManualModels(msg.value);
+            if (!models) {
+                deps.error(t('Enter a JSON array of models with unique ids and valid optional names, token limits, and capability flags.'));
+                return;
+            }
+            if (msg.connectionId) await deps.updateConnection?.(msg.connectionId, { models });
+            return;
+        }
         case 'saveKey': {
             const trimmed = String(msg.value ?? '').trim();
             if (!trimmed) {

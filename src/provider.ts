@@ -23,6 +23,7 @@ import {
     type OutputReservePolicy,
 } from './modelInfo';
 import { formatUsdPrecise, roundSignificant } from './logic';
+import type { ConnectionKind, ManualModel } from './connections';
 
 const TEMPLATE_KEY = 'requestTemplate';
 const OPENROUTER_API_BASE_URL = 'https://openrouter.ai/api/v1';
@@ -336,8 +337,19 @@ export function sessionIdFor(conversationId: unknown): string | undefined {
  */
 const PARENT_ATTRIBUTION_WINDOW_MS = 10 * 60 * 1000;
 
-let lastActiveSessionId: string | undefined;
-let lastActiveAt = 0;
+interface SpendLedger {
+    sessionCosts: Map<string, SessionCost>;
+    lastActiveSessionId?: string;
+    lastActiveAt: number;
+    lastStamp: number;
+    persistQueue: Promise<unknown>;
+    persistSessionCosts?: (snapshot: SessionCost[]) => void;
+    persistParentSession?: (sessionId: string, at: number) => void;
+}
+function createSpendLedger(): SpendLedger {
+    return { sessionCosts: new Map(), lastActiveAt: 0, lastStamp: 0, persistQueue: Promise.resolve() };
+}
+const defaultLedger = createSpendLedger();
 
 /**
  * Whether a request came through the Copilot harness at all.
@@ -389,16 +401,17 @@ export function resolveCostSession(
     sessionId: string,
     hasConversationId: boolean,
     now = Date.now(),
-    harnessOwned = true
+    harnessOwned = true,
+    ledger: SpendLedger = defaultLedger
 ): string {
     if (hasConversationId) {
-        lastActiveSessionId = sessionId;
-        lastActiveAt = now;
-        persistParentSession?.(sessionId, now);
+        ledger.lastActiveSessionId = sessionId;
+        ledger.lastActiveAt = now;
+        ledger.persistParentSession?.(sessionId, now);
         return sessionId;
     }
-    if (harnessOwned && lastActiveSessionId !== undefined && now - lastActiveAt <= PARENT_ATTRIBUTION_WINDOW_MS) {
-        return lastActiveSessionId;
+    if (harnessOwned && ledger.lastActiveSessionId !== undefined && now - ledger.lastActiveAt <= PARENT_ATTRIBUTION_WINDOW_MS) {
+        return ledger.lastActiveSessionId;
     }
     return UNATTRIBUTED_SESSION_ID;
 }
@@ -408,20 +421,23 @@ export function resolveCostSession(
  * after a reload still joins its parent's OpenRouter session. The attribution
  * window still applies, so a long-idle parent is not resurrected.
  */
-export function hydrateParentAttribution(stored: { sessionId?: unknown; at?: unknown } | undefined): void {
+export function hydrateParentAttribution(
+    stored: { sessionId?: unknown; at?: unknown } | undefined, ledger: SpendLedger = defaultLedger
+): void {
     if (!stored || typeof stored.sessionId !== 'string' || !stored.sessionId.startsWith(SESSION_ID_PREFIX)) {
         return;
     }
     const at = typeof stored.at === 'number' && Number.isFinite(stored.at) ? stored.at : 0;
-    if (at > lastActiveAt) {
-        lastActiveSessionId = stored.sessionId;
-        lastActiveAt = at;
+    if (at > ledger.lastActiveAt) {
+        ledger.lastActiveSessionId = stored.sessionId;
+        ledger.lastActiveAt = at;
     }
 }
 
 export function resetParentAttributionForTesting(): void {
-    lastActiveSessionId = undefined;
-    lastActiveAt = 0;
+    const ledger = defaultLedger;
+    ledger.lastActiveSessionId = undefined;
+    ledger.lastActiveAt = 0;
 }
 
 function finiteNumber(value: unknown): number | undefined {
@@ -468,6 +484,8 @@ export function buildUsagePart(usage: unknown): Record<string, unknown> | undefi
 }
 
 export interface TurnCost {
+    connectionId?: string;
+    costUnavailable?: boolean;
     openRouter: number;
     upstream?: number;
     isByok: boolean;
@@ -522,6 +540,7 @@ export function turnCostOf(usage: unknown, provider?: string): TurnCost | undefi
  * see the whole turn; this deliberately outlives the call.
  */
 export interface CostBucket {
+    costUnavailable?: boolean;
     paid: number;
     openRouter: number;
     upstream: number;
@@ -550,17 +569,9 @@ export interface SessionCost extends CostBucket {
     updatedAt: number;
 }
 
-const sessionCosts = new Map<string, SessionCost>();
 export const MAX_TRACKED_SESSIONS = 10;
 const SESSION_COSTS_KEY = 'sessionCosts';
 const PARENT_SESSION_KEY = 'parentSession';
-
-/** Persist hook, supplied by the provider once it has global state. Kept as a
- *  module-level callback so the accumulator stays callable from tests. */
-let persistSessionCosts: ((snapshot: SessionCost[]) => void) | undefined;
-let persistParentSession: ((sessionId: string, at: number) => void) | undefined;
-
-let lastStamp = 0;
 
 /**
  * A strictly increasing recency stamp, in milliseconds.
@@ -571,28 +582,28 @@ let lastStamp = 0;
  * keeps stale sessions. Bumping past the previous value guarantees a total order
  * while staying a usable timestamp.
  */
-function stamp(): number {
-    lastStamp = Math.max(Date.now(), lastStamp + 1);
-    return lastStamp;
+function stamp(ledger: SpendLedger): number {
+    ledger.lastStamp = Math.max(Date.now(), ledger.lastStamp + 1);
+    return ledger.lastStamp;
 }
 
-function trimToCap(): void {
-    if (sessionCosts.size <= MAX_TRACKED_SESSIONS) {
+function trimToCap(ledger: SpendLedger): void {
+    if (ledger.sessionCosts.size <= MAX_TRACKED_SESSIONS) {
         return;
     }
     // The unattributed bucket is not a chat and must not be evicted by chat
     // churn, so it keeps its slot and the chat entries share what is left.
-    const unattributedBucket = sessionCosts.get(UNATTRIBUTED_SESSION_ID);
-    const keep = [...sessionCosts.values()]
+    const unattributedBucket = ledger.sessionCosts.get(UNATTRIBUTED_SESSION_ID);
+    const keep = [...ledger.sessionCosts.values()]
         .filter(session => session.sessionId !== UNATTRIBUTED_SESSION_ID)
         .sort((a, b) => b.updatedAt - a.updatedAt)
         .slice(0, MAX_TRACKED_SESSIONS - (unattributedBucket ? 1 : 0));
-    sessionCosts.clear();
+    ledger.sessionCosts.clear();
     for (const session of keep) {
-        sessionCosts.set(session.sessionId, session);
+        ledger.sessionCosts.set(session.sessionId, session);
     }
     if (unattributedBucket) {
-        sessionCosts.set(UNATTRIBUTED_SESSION_ID, unattributedBucket);
+        ledger.sessionCosts.set(UNATTRIBUTED_SESSION_ID, unattributedBucket);
     }
 }
 
@@ -604,7 +615,9 @@ function trimToCap(): void {
  * and only genuinely-absent sessions are restored. That also makes hydration
  * idempotent if a second provider instance is ever created.
  */
-export function hydrateSessionCosts(sessions: SessionCost[] | undefined): void {
+export function hydrateSessionCosts(
+    sessions: SessionCost[] | undefined, ledger: SpendLedger = defaultLedger
+): void {
     for (const session of sessions ?? []) {
         if (
             session &&
@@ -615,8 +628,9 @@ export function hydrateSessionCosts(sessions: SessionCost[] | undefined): void {
             // their parent or the bucket, so they are dropped.
             (session.sessionId.startsWith(SESSION_ID_PREFIX) || session.sessionId === UNATTRIBUTED_SESSION_ID) &&
             Number.isFinite(session.paid) &&
-            session.paid > 0 &&
-            !sessionCosts.has(session.sessionId)
+            (session.paid > 0 || (ledger !== defaultLedger && session.paid === 0
+                && Number.isFinite(session.calls) && session.calls > 0)) &&
+            !ledger.sessionCosts.has(session.sessionId)
         ) {
             const raw = session as unknown as Record<string, unknown>;
             const rawRoutes: unknown[] = Array.isArray(raw.routes) ? raw.routes : [];
@@ -631,7 +645,7 @@ export function hydrateSessionCosts(sessions: SessionCost[] | undefined): void {
                     byok: route.byok === true,
                     updatedAt: finiteNumber(route.updatedAt) ?? 0,
                 }));
-            sessionCosts.set(session.sessionId, {
+            ledger.sessionCosts.set(session.sessionId, {
                 ...session,
                 ...restoredBucket(raw),
                 byok: session.byok === true,
@@ -640,11 +654,12 @@ export function hydrateSessionCosts(sessions: SessionCost[] | undefined): void {
             });
         }
     }
-    trimToCap();
+    trimToCap(ledger);
 }
 
 export function resetSessionCostsForTesting(): void {
-    sessionCosts.clear();
+    const ledger = defaultLedger;
+    ledger.sessionCosts.clear();
 }
 
 function newBucket(): CostBucket {
@@ -654,6 +669,7 @@ function newBucket(): CostBucket {
 /** Restore a persisted bucket, substituting zero for missing or corrupted fields. */
 function restoredBucket(raw: Record<string, unknown>): CostBucket {
     return {
+        ...(raw.costUnavailable === true ? { costUnavailable: true } : {}),
         paid: Math.max(0, finiteNumber(raw.paid) ?? 0),
         openRouter: Math.max(0, finiteNumber(raw.openRouter) ?? 0),
         upstream: Math.max(0, finiteNumber(raw.upstream) ?? 0),
@@ -665,6 +681,7 @@ function restoredBucket(raw: Record<string, unknown>): CostBucket {
 }
 
 function addToBucket(bucket: CostBucket, cost: TurnCost): void {
+    if (cost.costUnavailable) { bucket.costUnavailable = true; }
     const payable = cost.openRouter > 0 ? cost.openRouter : (cost.upstream ?? 0);
     bucket.paid = roundSignificant(bucket.paid + payable);
     bucket.openRouter = roundSignificant(bucket.openRouter + cost.openRouter);
@@ -676,25 +693,46 @@ function addToBucket(bucket: CostBucket, cost: TurnCost): void {
 }
 
 /** Fold one model call's usage into its session's total and its route bucket.
- *  Returns the updated snapshot, or `undefined` when the call reported no
- *  payable cost. */
+ *  Generic connections also keep token-only calls and mark an unavailable cost;
+ *  legacy callers retain the payable-cost-only behavior. */
 export function accumulateSessionCost(
     sessionId: string,
     usage: unknown,
     provider?: string,
-    model?: string
+    model?: string,
+    ledger: SpendLedger = defaultLedger,
+    connectionId?: string,
+    includeTokenOnlyUsage = false
 ): SessionCost | undefined {
     // An empty key means "no bucket at all" — `resolveCostSession` never returns
     // one, so this only guards a bad direct call.
     if (typeof sessionId !== 'string' || sessionId.trim() === '') {
         return undefined;
     }
-    const cost = turnCostOf(usage, provider);
-    if (!cost) {
-        return undefined;
+    let cost = turnCostOf(usage, provider);
+    if (!cost && includeTokenOnlyUsage && usage && typeof usage === 'object' && !Array.isArray(usage)) {
+        const raw = usage as Record<string, unknown>;
+        const promptTokens = finiteNumber(raw.prompt_tokens);
+        const completionTokens = finiteNumber(raw.completion_tokens);
+        const amount = finiteNumber(raw.cost);
+        const details = raw.cost_details && typeof raw.cost_details === 'object'
+            ? raw.cost_details as Record<string, unknown> : {};
+        const upstream = finiteNumber(details.upstream_inference_cost);
+        const reportedCost = (amount !== undefined && amount >= 0) || (upstream !== undefined && upstream >= 0);
+        const tokenDetails = raw.prompt_tokens_details && typeof raw.prompt_tokens_details === 'object'
+            ? raw.prompt_tokens_details as Record<string, unknown> : {};
+        if (promptTokens !== undefined || completionTokens !== undefined || reportedCost) {
+            cost = {
+                openRouter: 0, isByok: raw.is_byok === true, provider,
+                promptTokens: Math.max(0, promptTokens ?? 0), completionTokens: Math.max(0, completionTokens ?? 0),
+                cachedTokens: Math.max(0, finiteNumber(tokenDetails.cached_tokens) ?? 0),
+                ...(!reportedCost ? { costUnavailable: true } : {}),
+            };
+        }
     }
-    const now = stamp();
-    const session = sessionCosts.get(sessionId) ?? {
+    if (!cost) { return undefined; }
+    const now = stamp(ledger);
+    const session = ledger.sessionCosts.get(sessionId) ?? {
         sessionId,
         ...newBucket(),
         byok: false,
@@ -717,12 +755,12 @@ export function accumulateSessionCost(
     // Most expensive route first: that is what a reader wants to see.
     session.routes.sort((a, b) => b.paid - a.paid);
 
-    sessionCosts.set(sessionId, session);
+    ledger.sessionCosts.set(sessionId, session);
 
     // Bound the map: keep only the most recently updated sessions.
-    trimToCap();
-    persistSessionCosts?.(getSessionCosts());
-    turnCostEmitter.fire(cost);
+    trimToCap(ledger);
+    ledger.persistSessionCosts?.(getSessionCosts(ledger));
+    turnCostEmitter.fire({ ...cost, ...(connectionId ? { connectionId } : {}) });
     return snapshotSession(session);
 }
 
@@ -731,15 +769,15 @@ function snapshotSession(session: SessionCost): SessionCost {
 }
 
 /** Every tracked session's running total, most recent first. */
-export function getSessionCosts(): SessionCost[] {
-    return [...sessionCosts.values()]
+export function getSessionCosts(ledger: SpendLedger = defaultLedger): SessionCost[] {
+    return [...ledger.sessionCosts.values()]
         .sort((a, b) => b.updatedAt - a.updatedAt)
         .map(snapshotSession);
 }
 
 /** The session's running total, or `undefined` if it has spent nothing yet. */
-export function getSessionCost(sessionId: string): SessionCost | undefined {
-    const found = sessionCosts.get(sessionId);
+export function getSessionCost(sessionId: string, ledger: SpendLedger = defaultLedger): SessionCost | undefined {
+    const found = ledger.sessionCosts.get(sessionId);
     return found ? snapshotSession(found) : undefined;
 }
 
@@ -781,10 +819,17 @@ export interface CostRouteCells {
     cached?: string;
 }
 
+export function costAmountText(bucket: Pick<CostBucket, 'paid' | 'costUnavailable'>): string {
+    if (bucket.costUnavailable) {
+        return bucket.paid > 0 ? t('{0} + unavailable', formatUsdPrecise(bucket.paid)) : t('Unavailable');
+    }
+    return formatUsdPrecise(bucket.paid);
+}
+
 export function routeCostCells(route: CostRoute): CostRouteCells {
     const providerName = route.provider === 'unknown' ? t('unknown') : route.provider;
     return {
-        cost: formatUsdPrecise(route.paid),
+        cost: costAmountText(route),
         provider: route.byok ? t('{0} (BYOK)', providerName) : providerName,
         model: route.model || undefined,
         calls: String(route.calls),
@@ -883,12 +928,14 @@ async function fetchWithRetry(
         let response: Response | undefined;
         let thrown: unknown;
         try {
-            response = await fetch(url, init);
+            response = await fetch(url, { ...init, redirect: 'error' });
         } catch (err) {
             thrown = err;
         }
         if (response !== undefined) {
-            assertSecureResponse(response);
+            if (/^https:/i.test(url)) {
+                assertSecureResponse(response);
+            }
         }
         if (thrown !== undefined) {
             if (token.isCancellationRequested) {
@@ -1054,7 +1101,8 @@ export function buildRequestBody(
     modelConfiguration: { readonly [key: string]: unknown } | undefined,
     cacheModelId?: string,
     sessionId?: string,
-    requireToolCall?: boolean
+    requireToolCall?: boolean,
+    openRouter = true
 ): Record<string, unknown> {
     const body: Record<string, unknown> = {
         ...(template ?? {}),
@@ -1067,8 +1115,10 @@ export function buildRequestBody(
     if (Array.isArray(body.tools) && body.tools.length === 0) {
         delete body.tools;
     }
-    delete body.session_id;
-    if (typeof sessionId === 'string' && sessionId.trim() !== '') {
+    if (openRouter) {
+        delete body.session_id;
+    }
+    if (openRouter && typeof sessionId === 'string' && sessionId.trim() !== '') {
         body.session_id = sessionId;
     }
     // Copilot's toolMode is an obligation on the provider. Auto (the default) needs
@@ -1080,7 +1130,7 @@ export function buildRequestBody(
     if (presetSlugFromModelId(modelId) !== undefined) {
         delete body.preset;
     }
-    const effort = effortFromModelConfiguration(modelConfiguration);
+    const effort = openRouter ? effortFromModelConfiguration(modelConfiguration) : undefined;
     if (effort === 'none') {
         const existing = body.reasoning;
         if (typeof existing === 'object' && existing !== null && !Array.isArray(existing)) {
@@ -1092,12 +1142,25 @@ export function buildRequestBody(
     } else {
         mergeReasoningConfig(body, 'effort', effort);
     }
-    mergeReasoningConfig(body, 'enabled', enabledFromModelConfiguration(modelConfiguration));
+    if (openRouter) {
+        mergeReasoningConfig(body, 'enabled', enabledFromModelConfiguration(modelConfiguration));
+    }
     const cacheId = cacheModelId ?? modelId;
-    if (cacheId.replace(/^~/, '').split('/')[0] === 'anthropic' && !('cache_control' in body)) {
+    if (openRouter && cacheId.replace(/^~/, '').split('/')[0] === 'anthropic' && !('cache_control' in body)) {
         body.cache_control = { type: 'ephemeral' };
     }
     return body;
+}
+
+export interface ProviderRuntimeConfig {
+    connectionId?: string;
+    baseUrl?: string;
+    kind?: ConnectionKind;
+    hideUnavailableModels?: boolean;
+    manualModels?: ManualModel[];
+    accounting?: OpenRouterChatProvider;
+    isCurrent?: () => boolean;
+    readKey?: () => Promise<string | undefined>;
 }
 
 interface ChatModelInfo extends vscode.LanguageModelChatInformation {
@@ -1107,6 +1170,7 @@ interface ChatModelInfo extends vscode.LanguageModelChatInformation {
 export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider {
     private cachedInfo: ChatModelInfo[] | undefined;
     private cachedCatalog: ModelCatalogEntry[] | undefined;
+    private readonly genericAssumptions = new WeakMap<ModelCatalogEntry, string[]>();
     private catalogPromise: Promise<ModelCatalogEntry[]> | undefined;
     private cachedAvailableIds: Set<string> | undefined;
     private availableCacheKey: string | undefined;
@@ -1121,35 +1185,57 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
     private key: string | undefined;
     private template: Record<string, unknown> | undefined;
     private readonly infoChangeEvent = new vscode.EventEmitter<void>();
-    private persistQueue: Promise<unknown> = Promise.resolve();
     private contextCapQueue: Promise<void> = Promise.resolve();
+    private readonly ledger: SpendLedger;
 
     readonly onDidChangeLanguageModelChatInformation: vscode.Event<void> = this.infoChangeEvent.event;
 
     constructor(
         private readonly secrets: vscode.SecretStorage,
-        private readonly state: vscode.Memento
+        private readonly state: vscode.Memento,
+        private readonly runtime: ProviderRuntimeConfig = {}
     ) {
-        // Restore spend recorded in previous windows, then keep it up to date.
-        // Persisted so the panel's Session spend survives a reload or restart;
-        // the accumulator itself stays a module-level map so it is testable.
-        hydrateSessionCosts(this.state.get<SessionCost[]>(SESSION_COSTS_KEY));
-        hydrateParentAttribution(this.state.get<{ sessionId: string; at: number }>(PARENT_SESSION_KEY));
+        this.ledger = runtime.accounting?.ledger ?? (runtime.connectionId ? createSpendLedger() : defaultLedger);
+        // Production connections own their ledger; the default ledger preserves
+        // the exported accounting helpers used by legacy callers and tests.
+        hydrateSessionCosts(this.state.get<SessionCost[]>(SESSION_COSTS_KEY), this.ledger);
+        hydrateParentAttribution(this.state.get<{ sessionId: string; at: number }>(PARENT_SESSION_KEY), this.ledger);
         this.migrateLegacyContextCaps();
-        persistSessionCosts = (snapshot) => {
+        this.ledger.persistSessionCosts = (snapshot) => {
             const value = snapshot.length === 0 ? undefined : snapshot;
-            this.persistQueue = this.persistQueue
+            this.ledger.persistQueue = this.ledger.persistQueue
                 .then(() => this.state.update(SESSION_COSTS_KEY, value))
                 .catch(() => undefined);
         };
-        persistParentSession = (sessionId, at) => {
-            this.persistQueue = this.persistQueue
+        this.ledger.persistParentSession = (sessionId, at) => {
+            this.ledger.persistQueue = this.ledger.persistQueue
                 .then(() => this.state.update(PARENT_SESSION_KEY, { sessionId, at }))
                 .catch(() => undefined);
         };
     }
 
+    getSessionCosts(): SessionCost[] {
+        return getSessionCosts(this.ledger);
+    }
+
+    private get isOpenRouter(): boolean {
+        return this.runtime.kind !== 'openai-compatible';
+    }
+
+    private get baseUrl(): string {
+        return (this.runtime.baseUrl ?? OPENROUTER_API_BASE_URL).replace(/\/+$/, '');
+    }
+
+    private get hideUnavailable(): boolean {
+        return this.isOpenRouter && (this.runtime.hideUnavailableModels ?? hideUnavailableModelsEnabled());
+    }
+
+    private headers(key: string | undefined): Record<string, string> {
+        return key ? { Authorization: `Bearer ${key}` } : {};
+    }
+
     dispose(): void {
+        this.invalidateCatalogCaches();
         this.infoChangeEvent.dispose();
     }
 
@@ -1326,7 +1412,10 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             return { ok: false, error: t('The template must be a JSON object (a request body).') };
         }
         const body = parsed as Record<string, unknown>;
-        const { messages, prompt, model, tools, stream, session_id, ...params } = body;
+        const { messages, prompt, model, tools, stream, ...params } = body;
+        if (this.isOpenRouter) {
+            delete params.session_id;
+        }
         this.template = params;
         await this.state.update(TEMPLATE_KEY, params);
         return { ok: true };
@@ -1349,12 +1438,12 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         if (this.key) {
             return this.key;
         }
-        const stored = await readKey(this.secrets);
+        const stored = this.runtime.readKey ? await this.runtime.readKey() : await readKey(this.secrets);
         if (stored) {
             this.key = stored;
             return stored;
         }
-        if (silent) {
+        if (silent || !this.isOpenRouter) {
             return undefined;
         }
         const value = await vscode.window.showInputBox({
@@ -1377,12 +1466,12 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             return this.cachedInfo;
         }
         const key = await this.getKey(options.silent);
-        if (!key) {
+        if (!key && this.isOpenRouter) {
             return [];
         }
         const generation = this.cacheGeneration;
-        const models = await this.ensureCatalog(key, token);
-        const visible = await this.resolveVisibleCatalog(key, models, token, generation);
+        const models = await this.ensureCatalog(key ?? '', token);
+        const visible = await this.resolveVisibleCatalog(key ?? '', models, token, generation);
         const stale = generation !== this.cacheGeneration;
         if (!stale) {
             this.cachedCatalog = visible;
@@ -1392,11 +1481,14 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             return info;
         }
         this.cachedInfo = info;
+        if (!this.isOpenRouter) {
+            return info;
+        }
         if (this.cachedPresets) {
             this.appendPresetEntries(info, models);
             return info;
         }
-        void this.attachPresets(key, models, info, generation);
+        void this.attachPresets(key ?? '', models, info, generation);
         return info;
     }
 
@@ -1412,7 +1504,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         token: vscode.CancellationToken,
         generation: number
     ): Promise<ModelCatalogEntry[]> {
-        if (!hideUnavailableModelsEnabled()) {
+        if (!this.hideUnavailable) {
             return models;
         }
         let available: Set<string> | undefined;
@@ -1490,9 +1582,10 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         }
         const bounded = boundedFetchSignal(token);
         try {
-            const response = await fetch(`${OPENROUTER_API_BASE_URL}/models/user?output_modalities=all`, {
-                headers: { Authorization: `Bearer ${key}` },
+            const response = await fetch(`${this.baseUrl}/models/user?output_modalities=all`, {
+                headers: this.headers(key),
                 signal: bounded.signal,
+                redirect: 'error',
             });
             assertSecureResponse(response);
             if (token.isCancellationRequested) {
@@ -1577,14 +1670,17 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         progress: vscode.Progress<ResponsePart>,
         token: vscode.CancellationToken
     ): Promise<void> {
+        const template = structuredClone((await this.getTemplate()) ?? {});
         const key = await this.getKey(true);
-        if (!key) {
+        if (this.runtime.isCurrent && !this.runtime.isCurrent()) {
+            throw vscode.LanguageModelError.NotFound('This connection changed while preparing the request. Select it again.');
+        }
+        if (!key && this.isOpenRouter) {
             throw vscode.LanguageModelError.NoPermissions(
                 t('OpenRouter key not configured. Run "OpenRouter: Manage provider".')
             );
         }
 
-        const template = (await this.getTemplate()) ?? {};
         const modelConfiguration = (
             options as { modelConfiguration?: { readonly [key: string]: unknown } }
         ).modelConfiguration;
@@ -1605,7 +1701,8 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             sessionIdFor(conversationId) ?? '',
             hasConversationId,
             Date.now(),
-            harnessOwned
+            harnessOwned,
+            this.ledger
         );
         const sessionId = costKey === UNATTRIBUTED_SESSION_ID ? undefined : costKey;
         const presetSlug = presetSlugFromModelId(model.id);
@@ -1618,7 +1715,11 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         const body = buildRequestBody(
             template,
             model.id,
-            toOpenAI(messages),
+            toOpenAI(messages).map(message => {
+                if (this.isOpenRouter || !message || typeof message !== 'object') { return message; }
+                const { reasoning_content, ...common } = message as Record<string, unknown>;
+                return reasoning_content === '' ? common : message;
+            }),
             options.tools?.map(tool => ({
                 type: 'function',
                 function: {
@@ -1630,7 +1731,8 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             modelConfiguration,
             presetModel,
             sessionId,
-            requireToolCall
+            requireToolCall,
+            this.isOpenRouter
         );
 
         lastStreamUsage = undefined;
@@ -1644,7 +1746,9 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             }
             usageAccounted = true;
             reportUsagePart(progress, usage);
-            accumulateSessionCost(costKey, usage, provider, recordedModel);
+            accumulateSessionCost(
+                costKey, usage, provider, recordedModel, this.ledger, this.runtime.connectionId, !this.isOpenRouter
+            );
         };
         const streamState = { reportedAnyPart: false, sawReasoning: false };
         const trackedProgress: vscode.Progress<ResponsePart> = {
@@ -1665,9 +1769,11 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         try {
             const headers = {
                 'Content-Type': 'application/json',
-                Authorization: `Bearer ${key}`,
-                'HTTP-Referer': 'https://github.com/tianyu-liu/vscode-openrouter-copilot-request-credit',
-                'X-Title': 'OpenRouter for Copilot',
+                ...this.headers(key),
+                ...(this.isOpenRouter ? {
+                    'HTTP-Referer': 'https://github.com/tianyu-liu/vscode-openrouter-copilot-request-credit',
+                    'X-Title': 'OpenRouter for Copilot',
+                } : {}),
             };
             const init = (payload: unknown): RequestInit => {
                 dumpRequestBody(payload);
@@ -1685,14 +1791,14 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
                 payload = cleaned.body;
                 sanitizedRemoved = cleaned.removed;
             }
-            let response = await fetchWithRetry(`${OPENROUTER_API_BASE_URL}/chat/completions`, init(payload), token);
+            let response = await fetchWithRetry(`${this.baseUrl}/chat/completions`, init(payload), token);
             if (response.status === 403 && sanitizedRemoved === 0 && (await isGuardrailBlock(response))) {
                 const cleaned = sanitizeRequestBody(body);
                 if (cleaned.removed > 0) {
                     await response.body?.cancel();
                     trackedProgress.report(new vscode.LanguageModelTextPart(t(GUARDRAIL_RETRY_NOTICE)));
                     response = await fetchWithRetry(
-                        `${OPENROUTER_API_BASE_URL}/chat/completions`,
+                        `${this.baseUrl}/chat/completions`,
                         init(cleaned.body),
                         token
                     );
@@ -1841,8 +1947,8 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         const bounded = boundedFetchSignal(token);
         try {
             const response = await fetchWithRetry(
-                `${OPENROUTER_API_BASE_URL}/models`,
-                { headers: { Authorization: `Bearer ${key}` }, signal: bounded.signal },
+                `${this.baseUrl}/models`,
+                { headers: this.headers(key), signal: bounded.signal },
                 token
             );
             await throwIfNotOk(response);
@@ -1855,13 +1961,66 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             if (!Array.isArray(json.data)) {
                 throw new Error(t('OpenRouter /models returned an unexpected response body (missing the data array).'));
             }
-            return json.data as ModelCatalogEntry[];
+            const models = (json.data as ModelCatalogEntry[]).filter(m => m && typeof m.id === 'string');
+            return this.isOpenRouter ? models : this.genericCatalog(models);
+        } catch (error) {
+            if (!this.isOpenRouter && this.runtime.manualModels?.length && !token.isCancellationRequested) {
+                return this.genericCatalog([]);
+            }
+            throw error;
         } finally {
             bounded.dispose();
         }
     }
 
+    private genericCatalog(models: ModelCatalogEntry[]): ModelCatalogEntry[] {
+        const merged = new Map(models.map(m => [m.id, m]));
+        for (const manual of this.runtime.manualModels ?? []) {
+            const previous = merged.get(manual.id);
+            merged.set(manual.id, {
+                ...previous,
+                id: manual.id,
+                ...(manual.name !== undefined ? { name: manual.name } : {}),
+                ...(manual.contextLength !== undefined ? { context_length: manual.contextLength } : {}),
+                ...(manual.maxOutputTokens !== undefined ? {
+                    top_provider: { ...previous?.top_provider, max_completion_tokens: manual.maxOutputTokens },
+                } : {}),
+                ...(manual.toolCalling !== undefined ? { supported_parameters: manual.toolCalling ? ['tools'] : [] } : {}),
+                ...(manual.imageInput !== undefined ? {
+                    architecture: {
+                        ...previous?.architecture, input_modalities: manual.imageInput ? ['text', 'image'] : ['text'],
+                    },
+                } : {}),
+            });
+        }
+        const positive = (value: unknown): number | undefined =>
+            typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
+        return [...merged.values()].map(m => {
+            const context = positive(m.context_length) ?? positive(m.top_provider?.context_length);
+            const output = positive(m.top_provider?.max_completion_tokens);
+            const toolsKnown = Array.isArray(m.supported_parameters) || typeof m.supports_tool_parameters === 'boolean';
+            const imagesKnown = Array.isArray(m.architecture?.input_modalities);
+            const assumed = [
+                ...(!context ? ['context'] : []), ...(!output ? ['output'] : []),
+                ...(!toolsKnown ? ['tools'] : []), ...(!imagesKnown ? ['images'] : []),
+            ];
+            const normalized: ModelCatalogEntry = {
+                ...m,
+                context_length: context ?? 8192,
+                architecture: {
+                    ...m.architecture, input_modalities: imagesKnown ? m.architecture?.input_modalities : ['text'],
+                },
+                supports_tool_parameters: typeof m.supports_tool_parameters === 'boolean'
+                    ? m.supports_tool_parameters : false,
+                top_provider: { ...m.top_provider, max_completion_tokens: output ?? 2048 },
+            };
+            this.genericAssumptions.set(normalized, assumed);
+            return normalized;
+        });
+    }
+
     async getPresets(): Promise<PresetSummary[] | undefined> {
+        if (!this.isOpenRouter) { return []; }
         if (this.cachedPresets) {
             return this.cachedPresets;
         }
@@ -1908,8 +2067,8 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         const bounded = boundedFetchSignal(token);
         try {
             const response = await fetchWithRetry(
-                `${OPENROUTER_API_BASE_URL}/presets?limit=100`,
-                { headers: { Authorization: `Bearer ${key}` }, signal: bounded.signal },
+                `${this.baseUrl}/presets?limit=100`,
+                { headers: this.headers(key), signal: bounded.signal },
                 token
             );
             if (!response.ok) {
@@ -1943,6 +2102,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
     }
 
     async getPresetConfig(slug: string): Promise<Record<string, unknown> | undefined> {
+        if (!this.isOpenRouter) { return undefined; }
         const cached = this.presetConfigs.get(slug);
         if (cached) {
             return cached;
@@ -1976,8 +2136,8 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         const bounded = boundedFetchSignal(token);
         try {
             const response = await fetchWithRetry(
-                `${OPENROUTER_API_BASE_URL}/presets/${encodeURIComponent(slug)}`,
-                { headers: { Authorization: `Bearer ${key}` }, signal: bounded.signal },
+                `${this.baseUrl}/presets/${encodeURIComponent(slug)}`,
+                { headers: this.headers(key), signal: bounded.signal },
                 token
             );
             if (!response.ok) {
@@ -2019,7 +2179,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         if (!preset.model) {
             return undefined;
         }
-        if (hideUnavailableModelsEnabled() && this.cachedAvailableIds && !this.presetModelAvailable(preset.model)) {
+        if (this.hideUnavailable && this.cachedAvailableIds && !this.presetModelAvailable(preset.model)) {
             return undefined;
         }
         const id = `${PRESET_ID_PREFIX}${preset.slug}`;
@@ -2070,6 +2230,29 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
                 imageInput: (m.architecture?.input_modalities ?? []).includes('image'),
             },
         };
+        if (!this.isOpenRouter) {
+            const knownPrice = (value: unknown): boolean => typeof value === 'string' && value.trim() !== ''
+                && Number.isFinite(Number(value)) && Number(value) >= 0;
+            const completePricing = knownPrice(m.pricing?.prompt) && knownPrice(m.pricing?.completion);
+            const genericInfo = completePricing ? { detail, tooltip } : buildModelInfo({ ...m, pricing: undefined }, budget);
+            const assumed = this.genericAssumptions.get(m) ?? [];
+            const labels: Record<string, string> = {
+                context: t('context window'), output: t('maximum output tokens'),
+                tools: t('tool calling'), images: t('image input'),
+            };
+            const assumptionNote = assumed.length > 0 ? t(
+                'Missing endpoint metadata: conservative defaults for {0}. Manual models can override them.',
+                assumed.map(field => labels[field]).join(', ')
+            ) : undefined;
+            const pricingDetail = genericInfo.detail ?? t('Pricing: unknown');
+            return {
+                ...info,
+                tooltip: [genericInfo.tooltip.replace(
+                    t('Pricing: not listed by OpenRouter'), t('Pricing: not listed by the endpoint')
+                ), assumptionNote].filter(Boolean).join('\n\n'),
+                detail: assumptionNote ? `${pricingDetail} \u00b7 ${t('conservative defaults')}` : pricingDetail,
+            };
+        }
         const reasoningSchema = buildReasoningSchema(m);
         const capSchema = buildContextCapSchema(m, this.getContextCaps()[m.id], budget.outputReserve);
         const schemaProperties = {
@@ -2248,7 +2431,8 @@ function reportThinkingParts(
     progress: vscode.Progress<ResponsePart>,
     state?: { sawReasoning: boolean }
 ): void {
-    const reasoning = typeof delta.reasoning === 'string' ? delta.reasoning : '';
+    const reasoning = typeof delta.reasoning === 'string' ? delta.reasoning
+        : typeof delta.reasoning_content === 'string' ? delta.reasoning_content : '';
     const details = Array.isArray(delta.reasoning_details)
         ? flattenReasoningDetails(delta.reasoning_details)
         : undefined;

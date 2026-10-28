@@ -11,8 +11,13 @@ import {
     renderPanelHtml,
     templatePresetSlug,
 } from './panel';
-import { readKey } from './storage';
-import { getSessionCosts, onTurnCost, OpenRouterChatProvider, SESSION_ID_PREFIX, type SessionCost } from './provider';
+import { readKey, resolveSecretStorage } from './storage';
+import { getSessionCosts, OpenRouterChatProvider, SESSION_ID_PREFIX, type SessionCost } from './provider';
+import {
+    ConnectionRegistry, type ConnectionDefinition, type ConnectionPatch, type ConnectionSettings,
+} from './connections';
+import { ConnectionChatProvider } from './connectionProvider';
+import { NativeGroupManager } from './nativeGroups';
 
 export { readConfig } from './panel';
 
@@ -26,6 +31,40 @@ let panel: vscode.WebviewPanel | undefined;
 let lastPanelHtml: string | undefined;
 let provider: OpenRouterChatProvider | undefined;
 let sessionTitleDir: vscode.Uri | undefined;
+let registry: ConnectionRegistry | undefined;
+let router: ConnectionChatProvider | undefined;
+let nativeGroups: NativeGroupManager | undefined;
+let selectedConnectionId: string | undefined;
+let extensionState: vscode.Memento | undefined;
+let panelMessageQueue: Promise<void> = Promise.resolve();
+
+const CONNECTION_MESSAGES = new Set([
+    'saveKey', 'clearKey', 'saveLimit', 'saveResetPeriod', 'saveIncludeByok', 'saveHideUnavailableModels',
+    'saveTemplate', 'clearTemplate', 'selectPreset', 'refresh', 'updateConnection', 'deleteConnection',
+    'setConnectionEnabled', 'saveManualModels',
+]);
+
+interface CreditState {
+    info?: KeyInfo;
+    fetchedAt?: Date;
+    accountCredits?: AccountCredits;
+    error?: string;
+    currentRun?: { controller: AbortController; done: Promise<KeyInfo | undefined> };
+}
+const connectionCredits = new Map<string, CreditState>();
+
+function creditState(id: string): CreditState {
+    let value = connectionCredits.get(id);
+    if (!value) {
+        value = {};
+        connectionCredits.set(id, value);
+    }
+    return value;
+}
+
+function selectedConnection(): ConnectionDefinition | undefined {
+    return selectedConnectionId ? registry?.get(selectedConnectionId) : undefined;
+}
 
 const CHAT_SESSIONS_DIR = 'chatSessions';
 const SESSION_TITLE_MAX_BYTES = 64 * 1024;
@@ -71,12 +110,7 @@ async function withSessionTitles(sessions: SessionCost[]): Promise<SessionCost[]
     );
 }
 
-let lastInfo: KeyInfo | undefined;
-let lastFetchAt: Date | undefined;
-let lastAccountCredits: AccountCredits | undefined;
-let lastErrorMessage: string | undefined;
-
-let currentRun: { controller: AbortController; done: Promise<KeyInfo | undefined> } | undefined;
+const legacyCredits: CreditState = {};
 
 let refreshTimerDisarmedForTesting = false;
 
@@ -119,6 +153,7 @@ export function getStatusText(): string | undefined {
 async function getJson(url: string, apiKey: string, signal?: AbortSignal, timeoutMs = 15000): Promise<unknown> {
     try {
         const res = await fetch(url, {
+            redirect: 'error',
             headers: {
                 Authorization: `Bearer ${apiKey}`,
                 'User-Agent': 'vscode-openrouter-copilot-request-credit',
@@ -180,39 +215,47 @@ async function updatePanel(
 ): Promise<void> {
     if (!panel) return;
     const render = ++panelRenderSeq;
-    const stale = (): boolean => render !== panelRenderSeq || (signal?.aborted ?? false) || !panel;
+    const connection = selectedConnection();
+    const id = connection?.id;
+    const state = id ? creditState(id) : undefined;
+    const activeProvider = id ? router?.getProvider(id) : provider;
+    const stale = (): boolean => render !== panelRenderSeq || (signal?.aborted ?? false) || !panel
+        || (id !== undefined && (selectedConnectionId !== id || registry?.get(id)?.revision !== connection?.revision));
+    const config = readConfig();
     const {
-        limit,
-        resetPeriod,
-        includeByok,
         refreshIntervalMinutes,
         sanitizeBase64Content,
-        hideUnavailableModels,
         outputReservePercent,
         outputReserveMinTokens,
         outputReserveMaxTokens,
-    } = readConfig();
-    const key = storedKey !== undefined ? storedKey : await readKey(secrets);
+    } = config;
+    const limit = connection?.settings.creditLimit ?? config.limit;
+    const resetPeriod = connection?.settings.creditResetPeriod ?? config.resetPeriod;
+    const includeByok = connection?.settings.creditIncludeByok ?? config.includeByok;
+    const hideUnavailableModels = connection?.settings.hideUnavailableModels ?? config.hideUnavailableModels;
+    const key = storedKey !== undefined ? storedKey : id ? await registry?.readKey(id) : await readKey(secrets);
     if (stale()) return;
-    const template = provider ? await provider.getTemplate() : undefined;
+    const template = await activeProvider?.getTemplate();
     if (stale()) return;
-    const presets = provider ? await provider.getPresets() : [];
+    const presets = activeProvider ? await activeProvider.getPresets() : [];
     if (stale()) return;
     const presetSlug = templatePresetSlug(template);
-    const presetConfig = presetSlug && provider ? await provider.getPresetConfig(presetSlug) : undefined;
+    const presetConfig = presetSlug && activeProvider ? await activeProvider.getPresetConfig(presetSlug) : undefined;
     if (stale()) return;
-    const sessions = await withSessionTitles(getSessionCosts());
+    const sessions = await withSessionTitles(id ? router?.getSessionCosts(id) ?? [] : getSessionCosts());
     if (stale()) return;
     const html = renderPanelHtml({
-        info,
+        connections: registry?.list(),
+        selectedConnectionId: id,
+        info: state ? state.info : info,
         limit,
         resetPeriod,
         includeByok,
         refreshIntervalMinutes,
-        fetchedAt: lastFetchAt,
+        fetchedAt: state ? state.fetchedAt : legacyCredits.fetchedAt,
         maskedKey: key ? maskKey(key) : undefined,
-        accountCredits: lastAccountCredits,
-        errorMessage: lastErrorMessage,
+        accountCredits: state ? state.accountCredits : legacyCredits.accountCredits,
+        errorMessage: state ? state.error : legacyCredits.error,
         template,
         presets,
         presetConfig,
@@ -251,6 +294,125 @@ export function createPanelDeps(
     };
 }
 
+async function selectConnection(id: string, secrets: vscode.SecretStorage): Promise<void> {
+    if (!registry?.get(id)) throw new Error(t('Connection no longer exists.'));
+    selectedConnectionId = id;
+    provider = router?.getProvider(id);
+    ++panelRenderSeq;
+    await extensionState?.update('selectedConnectionId', id);
+    await updatePanel(secrets, creditState(id).info);
+    await refresh(secrets, id);
+}
+
+export async function updateConnectionWithGroup(
+    store: Pick<ConnectionRegistry, 'get' | 'update'>,
+    groups: Pick<NativeGroupManager, 'update'>,
+    id: string,
+    patch: ConnectionPatch
+): Promise<ConnectionDefinition> {
+    const before = store.get(id);
+    if (!before) throw new Error(t('Connection no longer exists.'));
+    const updated = await store.update(id, patch);
+    if (updated.name !== before.name) {
+        try {
+            await groups.update(updated);
+        } catch (error) {
+            await store.update(id, {
+                name: before.name, kind: before.kind, baseUrl: before.baseUrl,
+                enabled: before.enabled, settings: before.settings, models: before.models,
+            });
+            throw error;
+        }
+    }
+    return updated;
+}
+
+function createConnectionPanelDeps(secrets: vscode.SecretStorage, id: string | undefined): PanelDeps {
+    const store = registry!;
+    const requireConnection = (): ConnectionDefinition => {
+        const connection = id ? store.get(id) : undefined;
+        if (!connection) throw new Error(t('Select a connection first.'));
+        return connection;
+    };
+    const requireProvider = (): OpenRouterChatProvider => {
+        const child = router?.getProvider(requireConnection().id);
+        if (!child) throw new Error(t('Connection no longer exists.'));
+        return child;
+    };
+    const refreshCurrent = async (): Promise<void> => {
+        await doRefresh(secrets, requireConnection().id);
+    };
+    return {
+        error: message => void vscode.window.showErrorMessage(`${APP_PREFIX}${message}`),
+        info: message => void vscode.window.showInformationMessage(`${APP_PREFIX}${message}`),
+        updateConfig: async (key, value) => {
+            if (['creditLimit', 'creditResetPeriod', 'creditIncludeByok', 'hideUnavailableModels'].includes(key)) {
+                const connection = requireConnection();
+                await store.update(connection.id, { settings: { [key]: value } as Partial<ConnectionSettings> });
+            } else {
+                await getConfig().update(key, value, vscode.ConfigurationTarget.Global);
+            }
+        },
+        doRefresh: refreshCurrent,
+        refresh: async () => { await refresh(secrets, requireConnection().id); },
+        saveTemplate: async raw => requireProvider().setTemplate(raw),
+        clearTemplate: async () => {
+            await requireProvider().clearTemplate();
+            await updatePanel(secrets, id ? creditState(id).info : undefined);
+        },
+        setKey: async value => { await store.storeKey(requireConnection().id, value); },
+        clearKey: async () => { await store.clearKey(requireConnection().id); },
+        syncPresetSelection: slug => {
+            if (selectedConnectionId === id) {
+                void panel?.webview.postMessage({ type: 'presetSelection', value: slug ?? '', connectionId: id });
+            }
+        },
+        selectConnection: selected => selectConnection(selected, secrets),
+        addConnection: async input => {
+            const connection = await store.add(input);
+            try {
+                await nativeGroups?.add(connection);
+            } catch (error) {
+                await store.remove(connection.id);
+                throw error;
+            } finally {
+                panel?.reveal();
+            }
+            await selectConnection(connection.id, secrets);
+        },
+        updateConnection: async (connectionId, patch) => {
+            const before = store.get(connectionId);
+            if (!before) throw new Error(t('Connection no longer exists.'));
+            try {
+                const updated = await updateConnectionWithGroup(store, nativeGroups!, connectionId, patch);
+                if (updated.name !== before.name) {
+                    void vscode.window.showInformationMessage(t(
+                        'Connection renamed. Select its model again in Copilot; saved selections may use the old group name.'
+                    ));
+                }
+            } finally {
+                panel?.reveal();
+            }
+            await updatePanel(secrets, selectedConnectionId ? creditState(selectedConnectionId).info : undefined);
+        },
+        deleteConnection: async connectionId => {
+            const connection = store.get(connectionId);
+            if (!connection) return;
+            const confirmation = await vscode.window.showWarningMessage(
+                t('Delete connection “{0}”, its saved key, request settings, and local spend history?', connection.name),
+                { modal: true }, t('Delete connection')
+            );
+            if (confirmation !== t('Delete connection')) return;
+            try {
+                await nativeGroups?.remove(connectionId);
+                await store.remove(connectionId);
+            } finally {
+                panel?.reveal();
+            }
+        },
+    };
+}
+
 export interface PasteTemplateResult {
     applied: boolean;
     error?: string;
@@ -286,12 +448,18 @@ function openPanel(secrets: vscode.SecretStorage): void {
             lastPanelHtml = undefined;
         });
         panel.webview.onDidReceiveMessage((msg) => {
-            if (provider) {
-                handlePanelMessage(msg as PanelMessage, createPanelDeps(secrets, provider)).catch(showError);
-            }
+            const message = msg as PanelMessage;
+            panelMessageQueue = panelMessageQueue.then(async () => {
+                if (registry && CONNECTION_MESSAGES.has(message.type) && !message.connectionId) {
+                    throw new Error(t('Select a connection first.'));
+                }
+                const deps = registry ? createConnectionPanelDeps(secrets, message.connectionId)
+                    : provider ? createPanelDeps(secrets, provider) : undefined;
+                if (deps) await handlePanelMessage(message, deps);
+            }).catch(showError);
         });
     }
-    updatePanel(secrets, lastInfo).catch(showError);
+    updatePanel(secrets, selectedConnectionId ? creditState(selectedConnectionId).info : legacyCredits.info).catch(showError);
 }
 
 function showNoKey(): void {
@@ -301,41 +469,66 @@ function showNoKey(): void {
     );
 }
 
-export function doRefresh(secrets: vscode.SecretStorage): Promise<KeyInfo | undefined> {
-    currentRun?.controller.abort();
+export function doRefresh(secrets: vscode.SecretStorage, connectionId?: string): Promise<KeyInfo | undefined> {
+    const state = connectionId ? creditState(connectionId) : legacyCredits;
+    state.currentRun?.controller.abort();
     const controller = new AbortController();
-    const done = doRefreshRun(secrets, controller.signal);
-    currentRun = { controller, done };
+    const done = doRefreshRun(secrets, controller.signal, state, connectionId);
+    state.currentRun = { controller, done };
     const cleanup = (): void => {
-        if (currentRun?.done === done) currentRun = undefined;
+        if (state.currentRun?.done === done) state.currentRun = undefined;
     };
     void done.then(cleanup, cleanup);
     return done;
 }
 
-async function doRefreshRun(secrets: vscode.SecretStorage, signal: AbortSignal): Promise<KeyInfo | undefined> {
-    const { limit, resetPeriod, includeByok } = readConfig();
-
-    setStatus('$(sync~spin) …', t('Refreshing OpenRouter key info…'));
-
-    const apiKey = await readKey(secrets);
-    if (signal.aborted) return undefined;
-
-    if (!apiKey) {
-        lastInfo = undefined;
-        lastFetchAt = undefined;
-        lastAccountCredits = undefined;
-        lastErrorMessage = undefined;
-        showNoKey();
-        await updatePanel(secrets, undefined, signal, null);
+async function doRefreshRun(
+    secrets: vscode.SecretStorage, signal: AbortSignal, state: CreditState, connectionId?: string
+): Promise<KeyInfo | undefined> {
+    const connection = connectionId ? registry?.get(connectionId) : undefined;
+    if (connectionId && !connection) return undefined;
+    const config = readConfig();
+    const limit = connection?.settings.creditLimit ?? config.limit;
+    const resetPeriod = connection?.settings.creditResetPeriod ?? config.resetPeriod;
+    const includeByok = connection?.settings.creditIncludeByok ?? config.includeByok;
+    const stale = (): boolean => signal.aborted || (connectionId !== undefined
+        && registry?.get(connectionId)?.revision !== connection?.revision);
+    const status = (text: string, tooltip: string, background?: vscode.ThemeColor): void => {
+        if (stale() || (connectionId !== undefined && selectedConnectionId !== connectionId)) return;
+        setStatus(connection ? `${connection.name} · ${text}` : text, tooltip, background);
+    };
+    const render = async (key?: string | null): Promise<void> => {
+        if (stale() || (connectionId !== undefined && selectedConnectionId !== connectionId)) return;
+        await updatePanel(secrets, state.info, signal, key);
+    };
+    if (connection && (!connection.enabled || connection.kind !== 'openrouter')) {
+        state.info = undefined;
+        state.accountCredits = undefined;
+        state.error = undefined;
+        status(connection.enabled ? t('Usage tracked') : t('Disabled'),
+            connection.enabled ? t('Token usage and reported cost are tracked per connection.') : t('Connection disabled.'));
+        await render();
         return undefined;
     }
-
+    status('$(sync~spin) …', t('Refreshing OpenRouter key info…'));
+    let apiKey: string | undefined;
     try {
+        apiKey = connectionId ? await registry?.readKey(connectionId) : await readKey(secrets);
+        if (stale()) return undefined;
+        if (!apiKey) {
+            state.info = undefined;
+            state.fetchedAt = undefined;
+            state.accountCredits = undefined;
+            state.error = undefined;
+            if (connectionId) status(t('$(key) No key'), t('Open Settings in the panel to set this connection’s API key.'));
+            else showNoKey();
+            await render(null);
+            return undefined;
+        }
         const info = await fetchApi<KeyInfo>(apiKey, 'key', signal);
-        if (signal.aborted) return undefined;
-        lastInfo = info;
-        lastFetchAt = new Date();
+        if (stale()) return undefined;
+        state.info = info;
+        state.fetchedAt = new Date();
         let accountCredits: AccountCredits | undefined;
         if ((info.limit === null || info.limit === undefined) && limit <= 0) {
             try {
@@ -343,12 +536,12 @@ async function doRefreshRun(secrets: vscode.SecretStorage, signal: AbortSignal):
             } catch {
             }
         }
-        if (signal.aborted) return undefined;
-        lastAccountCredits = accountCredits;
-        lastErrorMessage = undefined;
+        if (stale()) return undefined;
+        state.accountCredits = accountCredits;
+        state.error = undefined;
         const view = buildStatus(info, limit, resetPeriod, includeByok, accountCredits);
 
-        setStatus(
+        status(
             view.text,
             view.tooltip,
             view.background === 'error'
@@ -356,33 +549,81 @@ async function doRefreshRun(secrets: vscode.SecretStorage, signal: AbortSignal):
                 : undefined
         );
 
-        await updatePanel(secrets, info, signal, apiKey);
+        await render(apiKey);
         return info;
     } catch (err) {
-        if (signal.aborted) return undefined;
+        if (stale()) return undefined;
         const message = errorMessage(err);
-        lastErrorMessage = t('Refresh failed: {0}', message);
-        setStatus(t('$(error) Error'), t('OpenRouter error: {0}', message));
-        await updatePanel(secrets, lastInfo, signal, apiKey);
+        state.error = t('Refresh failed: {0}', message);
+        status(t('$(error) Error'), t('OpenRouter error: {0}', message));
+        await render(apiKey);
         return undefined;
     }
 }
 
-export function refresh(secrets: vscode.SecretStorage): Promise<KeyInfo | undefined> {
-    return currentRun?.done ?? doRefresh(secrets);
+export function refresh(secrets: vscode.SecretStorage, connectionId?: string): Promise<KeyInfo | undefined> {
+    const state = connectionId ? creditState(connectionId) : legacyCredits;
+    return state.currentRun?.done ?? doRefresh(secrets, connectionId);
 }
 
-export function activate(context: vscode.ExtensionContext): void {
+export async function activate(context: vscode.ExtensionContext): Promise<void> {
     setTranslator((message, ...args) => vscode.l10n.t(message, ...args));
-    provider = new OpenRouterChatProvider(context.secrets, context.globalState);
+    extensionState = context.globalState;
+    const secrets = resolveSecretStorage(context.secrets);
+    const legacy = readConfig();
+    registry = new ConnectionRegistry(context.globalState, secrets);
+    await registry.initialize({
+        creditLimit: legacy.limit,
+        creditResetPeriod: legacy.resetPeriod,
+        creditIncludeByok: legacy.includeByok,
+        hideUnavailableModels: legacy.hideUnavailableModels,
+    });
+    router = new ConnectionChatProvider(registry);
+    nativeGroups = new NativeGroupManager();
+    const savedSelection = context.globalState.get<string>('selectedConnectionId');
+    selectedConnectionId = savedSelection && registry.get(savedSelection)
+        ? savedSelection : registry.list()[0]?.id;
+    provider = selectedConnectionId ? router.getProvider(selectedConnectionId) : undefined;
     sessionTitleDir = chatSessionsDir(context.storageUri);
 
     context.subscriptions.push(
-        vscode.lm.registerLanguageModelChatProvider('openrouter-copilot-request-credit', provider)
+        registry,
+        router,
+        vscode.lm.registerLanguageModelChatProvider('openrouter-copilot-request-credit', router)
     );
 
-    // Keep an open panel's session-spend list current as turns finish.
-    context.subscriptions.push(onTurnCost(() => void updatePanel(context.secrets, lastInfo).catch(() => undefined)));
+    context.subscriptions.push(router.onTurnCost(cost => {
+        if (cost.connectionId && cost.connectionId === selectedConnectionId) {
+            void updatePanel(secrets, creditState(cost.connectionId).info).catch(() => undefined);
+        }
+    }));
+
+    const revisions = new Map(registry.list().map(connection => [connection.id, connection.revision]));
+    context.subscriptions.push(registry.onDidChange(() => {
+        const connections = registry!.list();
+        const existing = new Set(connections.map(connection => connection.id));
+        for (const [id, state] of connectionCredits) {
+            const revision = connections.find(connection => connection.id === id)?.revision;
+            if (revision !== revisions.get(id)) {
+                state.currentRun?.controller.abort();
+                connectionCredits.delete(id);
+            }
+        }
+        revisions.clear();
+        for (const connection of connections) revisions.set(connection.id, connection.revision);
+        if (selectedConnectionId && !existing.has(selectedConnectionId)) {
+            selectedConnectionId = connections[0]?.id;
+            void extensionState?.update('selectedConnectionId', selectedConnectionId);
+        }
+        provider = selectedConnectionId ? router?.getProvider(selectedConnectionId) : undefined;
+        ++panelRenderSeq;
+        if (selectedConnectionId) {
+            void doRefresh(secrets, selectedConnectionId).catch(() => undefined);
+        } else {
+            setStatus(t('No connections'), t('Open Settings in the panel to add a connection.'));
+            void updatePanel(secrets, undefined).catch(() => undefined);
+        }
+    }));
 
     statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
     statusBarItem.name = 'OpenRouter';
@@ -391,8 +632,16 @@ export function activate(context: vscode.ExtensionContext): void {
     setStatus('$(sync~spin) …', t('OpenRouter: loading…'));
 
     const openAndRefresh = (): void => {
-        openPanel(context.secrets);
-        refresh(context.secrets).catch(showError);
+        openPanel(secrets);
+        if (selectedConnectionId) {
+            refresh(secrets, selectedConnectionId).catch(showError);
+            const initial = registry?.list()[0];
+            if (initial && !extensionState?.get<boolean>('nativeConnectionGroupInitialized')) {
+                void nativeGroups?.update(initial).then(async () => {
+                    await extensionState?.update('nativeConnectionGroupInitialized', true);
+                }).catch(showError).finally(() => panel?.reveal());
+            }
+        }
     };
     const SHOW = 'openrouterCopilot.show';
     statusBarItem.command = SHOW;
@@ -411,13 +660,15 @@ export function activate(context: vscode.ExtensionContext): void {
                     void vscode.window.showErrorMessage(`${APP_PREFIX}${result.error}`);
                 }
             }
-            openPanel(context.secrets);
+            openPanel(secrets);
         }),
         vscode.commands.registerCommand('openrouterCopilot.clearTemplate', async () => {
             const open = panel;
+            const connectionId = selectedConnectionId;
             if (provider && open) {
-                await handlePanelMessage({ type: 'clearTemplate' }, createPanelDeps(context.secrets, provider));
-                void open.webview.postMessage({ type: 'templateCleared' });
+                await handlePanelMessage({ type: 'clearTemplate', connectionId },
+                    createConnectionPanelDeps(secrets, connectionId));
+                void open.webview.postMessage({ type: 'templateCleared', connectionId });
                 return;
             }
             await provider?.clearTemplate();
@@ -431,7 +682,9 @@ export function activate(context: vscode.ExtensionContext): void {
         if (refreshTimerDisarmedForTesting) return;
         const { refreshIntervalMinutes } = readConfig();
         refreshTimer = setInterval(() => {
-            refresh(context.secrets).catch(() => undefined);
+            for (const connection of registry?.list() ?? []) {
+                if (connection.enabled) void refresh(secrets, connection.id).catch(() => undefined);
+            }
         }, refreshIntervalMinutes * 60 * 1000);
     };
 
@@ -440,45 +693,65 @@ export function activate(context: vscode.ExtensionContext): void {
             if (!e.affectsConfiguration('openrouterCopilot')) return;
             applyConfig();
             if (e.affectsConfiguration('openrouterCopilot.hideUnavailableModels')) {
-                provider?.resetCatalogCache();
-                updatePanel(context.secrets, lastInfo).catch(() => undefined);
+                router?.resetCatalogCache();
             }
             if (
                 e.affectsConfiguration('openrouterCopilot.outputReservePercent') ||
                 e.affectsConfiguration('openrouterCopilot.outputReserveMinTokens') ||
                 e.affectsConfiguration('openrouterCopilot.outputReserveMaxTokens')
             ) {
-                provider?.refreshModelInfo();
-                updatePanel(context.secrets, lastInfo).catch(() => undefined);
+                router?.refreshModelInfo();
             }
             if (
                 e.affectsConfiguration('openrouterCopilot.creditLimit') ||
                 e.affectsConfiguration('openrouterCopilot.creditResetPeriod') ||
                 e.affectsConfiguration('openrouterCopilot.creditIncludeByok')
             ) {
-                doRefresh(context.secrets).catch(() => undefined);
+                if (selectedConnectionId) void doRefresh(secrets, selectedConnectionId).catch(() => undefined);
             }
             if (
                 e.affectsConfiguration('openrouterCopilot.sanitizeBase64Content') ||
                 e.affectsConfiguration('openrouterCopilot.creditRefreshIntervalMinutes')
             ) {
-                updatePanel(context.secrets, lastInfo).catch(() => undefined);
+                void updatePanel(secrets, selectedConnectionId ? creditState(selectedConnectionId).info : undefined)
+                    .catch(() => undefined);
             }
+            void updatePanel(secrets, selectedConnectionId ? creditState(selectedConnectionId).info : undefined)
+                .catch(() => undefined);
         })
     );
 
     applyConfig();
-    refresh(context.secrets).catch(() => undefined);
+    if (!context.globalState.get<boolean>('nativeConnectionGroupInitialized')) {
+        const initial = registry.list()[0];
+        if (initial) {
+            try {
+                const outcome = await nativeGroups.ensureDefault(initial);
+                if (outcome === 'added') await context.globalState.update('nativeConnectionGroupInitialized', true);
+            } catch (error) {
+                showError(error);
+            }
+        }
+    }
+    if (selectedConnectionId) void refresh(secrets, selectedConnectionId).catch(() => undefined);
 }
 
 export function deactivate(): void {
     if (refreshTimer) clearInterval(refreshTimer);
     refreshTimer = undefined;
-    currentRun?.controller.abort();
-    currentRun = undefined;
+    legacyCredits.currentRun?.controller.abort();
+    legacyCredits.currentRun = undefined;
+    for (const state of connectionCredits.values()) state.currentRun?.controller.abort();
+    connectionCredits.clear();
     statusBarItem = undefined;
     panel?.dispose();
     panel = undefined;
-    provider?.dispose();
+    router?.dispose();
+    registry?.dispose();
+    router = undefined;
+    registry = undefined;
+    nativeGroups = undefined;
+    selectedConnectionId = undefined;
+    extensionState = undefined;
     provider = undefined;
 }
