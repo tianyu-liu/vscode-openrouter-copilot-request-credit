@@ -119,7 +119,7 @@ suite("logic.buildStatus", () => {
             is_free_tier: false,
         };
         const view = buildStatus(info, 10);
-        assert.strictEqual(view.text, "OR $3.42/10");
+        assert.strictEqual(view.text, "$3.42/10");
         assert.match(view.tooltip, /Daily limit: \$10\.00/);
         assert.match(view.tooltip, /Daily remaining: \$3\.42/);
         assert.match(view.tooltip, /Daily usage: \$1\.50/);
@@ -155,7 +155,7 @@ suite("logic.buildStatus", () => {
             is_free_tier: false,
         };
         const view = buildStatus(info, 10);
-        assert.strictEqual(view.text, "OR $0.00/5");
+        assert.strictEqual(view.text, "$0.00/5");
     });
 
     test("limit branch with missing limit_remaining shows 'n/a' (not $0.00)", () => {
@@ -170,7 +170,7 @@ suite("logic.buildStatus", () => {
             is_free_tier: false,
         };
         const view = buildStatus(info, 10);
-        assert.strictEqual(view.text, "OR n/a/5");
+        assert.strictEqual(view.text, "n/a/5");
         assert.match(view.tooltip, /All-time remaining: n\/a/);
         // Absence is not exhaustion: a null figure must not trigger error state.
         assert.strictEqual(view.background, "default");
@@ -188,7 +188,7 @@ suite("logic.buildStatus", () => {
             is_free_tier: false,
         };
         const view = buildStatus(info, 10);
-        assert.strictEqual(view.text, "OR $0.00/5");
+        assert.strictEqual(view.text, "$0.00/5");
         assert.strictEqual(view.background, "error");
     });
 
@@ -204,7 +204,7 @@ suite("logic.buildStatus", () => {
             is_free_tier: false,
         };
         const view = buildStatus(info, 10);
-        assert.strictEqual(view.text, "OR $6.58/10");
+        assert.strictEqual(view.text, "$6.58/10");
         assert.match(view.tooltip, /Daily limit: \$10\.00/);
         assert.match(view.tooltip, /Daily usage: \$3\.42/);
         assert.match(view.tooltip, /Daily remaining: \$6\.58/);
@@ -226,7 +226,7 @@ suite("logic.buildStatus", () => {
         };
         // used = 3.42 + 1.0 = 4.42; remaining = 10 - 4.42 = 5.58
         const view = buildStatus(info, 10, "daily", true);
-        assert.strictEqual(view.text, "OR $5.58/10");
+        assert.strictEqual(view.text, "$5.58/10");
     });
 
     test("No limit + BYOK excluded (includeByok=false) -> only non-BYOK spend counts", () => {
@@ -243,7 +243,7 @@ suite("logic.buildStatus", () => {
         };
         // used = 3.42 (BYOK ignored); remaining = 10 - 3.42 = 6.58
         const view = buildStatus(info, 10, "daily", false);
-        assert.strictEqual(view.text, "OR $6.58/10");
+        assert.strictEqual(view.text, "$6.58/10");
     });
 
     test("guardrail respects a weekly reset period", () => {
@@ -258,7 +258,7 @@ suite("logic.buildStatus", () => {
             is_free_tier: false,
         };
         const view = buildStatus(info, 10, "weekly");
-        assert.strictEqual(view.text, "OR $6.58/10");
+        assert.strictEqual(view.text, "$6.58/10");
         assert.match(view.tooltip, /Weekly limit: \$10\.00/);
         assert.match(view.tooltip, /Weekly usage: \$3\.42/);
         assert.match(view.tooltip, /Resets: Rolling 7-day window/);
@@ -276,7 +276,7 @@ suite("logic.buildStatus", () => {
             is_free_tier: false,
         };
         const view = buildStatus(info, 10);
-        assert.strictEqual(view.text, "$(error) OR $0.00/10");
+        assert.strictEqual(view.text, "$(error) $0.00/10");
         assert.strictEqual(view.background, "error");
     });
 
@@ -292,7 +292,7 @@ suite("logic.buildStatus", () => {
             is_free_tier: false,
         };
         const view = buildStatus(info, 10);
-        assert.strictEqual(view.text, "$(error) OR $0.00/10");
+        assert.strictEqual(view.text, "$(error) $0.00/10");
         assert.strictEqual(view.background, "error");
     });
 
@@ -752,7 +752,7 @@ suite("logic.buildDetail", () => {
             is_free_tier: false,
         };
         const status = buildStatus(info, 10, "monthly");
-        assert.strictEqual(status.text, "OR $6.50/10");
+        assert.strictEqual(status.text, "$6.50/10");
         const detail = buildDetail(info, 10, "monthly");
         assert.strictEqual(detail.remaining, "$6.50");
     });
@@ -769,7 +769,7 @@ suite("logic.buildDetail", () => {
             is_free_tier: false,
         };
         const status = buildStatus(info, 10);
-        assert.strictEqual(status.text, "OR $10.00/10");
+        assert.strictEqual(status.text, "$10.00/10");
         const detail = buildDetail(info, 10);
         assert.strictEqual(detail.remaining, "$10.00");
     });
@@ -787,7 +787,7 @@ suite("logic.buildDetail", () => {
         };
         const credits = { total_credits: null as unknown as number, total_usage: 1 };
         const status = buildStatus(info, 0, "daily", true, credits);
-        assert.strictEqual(status.text, "OR n/a");
+        assert.strictEqual(status.text, "n/a");
         assert.match(status.tooltip, /All-time remaining: n\/a/);
         const detail = buildDetail(info, 0, "daily", true, credits);
         assert.strictEqual(detail.remaining, "n/a");
@@ -875,7 +875,7 @@ suite("logic.buildDetail", () => {
         assert.strictEqual(detail.highlight, null);
         assert.strictEqual(detail.background, "default");
         const status = buildStatus(info, 0, "daily", true, credits);
-        assert.strictEqual(status.text, "OR $999.47");
+        assert.strictEqual(status.text, "$999.47");
         assert.strictEqual(status.background, "default");
     });
 

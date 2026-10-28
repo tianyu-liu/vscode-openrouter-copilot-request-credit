@@ -20,6 +20,7 @@ const MAX_ERROR_LENGTH = 300;
 const APP_PREFIX = 'OpenRouter: ';
 
 let statusBarItem: vscode.StatusBarItem | undefined;
+let statusText = '';
 let refreshTimer: ReturnType<typeof setInterval> | undefined;
 let panel: vscode.WebviewPanel | undefined;
 let lastPanelHtml: string | undefined;
@@ -96,10 +97,19 @@ function showError(err: unknown): void {
 
 function setStatus(text: string, tooltip: string, background?: vscode.ThemeColor): void {
     if (!statusBarItem) return;
-    statusBarItem.text = text;
+    statusText = text;
+    updateStatusIcon();
     statusBarItem.tooltip = new vscode.MarkdownString(tooltip);
+    statusBarItem.accessibilityInformation = { label: `OpenRouter: ${text.replace(/\$\([^)]+\)\s*/g, '')}` };
     statusBarItem.backgroundColor = background;
     statusBarItem.show();
+}
+
+function updateStatusIcon(): void {
+    if (!statusBarItem) return;
+    const kind = vscode.window.activeColorTheme.kind;
+    const light = kind === vscode.ColorThemeKind.Light || kind === vscode.ColorThemeKind.HighContrastLight;
+    statusBarItem.text = `$(openrouter-rc-${light ? 'ink' : 'cloud'}) ${statusText}`;
 }
 
 export function getStatusText(): string | undefined {
@@ -286,7 +296,7 @@ function openPanel(secrets: vscode.SecretStorage): void {
 
 function showNoKey(): void {
     setStatus(
-        t('$(key) OR: no key'),
+        t('$(key) No key'),
         t('{0}set your API key.  \nOpen the panel (click) and paste your key to begin.', APP_PREFIX)
     );
 }
@@ -306,7 +316,7 @@ export function doRefresh(secrets: vscode.SecretStorage): Promise<KeyInfo | unde
 async function doRefreshRun(secrets: vscode.SecretStorage, signal: AbortSignal): Promise<KeyInfo | undefined> {
     const { limit, resetPeriod, includeByok } = readConfig();
 
-    setStatus('$(sync~spin) OR …', t('Refreshing OpenRouter key info…'));
+    setStatus('$(sync~spin) …', t('Refreshing OpenRouter key info…'));
 
     const apiKey = await readKey(secrets);
     if (signal.aborted) return undefined;
@@ -352,7 +362,7 @@ async function doRefreshRun(secrets: vscode.SecretStorage, signal: AbortSignal):
         if (signal.aborted) return undefined;
         const message = errorMessage(err);
         lastErrorMessage = t('Refresh failed: {0}', message);
-        setStatus(t('$(error) OR error'), t('OpenRouter error: {0}', message));
+        setStatus(t('$(error) Error'), t('OpenRouter error: {0}', message));
         await updatePanel(secrets, lastInfo, signal, apiKey);
         return undefined;
     }
@@ -375,8 +385,10 @@ export function activate(context: vscode.ExtensionContext): void {
     context.subscriptions.push(onTurnCost(() => void updatePanel(context.secrets, lastInfo).catch(() => undefined)));
 
     statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+    statusBarItem.name = 'OpenRouter';
     context.subscriptions.push(statusBarItem);
-    setStatus('$(sync~spin) OR …', t('OpenRouter: loading…'));
+    context.subscriptions.push(vscode.window.onDidChangeActiveColorTheme(updateStatusIcon));
+    setStatus('$(sync~spin) …', t('OpenRouter: loading…'));
 
     const openAndRefresh = (): void => {
         openPanel(context.secrets);

@@ -76,6 +76,11 @@ npm run package      # vsce package → openrouter-copilot-request-credit-<ver>.
 No lint setup exists for this TypeScript project; `tsc --strict` is the gate.
 Run `npm run compile` (and `npm test` when behavior changed) before committing.
 
+VS Code compatibility is an open-ended minimum in `engines.vscode`, not a pin to the current client.
+Keep API types on a compatible dependency range; the lockfile records the resolved build dependency.
+The integration runner uses the latest stable VS Code by default. Describe runtime capabilities in
+plans/docs and verify them on the installed client instead of assuming a particular release number.
+
 **Panel preview (dev UI).** `scripts/panel-preview.mjs` (excluded from the VSIX) renders the panel
 and the picker's model cards in a normal browser, so their markup/styles can be debugged, reviewed,
 and iterated on **without installing the VSIX or reloading the VS Code extension host**. It stubs

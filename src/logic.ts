@@ -644,10 +644,10 @@ export function buildStatus(
     // prefixes $(error); the other modes rely on the error background.
     const text =
         view.mode === "unlimited"
-            ? `OR ${formatUsdOrNa(view.remainingNum)}`
+            ? formatUsdOrNa(view.remainingNum)
             : view.mode === "manual"
-                ? `${view.exhausted ? "$(error) " : ""}OR ${formatUsd(view.remainingNum)}/${formatCompact(view.limitNum)}`
-                : `OR ${formatUsdOrNa(view.remainingNum)}/${formatCompact(view.limitNum)}`;
+                ? `${view.exhausted ? "$(error) " : ""}${formatUsd(view.remainingNum)}/${formatCompact(view.limitNum)}`
+                : `${formatUsdOrNa(view.remainingNum)}/${formatCompact(view.limitNum)}`;
 
     return {
         text,

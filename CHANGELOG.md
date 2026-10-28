@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Replace the status bar's `OR` label with the official OpenRouter glyph, using Ink for light themes
+  and Cloud for dark themes, including high-contrast variants and live theme changes.
+- Remove the exact VS Code API-types pin, allow newer clients through an open-ended compatibility
+  range, and make the multi-provider plan's grouping check depend on runtime capabilities.
+- Include OpenRouter asset provenance and usage terms in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
 ## 0.4.1
 
 Localization release:

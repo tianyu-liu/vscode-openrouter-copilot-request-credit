@@ -35,6 +35,12 @@ const KEY_DATA = {
 
 const CREDITS_DATA = { total_credits: 100, total_usage: 10 };
 
+function statusWithIcon(text: string): string {
+    const kind = vscode.window.activeColorTheme.kind;
+    const light = kind === vscode.ColorThemeKind.Light || kind === vscode.ColorThemeKind.HighContrastLight;
+    return `$(openrouter-rc-${light ? 'ink' : 'cloud'}) ${text}`;
+}
+
 function stubProvider(secrets: vscode.SecretStorage) {
     return {
         setTemplate: async () => ({ ok: true }),
@@ -241,7 +247,35 @@ suite("network isolation (stubbed fetch)", () => {
         const before = fetchCalls.length;
         await doRefresh(fakeSecrets(undefined));
         assert.strictEqual(fetchCalls.length, before, "no fetch without a key");
-        assert.ok((getStatusText() ?? "").includes("no key"));
+        assert.ok((getStatusText() ?? "").includes("No key"));
+    });
+
+    test("status icon follows theme changes without refreshing the balance", async () => {
+        await settle();
+        await doRefresh(fakeSecrets("sk-theme"));
+        const balance = getStatusText()!.replace(/^\$\([^)]+\) /, "");
+        const accountCalls = (): number => fetchCalls.filter((call) => /\/api\/v1\/(key|credits)$/.test(call.url)).length;
+        const calls = accountCalls();
+        const cfg = vscode.workspace.getConfiguration("workbench");
+        const original = cfg.inspect<string>("colorTheme")?.globalValue;
+        try {
+            for (const [theme, icon] of [
+                ["Default Light Modern", "ink"],
+                ["Default Dark Modern", "cloud"],
+                ["Default High Contrast Light", "ink"],
+                ["Default High Contrast", "cloud"],
+            ]) {
+                await cfg.update("colorTheme", theme, vscode.ConfigurationTarget.Global);
+                const expected = `$(openrouter-rc-${icon}) ${balance}`;
+                for (let i = 0; i < 250 && getStatusText() !== expected; i++) {
+                    await new Promise((resolve) => setTimeout(resolve, 20));
+                }
+                assert.strictEqual(getStatusText(), expected, theme);
+            }
+            assert.strictEqual(accountCalls(), calls, "theme changes should not fetch account data");
+        } finally {
+            await cfg.update("colorTheme", original, vscode.ConfigurationTarget.Global);
+        }
     });
 
     test("single-flight: concurrent refreshes share exactly one fetch", async () => {
@@ -274,10 +308,10 @@ suite("network isolation (stubbed fetch)", () => {
             await new Promise((r) => setTimeout(r, 150));
             creditsShouldFail = true;
             await doRefresh(secrets);
-            assert.strictEqual(getStatusText(), "OR n/a");
+            assert.strictEqual(getStatusText(), statusWithIcon("n/a"));
             creditsShouldFail = false;
             await doRefresh(secrets);
-            assert.strictEqual(getStatusText(), "OR $90.00");
+            assert.strictEqual(getStatusText(), statusWithIcon("$90.00"));
         } finally {
             creditsShouldFail = false;
             await cfg.update("creditLimit", 0, vscode.ConfigurationTarget.Global);
@@ -296,11 +330,11 @@ suite("network isolation (stubbed fetch)", () => {
             await waitForPending(1);
             const deps = createPanelDeps(secrets, stubProvider(secrets));
             await handlePanelMessage({ type: "clearKey" }, deps);
-            assert.ok((getStatusText() ?? "").includes("no key"));
+            assert.ok((getStatusText() ?? "").includes("No key"));
             await settle();
             await run;
             assert.ok(
-                (getStatusText() ?? "").includes("no key"),
+                (getStatusText() ?? "").includes("No key"),
                 "stale run must not resurrect the cleared key"
             );
         } finally {
@@ -325,7 +359,7 @@ suite("network isolation (stubbed fetch)", () => {
             assert.ok(keyCall, "a key fetch happened");
             const headers = (keyCall!.init?.headers ?? {}) as Record<string, string>;
             assert.strictEqual(headers.Authorization, "Bearer sk-or-v1-abc123");
-            assert.strictEqual(getStatusText(), "OR $9.50/10");
+            assert.strictEqual(getStatusText(), statusWithIcon("$9.50/10"));
         } finally {
             await cfg.update("creditLimit", 0, vscode.ConfigurationTarget.Global);
             await settle();

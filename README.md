@@ -23,7 +23,7 @@ Host-managed fields are always replaced: `model`, `messages`, and `tools` come f
 
 ## The panel
 
-One webview, **"OpenRouter for Copilot"**, with three tabs: **Key Info**, **Session Spend**, and **Configurations**. Open it from the status bar item (**OR …**) or the "OpenRouter: Manage provider" command. Context size for long-context-priced models is set in the model picker's **Context size** menu, not the panel.
+One webview, **"OpenRouter for Copilot"**, with three tabs: **Key Info**, **Session Spend**, and **Configurations**. Open it from the status bar item (OpenRouter icon and remaining credit) or the "OpenRouter: Manage provider" command. Context size for long-context-priced models is set in the model picker's **Context size** menu, not the panel.
 
 ## Install (from VSIX)
 
