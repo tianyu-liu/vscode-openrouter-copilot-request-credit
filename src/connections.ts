@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto';
 import * as vscode from 'vscode';
 import { KEY_SECRET } from './storage';
 
-export type ConnectionKind = 'openrouter' | 'openai-compatible';
+export type ConnectionKind = 'openrouter' | 'gateway' | 'openai-compatible';
 export interface ConnectionSettings {
     creditLimit: number;
     creditResetPeriod: 'daily' | 'weekly' | 'monthly' | 'never';
@@ -37,6 +37,7 @@ export interface ConnectionInput {
 }
 export type ConnectionPatch = Partial<ConnectionInput>;
 export const LEGACY_CONNECTION_ID = 'default-openrouter';
+export const DEFAULT_CONNECTION_NAME = 'OpenRouter: RC';
 export const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 export const DEFAULT_CONNECTION_SETTINGS: Readonly<ConnectionSettings> = Object.freeze({
     creditLimit: 0,
@@ -64,6 +65,14 @@ function clone<T>(value: T): T {
 }
 function prefix(id: string): string { return `connections.${id}.`; }
 function secretSlot(id: string): string { return `connection.${id}.key.${randomUUID()}`; }
+export function nextConnectionName(connections: ReadonlyArray<Pick<ConnectionDefinition, 'name'>>): string {
+    const names = new Set(connections.map(item => item.name.toLowerCase()));
+    let candidate = DEFAULT_CONNECTION_NAME;
+    for (let suffix = 1; names.has(candidate.toLowerCase()); suffix++) {
+        candidate = `${DEFAULT_CONNECTION_NAME}${suffix}`;
+    }
+    return candidate;
+}
 function normalizeBaseUrl(kind: ConnectionKind, value?: string): string {
     if (kind === 'openrouter') {
         if (value !== undefined && value.replace(/\/+$/, '') !== OPENROUTER_BASE_URL) {
@@ -129,7 +138,10 @@ function manualModels(input?: ManualModel[]): ManualModel[] | undefined {
 }
 function definition(input: ConnectionInput, id: string, revision: number): ConnectionDefinition {
     if (typeof input.name !== 'string' || !input.name.trim()) throw new Error('A connection name is required.');
-    if (!['openrouter', 'openai-compatible'].includes(input.kind)) throw new Error('Invalid connection type.');
+    if (!['openrouter', 'gateway', 'openai-compatible'].includes(input.kind)) throw new Error('Invalid connection type.');
+    if (input.kind === 'gateway' && input.models !== undefined && (!Array.isArray(input.models) || input.models.length > 0)) {
+        throw new Error('Gateway models must come from its filtered catalog; manual models are not supported.');
+    }
     if (input.enabled !== undefined && typeof input.enabled !== 'boolean') throw new Error('Invalid enabled state.');
     return {
         id, revision, name: input.name.trim(), kind: input.kind,
@@ -238,7 +250,7 @@ export class ConnectionRegistry implements vscode.Disposable {
             } else {
                 const primary = await this.strictSecret(KEY_SECRET);
                 const credential = primary ?? await this.strictSecret(LEGACY_SECRET);
-                const initial = definition({ name: 'OpenRouter', kind: 'openrouter', settings: legacySettings },
+                const initial = definition({ name: DEFAULT_CONNECTION_NAME, kind: 'openrouter', settings: legacySettings },
                     LEGACY_CONNECTION_ID, 1);
                 const slot = `connection.${LEGACY_CONNECTION_ID}.key.migration`;
                 for (const key of LEGACY_STATE_KEYS) {

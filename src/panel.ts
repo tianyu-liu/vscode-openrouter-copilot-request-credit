@@ -1,7 +1,11 @@
 import * as vscode from 'vscode';
 import { randomBytes } from 'crypto';
 import { t } from './i18n';
-import type { ConnectionDefinition, ConnectionInput, ConnectionPatch, ManualModel } from './connections';
+import {
+    DEFAULT_CONNECTION_NAME, nextConnectionName,
+    type ConnectionDefinition, type ConnectionInput, type ConnectionPatch, type ManualModel,
+} from './connections';
+import type { GatewayAllowance, GatewayBudget } from './gatewayAllowance';
 import {
     presetSlugFromPickerValue,
     stripTemplateComments,
@@ -278,12 +282,54 @@ export interface PanelRenderOptions {
     fetchedAt?: Date;
     maskedKey?: string;
     accountCredits?: AccountCredits;
+    gatewayAllowance?: GatewayAllowance;
+    gatewayAllowanceStale?: boolean;
     errorMessage?: string;
     template?: Record<string, unknown>;
     presets?: PresetRow[];
     presetConfig?: Record<string, unknown>;
     sessions?: SessionCost[];
     settings?: Partial<PanelSettings>;
+}
+
+function gatewayAmount(value: number | null | undefined): string {
+    return typeof value === 'number' && Number.isFinite(value)
+        ? `$${value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}`
+        : t('Unavailable');
+}
+
+function gatewayTime(value: string | null | undefined): string {
+    if (!value) return t('Unavailable');
+    const date = new Date(value);
+    return Number.isFinite(date.getTime()) ? formatReset(date, true) : t('Unavailable');
+}
+
+function renderGatewayAllowance(allowance: GatewayAllowance | undefined, stale: boolean): string {
+    const rows = (['cheap', 'default'] as const).map(name => {
+        const lane = allowance?.[name];
+        const reported = lane?.status === 'reported';
+        const budget: GatewayBudget | null | undefined = reported ? lane.effective_budget : undefined;
+        const period = budget?.reset;
+        const periodText = period && isResetPeriod(period) ? resetPeriodLabel(period) : period || t('Unavailable');
+        return `<tr data-lane="${name}">
+            <th scope="row" class="label">${name === 'cheap' ? t('Cheap lane') : t('Default lane')}</th>
+            <td>${reported ? t('Reported') : t('Unknown')}</td>
+            <td class="col">${esc(gatewayAmount(budget?.remaining))}</td>
+            <td class="col">${esc(gatewayAmount(budget?.limit))}</td>
+            <td class="col">${esc(gatewayAmount(budget?.usage))}</td>
+            <td>${esc(periodText)}</td><td>${esc(gatewayTime(budget?.resets_at))}</td>
+        </tr>`;
+    }).join('');
+    return `${stale ? `<p class="warn">${t('Saved allowance is stale. Refresh to try again.')}</p>` : ''}
+        ${allowance ? '' : emptyState(t('No gateway allowance yet. Save a gateway token, then refresh.'))}
+        <div class="table-scroll"><table class="rows">
+            <thead><tr><th class="label">${t('Lane')}</th><th>${t('Status')}</th>
+            <th>${t('Remaining')}</th><th>${t('Interval allowance')}</th><th>${t('Interval usage')}</th>
+            <th>${t('Reset period')}</th><th>${t('Next reset')}</th></tr></thead><tbody>${rows}</tbody>
+        </table></div>
+        <p class="helptext">${t('Each lane shows its effective interval budget. Unavailable values do not mean zero usage or unlimited access. Lanes are not added together.')}</p>
+        <p class="helptext">${t('Gateway retrieved: {0}. Retrieval times do not guarantee current billing counters.', esc(gatewayTime(allowance?.fetched_at)))}</p>
+        <p class="helptext">${t('Direct and gateway connections may share the same upstream funds; using both does not add funds.')}</p>`;
 }
 
 export function renderPanelHtml(options: PanelRenderOptions): string {
@@ -304,14 +350,16 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
         settings = {},
     } = options;
     const connections = options.connections ?? [{
-        id: 'default', name: 'OpenRouter', kind: 'openrouter', baseUrl: 'https://openrouter.ai/api/v1',
+        id: 'default', name: DEFAULT_CONNECTION_NAME, kind: 'openrouter', baseUrl: 'https://openrouter.ai/api/v1',
         enabled: true, revision: 1,
         settings: { creditLimit: limit, creditResetPeriod: resetPeriod, creditIncludeByok: includeByok,
             hideUnavailableModels: settings.hideUnavailableModels ?? true },
     }];
     const connection = connections.find(item => item.id === options.selectedConnectionId) ?? connections[0];
     const connectionId = connection?.id ?? '';
-    const isOpenRouter = connection?.kind !== 'openai-compatible';
+    const newConnectionName = nextConnectionName(connections);
+    const isOpenRouter = !connection || connection.kind === 'openrouter';
+    const isGateway = connection?.kind === 'gateway';
     const jsonForScript = (value: unknown): string => JSON.stringify(value).replace(/</g, '\\u003c');
     const nonce = randomBytes(16).toString('hex');
     const detail = info ? buildDetail(info, limit, resetPeriod, includeByok, accountCredits) : undefined;
@@ -371,8 +419,8 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
            ${autoMode ? renderNote('autoLimit') : ''}`;
     const sessionCostHtml = renderSessionCosts(sessions, !isOpenRouter);
     const updatedLine = `<div class="keyline updatedline">
-            ${fetchedAt ? `<span class="muted">${t('Updated {0}', esc(formatReset(fetchedAt, true)))}</span>` : ''}
-            <button id="refresh">${t('Refresh')}</button>
+            ${fetchedAt ? `<span class="muted">${t(isGateway ? 'Retrieved locally: {0}' : 'Updated {0}', esc(formatReset(fetchedAt, true)))}</span>` : ''}
+            <button id="refresh">${isGateway ? t('Refresh allowance') : t('Refresh')}</button>
         </div>`;
     const templateValue = template ? JSON.stringify(template, null, 2) : '';
     const selectedPreset = templatePresetSlug(template) ?? '';
@@ -521,6 +569,12 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
     table.routes td { padding: 2px 12px 2px 0; vertical-align: top; }
     table.routes td:last-child, table.routes th:last-child { padding-right: 0; }
     table.routes td.num { text-align: right; }
+    @media (max-width: 480px) {
+        details.session summary { flex-wrap: wrap; }
+        .sessionname { flex-basis: 160px; min-width: 0; overflow-wrap: anywhere; }
+        .sessiontime { white-space: normal; overflow-wrap: anywhere; }
+        .sessionbody { padding-left: 0; }
+    }
 
 </style>
 </head>
@@ -542,8 +596,8 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
             ${connection ? `<button id="toggleConnection">${connection.enabled ? t('Disable') : t('Enable')}</button><button id="deleteConnection">${t('Delete connection')}</button>` : ''}
         </div>
         <form id="connectionForm" class="connection-form">
-            <label>${t('Connection name')}<input id="connectionName" type="text" required value="${esc(connection?.name ?? '')}" placeholder="${t('For example: Personal, Work, Local')}" /></label>
-            <label>${t('API type')}<select id="connectionKind"${connection ? ' disabled' : ''}><option value="openrouter"${isOpenRouter ? ' selected' : ''}>OpenRouter</option><option value="openai-compatible"${isOpenRouter ? '' : ' selected'}>${t('OpenAI compatible')}</option></select></label>
+            <label>${t('Connection name')}<input id="connectionName" type="text" required value="${esc(connection?.name ?? newConnectionName)}" placeholder="${t('For example: Personal, Work, Local')}" /></label>
+            <label>${t('API type')}<select id="connectionKind"${connection ? ' disabled' : ''}><option value="openrouter"${isOpenRouter ? ' selected' : ''}>OpenRouter</option><option value="gateway"${isGateway ? ' selected' : ''}>${t('Gateway')}</option><option value="openai-compatible"${connection?.kind === 'openai-compatible' ? ' selected' : ''}>${t('OpenAI compatible')}</option></select></label>
             <label>${t('Base URL')}<input id="connectionUrl" type="text" required value="${esc(connection?.baseUrl ?? 'https://openrouter.ai/api/v1')}" placeholder="http://localhost:1234/v1" /></label>
             <div class="keyline"><button id="saveConnection" type="submit">${t('Save connection')}</button><button id="cancelConnection" type="button" hidden>${t('Cancel')}</button><span id="newConnectionHint" class="helptext" hidden>${t('Enter the new connection details, then save.')}</span></div>
         </form>
@@ -552,7 +606,7 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
     <div class="section">
         <div class="section-title">${isOpenRouter ? t('OpenRouter API key') : t('API key')}</div>
         <div class="keyline">
-            <input type="${maskedKey ? 'text' : 'password'}" id="key" aria-label="${isOpenRouter ? t('OpenRouter API key') : t('API key')}" placeholder="${isOpenRouter ? t('OpenRouter API key (sk-or-v1-...)') : t('API key (optional for local servers)')}" />
+            <input type="${maskedKey ? 'text' : 'password'}" id="key" aria-label="${isOpenRouter ? t('OpenRouter API key') : t('API key')}" placeholder="${isOpenRouter ? t('OpenRouter API key (sk-or-v1-...)') : isGateway ? t('Gateway bearer token') : t('API key (optional for local servers)')}" />
             <button id="saveKey"${connection ? '' : ' disabled'}>${t('Save key')}</button>
             ${maskedKey ? `<button id="clearKey">${t('Clear key')}</button>` : ''}
             ${keyState}
@@ -608,7 +662,13 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
         <label class="optlabel"><input type="checkbox" id="hideUnavailableModels" ${hideUnavailableModels ? 'checked' : ''} /> ${t('Hide models this key cannot use')}</label>
         ${renderNote('hideUnavailable')}
     </div>
-` : `<div class="section"><div class="section-title">${t('Usage')}</div>${emptyState(t('This API does not provide OpenRouter credits or authoritative cost data. Token counts may be reported by the server.'))}</div>
+` : isGateway ? `<div class="section"><div class="section-title">${t('Gateway allowance')}</div>
+        ${renderGatewayAllowance(options.gatewayAllowance, options.gatewayAllowanceStale ?? false)}
+        ${updatedLine}
+    </div>
+    <div class="section"><div class="section-title">${t('Model availability')}</div>
+        <p class="helptext">${t('The gateway supplies the models available to this token. If discovery fails, no models are offered until it succeeds.')}</p>
+    </div>` : `<div class="section"><div class="section-title">${t('Usage')}</div>${emptyState(t('This API does not provide OpenRouter credits or authoritative cost data. Token counts may be reported by the server.'))}</div>
     <div class="section"><div class="section-title">${t('Manual models')}</div>
         <p class="helptext">${t('Optional model definitions override or supplement /models. Use an array with id, name, contextLength, maxOutputTokens, toolCalling, and imageInput.')}</p>
         <textarea id="manualModels" rows="6" aria-label="${t('Manual model definitions JSON')}">${esc(JSON.stringify(connection?.models ?? [], null, 2))}</textarea>
@@ -813,7 +873,7 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
         });
         bind('addConnection', 'click', () => {
             creatingConnection = true;
-            document.getElementById('connectionName').value = '';
+            document.getElementById('connectionName').value = ${jsonForScript(newConnectionName)};
             document.getElementById('connectionUrl').value = 'https://openrouter.ai/api/v1';
             document.getElementById('connectionKind').value = 'openrouter';
             document.getElementById('newConnectionHint').hidden = false;
@@ -832,7 +892,7 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
         bind('cancelConnection', 'click', () => {
             creatingConnection = false;
             const saved = ${jsonForScript(connection ?? {})};
-            document.getElementById('connectionName').value = saved.name || '';
+            document.getElementById('connectionName').value = saved.name || ${jsonForScript(newConnectionName)};
             document.getElementById('connectionUrl').value = saved.baseUrl || 'https://openrouter.ai/api/v1';
             document.getElementById('connectionKind').value = saved.kind || 'openrouter';
             document.getElementById('connectionKind').disabled = !!connectionId;
@@ -953,7 +1013,7 @@ function parseConnectionInput(value: unknown): ConnectionInput | undefined {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
     const input = value as Record<string, unknown>;
     if (typeof input.name !== 'string' || !input.name.trim()
-        || (input.kind !== 'openrouter' && input.kind !== 'openai-compatible')
+        || (input.kind !== 'openrouter' && input.kind !== 'openai-compatible' && input.kind !== 'gateway')
         || typeof input.baseUrl !== 'string') return undefined;
     try {
         const url = new URL(input.baseUrl.trim());

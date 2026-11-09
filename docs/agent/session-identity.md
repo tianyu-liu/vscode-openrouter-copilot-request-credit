@@ -7,7 +7,7 @@ a utility call can reuse only a parent seen on its own connection. Renaming keep
 deleting a connection removes it and blocks late callbacks from restoring it. Child replacement
 for a new revision retains the connection's live ledger, including in-flight usage.
 
-The wire `session_id` behavior below applies to **direct OpenRouter**. Generic OpenAI-compatible
+The wire `session_id` behavior below applies to **direct OpenRouter and explicit Gateway connections**. Generic OpenAI-compatible
 connections retain the same local chat/unattributed accounting rules but receive no automatic
 `session_id`; an explicitly pasted server-supported field is retained. The panel's selected
 connection affects editing/status display; Copilot's selected model determines the accounting route.
@@ -18,7 +18,7 @@ the same conversation **with the same id**. The Copilot extension threads that i
 extension-contributed models as `options.modelOptions._conversationId` (the agent/tool-calling loop
 passes `conversation.sessionId` into `makeChatRequest2`, `ExtensionContributedChatEndpoint` puts it in
 `modelOptions`, and the extension host forwards `modelOptions` verbatim to
-`provideLanguageModelChatResponse`). For direct OpenRouter, the extension therefore sends `session_id` =
+`provideLanguageModelChatResponse`). For direct OpenRouter and Gateway, the extension therefore sends `session_id` =
 `copilot-chat:<conversation id>`: **one OpenRouter session per Copilot chat session on the selected connection**, so sticky
 routing and the Logs → Sessions view follow the chat, not the window, and cache warmth carries across
 a reload. `_conversationId` is an internal, underscore-prefixed key with no public constant — always

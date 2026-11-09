@@ -150,6 +150,168 @@ suite('connection provider routing', () => {
             assert.match(String(model.tooltip), /新価格/); assert.doesNotMatch(String(model.tooltip), /旧価格/);
         } finally { resetTranslator(); }
     });
+    async function gateway(): Promise<ConnectionDefinition> {
+        const connection = await registry.add({ name: 'Gateway', kind: 'gateway', baseUrl: 'https://gateway.test/v1' });
+        await registry.storeKey(connection.id, 'gateway-key');
+        return connection;
+    }
+    test('gateway discovery requires its own bearer key and never borrows a direct connection key', async () => {
+        await registry.storeKey(registry.list()[0].id, 'direct-key');
+        const connection = await registry.add({ name: 'Gateway', kind: 'gateway', baseUrl: 'https://gateway.test/v1' });
+        await assert.rejects(models(connection), /Gateway bearer key not configured/);
+        assert.strictEqual(calls.length, 0);
+        await registry.storeKey(connection.id, 'gateway-key');
+        const [model] = await models(connection);
+        await request(model);
+        assert.ok(calls.every(call => new Headers(call.init?.headers).get('Authorization') === 'Bearer gateway-key'));
+        assert.ok(calls.every(call => call.url.startsWith('https://gateway.test/v1/')));
+        assert.ok(calls.every(call => call.init?.redirect === 'error'));
+    });
+    test('gateway preserves metadata and OpenRouter body features while using only gateway inference routes', async () => {
+        const connection = await gateway();
+        const events = [
+            { choices: [{ delta: { content: 'answer' } }] },
+            { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call-1', function: { name: 'lookup', arguments: '{"x":' } }] } }] },
+            { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '1}' } }] }, finish_reason: 'tool_calls' }] },
+            { choices: [], usage: { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5, cost: 0.01 } },
+        ];
+        fetcher = async url => url.endsWith('/models') ? Response.json({ data: [{
+            id: 'anthropic/shared', name: 'Gateway Claude', context_length: 200000,
+            top_provider: { max_completion_tokens: 64000 }, supported_parameters: ['tools', 'reasoning'],
+            architecture: { input_modalities: ['text', 'image'] },
+            pricing: { prompt: '0.000003', completion: '0.000015' },
+            reasoning: { supported_efforts: ['high', 'low'], default_effort: 'high' },
+        }] }) : new Response(new ReadableStream({ start(controller) {
+            const wire = events.map(event => `data: ${JSON.stringify(event)}\n\n`).join('') + 'data: [DONE]\n\n';
+            for (let index = 0; index < wire.length; index += 13) {
+                controller.enqueue(new TextEncoder().encode(wire.slice(index, index + 13)));
+            }
+            controller.close();
+        } }), { headers: { 'content-type': 'text/event-stream' } });
+        const [model] = await models(connection);
+        assert.strictEqual(model.name, 'Gateway Claude');
+        assert.deepStrictEqual(model.capabilities, { toolCalling: true, imageInput: true });
+        assert.ok((model as { configurationSchema?: unknown }).configurationSchema);
+        assert.doesNotMatch(String(model.tooltip), /conservative defaults/);
+        const provider = router.getProvider(connection.id)!;
+        assert.deepStrictEqual(await provider.getPresets(), []);
+        assert.strictEqual(await provider.getPresetConfig('never-probe'), undefined);
+        await provider.setTemplate('{"provider":{"only":["example"]},"reasoning":{"exclude":true},"session_id":"ignored"}');
+        const parts: vscode.LanguageModelResponsePart[] = [];
+        await router.provideLanguageModelChatResponse(model, [], {
+            toolMode: vscode.LanguageModelChatToolMode.Required,
+            tools: [{ name: 'lookup', description: 'Lookup', inputSchema: { type: 'object' } }],
+            modelOptions: { _conversationId: 'gateway-chat', _capturingTokenCorrelationId: 'marker' },
+            modelConfiguration: { reasoningEffort: 'low' },
+        } as never, { report: part => parts.push(part) }, token);
+        const post = calls.find(call => call.init?.method === 'POST')!;
+        const body = JSON.parse(String(post.init?.body));
+        assert.strictEqual(body.model, 'anthropic/shared');
+        assert.strictEqual(body.session_id, 'copilot-chat:gateway-chat');
+        assert.deepStrictEqual(body.reasoning, { exclude: true, effort: 'low' });
+        assert.deepStrictEqual(body.cache_control, { type: 'ephemeral' });
+        assert.deepStrictEqual(body.provider, { only: ['example'] });
+        assert.strictEqual(body.tool_choice, 'required');
+        assert.strictEqual(body.tools[0].function.name, 'lookup');
+        assert.ok(parts.some(part => part instanceof vscode.LanguageModelTextPart && part.value === 'answer'));
+        const tool = parts.find(part => part instanceof vscode.LanguageModelToolCallPart) as vscode.LanguageModelToolCallPart;
+        assert.strictEqual(tool.callId, 'call-1'); assert.deepStrictEqual(tool.input, { x: 1 });
+        assert.ok(parts.some(part => part instanceof vscode.LanguageModelDataPart && part.mimeType === 'usage'));
+        assert.ok(calls.every(call => /\/v1\/(models|chat\/completions)$/.test(call.url)));
+        assert.ok(!new Headers(post.init?.headers).has('HTTP-Referer'));
+        assert.ok(!new Headers(post.init?.headers).has('X-Title'));
+    });
+    test('gateway discovery failures and malformed lists never use a manual or unrestricted fallback', async () => {
+        const provider = new OpenRouterChatProvider(memorySecrets(), memoryState(), {
+            kind: 'gateway', baseUrl: 'https://gateway.test/v1', readKey: async () => 'gateway-key',
+            manualModels: [{ id: 'bypass', toolCalling: true }],
+        });
+        const invalid = [null, {}, { data: null }, { data: [{ id: 'allowed' }, {}] },
+            { data: [{ id: '' }] }, { data: [{ id: 'allowed' }, { id: 'allowed' }] },
+            { data: [{ id: 'allowed', architecture: { input_modalities: 'image' } }] }];
+        try {
+            for (const body of invalid) {
+                fetcher = async () => Response.json(body);
+                await assert.rejects(provider.provideLanguageModelChatInformation({ silent: true }, token));
+                provider.resetCatalogCache();
+            }
+            for (const status of [401, 403, 404, 503]) {
+                fetcher = async () => new Response('unavailable', { status });
+                await assert.rejects(provider.provideLanguageModelChatInformation({ silent: true }, token));
+                provider.resetCatalogCache();
+            }
+            fetcher = async () => Response.json({ data: [] });
+            assert.deepStrictEqual(await provider.provideLanguageModelChatInformation({ silent: true }, token), []);
+            await assert.rejects(provider.provideLanguageModelChatResponse({ id: 'bypass' } as never, [], {
+                toolMode: vscode.LanguageModelChatToolMode.Auto,
+            }, { report() {} }, token), /unavailable in the gateway catalog/);
+            assert.ok(calls.every(call => call.url === 'https://gateway.test/v1/models'));
+        } finally { provider.dispose(); }
+    });
+    test('gateway invalidation rejects old model handles when rediscovery fails or returns an empty catalog', async () => {
+        const connection = await gateway(); const [model] = await models(connection);
+        const provider = router.getProvider(connection.id)!;
+        provider.resetCatalogCache();
+        fetcher = async () => new Response('unavailable', { status: 403 });
+        await assert.rejects(models(connection));
+        await assert.rejects(request(model));
+        provider.resetCatalogCache();
+        fetcher = async () => Response.json({ data: [] });
+        assert.deepStrictEqual(await models(connection), []);
+        await assert.rejects(request(model), /unavailable in the gateway catalog/);
+        assert.ok(calls.every(call => call.init?.method !== 'POST'));
+    });
+    test('a pending gateway credential read cannot restore a superseded credential or catalog', async () => {
+        let release!: (key: string) => void;
+        const provider = new OpenRouterChatProvider(memorySecrets(), memoryState(), {
+            kind: 'gateway', baseUrl: 'https://gateway.test/v1',
+            readKey: async () => new Promise<string>(resolve => { release = resolve; }),
+        });
+        try {
+            const pending = provider.provideLanguageModelChatInformation({ silent: true }, token);
+            await tick();
+            await provider.setKey('replacement-key');
+            release('obsolete-key');
+            assert.deepStrictEqual(await pending, []);
+            assert.strictEqual(calls.length, 0);
+            const [model] = await provider.provideLanguageModelChatInformation({ silent: true }, token);
+            assert.ok(model);
+            assert.ok(calls.every(call => new Headers(call.init?.headers).get('Authorization') === 'Bearer replacement-key'));
+        } finally { provider.dispose(); }
+    });
+    test('gateway ignores an obsolete in-flight discovery result after invalidation', async () => {
+        const connection = await gateway();
+        let release!: (response: Response) => void;
+        fetcher = async () => new Promise<Response>(resolve => { release = resolve; });
+        const pending = models(connection); await tick();
+        router.getProvider(connection.id)!.resetCatalogCache();
+        release(Response.json({ data: [{ id: 'obsolete' }] }));
+        assert.deepStrictEqual(await pending, []);
+        fetcher = async () => new Response('denied', { status: 403 });
+        await assert.rejects(models(connection));
+    });
+    test('gateway rejects caller-forged models and cancels an active SSE reader', async () => {
+        const connection = await gateway(); const [model] = await models(connection);
+        await assert.rejects(request({ ...model, id: connectionModelId(connection.id, 'unlisted'),
+            version: JSON.stringify(['unlisted', registry.get(connection.id)!.revision]) }), /unavailable in the gateway catalog/);
+        let cancelled = false;
+        const source = new vscode.CancellationTokenSource();
+        fetcher = async () => new Response(new ReadableStream({
+            start(controller) {
+                controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'));
+            },
+            cancel() { cancelled = true; },
+        }), { headers: { 'content-type': 'text/event-stream' } });
+        try {
+            await assert.rejects(router.provideLanguageModelChatResponse(model, [], {
+                toolMode: vscode.LanguageModelChatToolMode.Auto,
+            }, { report(part) { if (part instanceof vscode.LanguageModelTextPart) { source.cancel(); } } }, source.token),
+            error => error instanceof vscode.CancellationError);
+            const post = calls.find(call => call.init?.method === 'POST')!;
+            assert.ok(post.init?.signal?.aborted);
+            assert.strictEqual(cancelled, true);
+        } finally { source.dispose(); }
+    });
     test('missing group configuration never discovers all connections or falls back to the last selected one', async () => {
         await generic('One');
         assert.deepStrictEqual(await router.provideLanguageModelChatInformation({ silent: true }, token), []);

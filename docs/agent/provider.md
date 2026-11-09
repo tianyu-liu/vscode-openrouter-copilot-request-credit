@@ -31,7 +31,14 @@ Missing generic metadata uses an 8192-token context window, a 2048-token complet
 tool support, and no assumed image support. Supplied compatible metadata is retained. Missing prices
 are displayed as unknown; generic token-only usage is persisted with unavailable cost rather than
 reported as free. Generic connections expose no OpenRouter reasoning/context picker schema.
-Gateway-specific allowance discovery is not implemented.
+Explicit Gateway connections retain OpenRouter metadata, wire session identity, reasoning controls,
+and cache markers. They use only their authenticated filtered `/models` and `/chat/completions` routes
+for model operations; discovery failures never fall back to other catalogs or manual models. Empty
+catalogs offer no models. Inference checks the upstream model against that connection's catalog.
+Presets, direct credit APIs, and OpenRouter attribution headers remain direct-only. Gateway allowance
+refresh is separate from the provider; see [gateway contract](gateway-allowance.md). Missing gateway
+cost remains unavailable rather than being recorded as free. Missing gateway metadata uses the same
+conservative limits/capabilities as generic endpoints while retaining supported picker schemas.
 
 ## Shared child implementation and direct OpenRouter details
 

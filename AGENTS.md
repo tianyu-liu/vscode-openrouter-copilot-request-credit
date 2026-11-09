@@ -34,7 +34,8 @@ configuration available. See [Request pipeline](docs/agent/request-pipeline.md).
 **Model choice is intentionally open:** each direct OpenRouter connection exposes the full catalog,
 with its optional account-availability filter. Generic endpoints expose their catalog plus manual
 model definitions. The extension adds no model allowlist; account/server restrictions still apply.
-Gateway-specific allowance discovery is planned, not implemented.
+Explicit gateway connections use a filtered catalog and show separate Cheap/Default allowance lanes.
+They retain OpenRouter request fields but make no direct OpenRouter credit or preset API calls.
 
 ## Repo naming and origin
 
@@ -116,6 +117,8 @@ the file first and open the copy read-only (Node's built-in `node:sqlite` `Datab
   and mutation revisions. Details: [architecture.md](docs/agent/architecture.md).
 - [connectionProvider.ts](src/connectionProvider.ts) — the registered `LanguageModelChatProvider`; dispatches native groups by
   connection ID, scopes model IDs, and rejects stale model revisions.
+- [gatewayAllowance.ts](src/gatewayAllowance.ts) and [gatewayAllowanceRefresh.ts](src/gatewayAllowanceRefresh.ts) —
+  conservative allowance validation and revision-checked gateway reads; see [contract](docs/agent/gateway-allowance.md).
 - [nativeGroups.ts](src/nativeGroups.ts) — explicit native group add/rename/remove and initial migration through the active
   client's profile. Details: [architecture.md](docs/agent/architecture.md).
 - [panel.ts](src/panel.ts) — the single webview with shared **Settings** and one tab per named connection.

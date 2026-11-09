@@ -19,7 +19,7 @@ an operation already sending requests. Retries retain the same captured endpoint
 
 ## Reasoning passthrough (P1)
 
-The OpenRouter-specific echo/cache behavior below is retained for direct connections. Generic
+The OpenRouter-specific echo/cache behavior below is retained for direct and explicit Gateway connections. Generic
 connections share thinking-stream conversion and echo existing traces, but omit the synthetic empty
 `reasoning_content` field and receive no automatic OpenRouter reasoning or cache configuration.
 
@@ -72,7 +72,7 @@ the last) **no `session_id` is sent at all**, so no orphan OpenRouter session is
   (5-min ephemeral, advancing) unless the template sets its own `cache_control` (P6).
 - Direct OpenRouter attribution headers `HTTP-Referer`/`X-Title` are hardcoded and sent only on
   `/chat/completions`, not `/models`. Generic requests receive neither header.
-- Direct OpenRouter is fixed to `https://openrouter.ai/api/v1`. Generic connections use validated
+- Direct OpenRouter is fixed to `https://openrouter.ai/api/v1`. Gateway and generic connections use validated
   API base URLs; HTTPS is required except for loopback HTTP, and redirect following is disabled.
 - Keys live in isolated per-connection SecretStorage slots, never settings.json.
 - A template applies until cleared/replaced for that connection. Choosing a different connection's
@@ -87,6 +87,12 @@ the last) **no `session_id` is sent at all**, so no orphan OpenRouter session is
   **Session spend** section instead (P12), where the figure is OpenRouter's `cost`, or the upstream
   cost on a BYOK route where OpenRouter charges nothing. Generic connections also retain token-only
   history; absent server cost is marked unavailable, and missing catalog pricing is unknown.
+
+Explicit Gateway connections also retain automatic session identity, reasoning/cache fields, and
+OpenRouter usage handling. Their filtered catalog is authoritative, with no manual catalog fallback.
+They use origin-relative `/lab/allowance` for separate Cheap/Default interval allowances and never call
+direct OpenRouter credit or preset endpoints. Allowances and session costs are different views; direct
+and gateway access can share the same upstream funds.
 
 ## Canonical request templates
 

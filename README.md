@@ -17,9 +17,10 @@ A VS Code extension for **named OpenRouter and OpenAI-compatible connections** i
 - **Used context size:** every turn forwards OpenRouter's own `usage` chunk (prompt/completion tokens, cache reads) to Copilot, so the context-usage ring shows *used / max tokens*.
 - **Session spend:** the panel's Session spend section accumulates what each chat session has cost in this window, with a collapsible per-session breakdown by provider and model (see below). Nothing is added to the chat transcript.
 - **One OpenRouter session per chat:** the `session_id` is the chat's own persisted id, so turns stay grouped in one OpenRouter session (sticky routing + the Logs → Sessions view) even after a window reload (a full restart is expected by design but was not exercised). A new chat is a new OpenRouter session. Background/internal calls (sub-agents, and Copilot's own utility flows) join the chat that triggered them; when there is no such chat, no `session_id` is sent, so no stray session is created.
-- **Status bar:** shows credit remaining; the panel has a usage dashboard.
+- **Gateway allowances:** choose the Gateway API type for a compatible gateway. Its tab shows Cheap and Default interval allowances separately, including unknown or stale readings.
+- **Status bar:** shows credit or gateway allowances for the selected panel connection.
 
-Host-managed fields are always replaced: `model`, `messages`, and `tools` come from Copilot, `stream` is always `true`, and a pasted `prompt` is dropped. OpenRouter connections also manage `session_id`, caching, and the picker's reasoning options. Compatible endpoints receive the pasted request options without those automatic OpenRouter additions.
+Host-managed fields are always replaced: `model`, `messages`, and `tools` come from Copilot, `stream` is always `true`, and a pasted `prompt` is dropped. OpenRouter and Gateway connections also manage `session_id`, caching, and the picker's reasoning options. Compatible endpoints receive the pasted request options without those automatic OpenRouter additions.
 
 ## The panel
 
@@ -48,7 +49,9 @@ Existing keys, request settings, context choices, and history migrate into one *
 2. Open the intended connection's tab, paste it into **Custom request**, then select **Save request**.
 3. Requests using that connection follow its saved settings until you clear or replace them.
 
-For an OpenAI-compatible endpoint, set its API base URL (for example `https://example.com/v1`). HTTPS is required except for loopback HTTP servers. Such connections support streaming Chat Completions; Responses-only APIs are not supported. Manual model IDs and optional context/capability metadata can fill gaps in `/models`. Missing prices are shown as unknown. To request token counts from a server that supports it, paste `"stream_options": {"include_usage": true}` into the request JSON. Gateway-specific allowance APIs are not supported yet.
+For an OpenAI-compatible endpoint, set its API base URL (for example `https://example.com/v1`). HTTPS is required except for loopback HTTP servers. Such connections support streaming Chat Completions; Responses-only APIs are not supported. Manual model IDs and optional context/capability metadata can fill gaps in `/models`. Missing prices are shown as unknown. To request token counts from a server that supports it, paste `"stream_options": {"include_usage": true}` into the request JSON.
+
+For a gateway providing the [allowance contract](docs/agent/gateway-allowance.md), choose **Gateway** and use its own bearer token. The server controls model availability; manual model additions are unavailable. Its separate allowances may share funds with direct connections. Private-CA endpoints require the extension host to trust the public CA certificate.
 
 ## Settings
 
@@ -93,5 +96,5 @@ Each connection's **Session spend** section has its own history, persisted acros
 ## Notes
 
 - **Compatibility:** chat and agent mode (tool calls) are supported; inline completions are not (same as BYOK).
-- **Network:** the key only leaves your machine in the Authorization header to OpenRouter.
+- **Network:** each connection sends its credential only to its configured API origin, with redirect following disabled.
 - **Local limit:** the local `limit` is a display helper; OpenRouter's server-side guardrail enforces the real cap.

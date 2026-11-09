@@ -2,6 +2,7 @@ import * as assert from "assert";
 import * as vscode from "vscode";
 import { runInNewContext } from "vm";
 import type { ConnectionDefinition } from "../../connections";
+import type { GatewayAllowance, GatewayLaneAllowance } from "../../gatewayAllowance";
 import { handlePanelMessage, PanelDeps, PanelRenderOptions, renderPanelHtml, renderSessionCosts } from "../../panel";
 import { SessionCost, stripTemplateComments, UNATTRIBUTED_SESSION_ID } from "../../provider";
 import { KEY_SECRET } from "../../storage";
@@ -257,7 +258,7 @@ suite("renderPanelHtml", () => {
     test("renders Settings followed by accessible named connection tabs", () => {
         const html = render();
         assert.match(html, /id="tab-settings" role="tab" aria-selected="true" aria-controls="panel-settings" tabindex="0">Settings<\/button>/);
-        assert.match(html, /id="tab-connection-default" data-connection-id="default" role="tab" aria-selected="false" aria-controls="panel-connection" tabindex="-1">OpenRouter<\/button>/);
+        assert.match(html, /id="tab-connection-default" data-connection-id="default" role="tab" aria-selected="false" aria-controls="panel-connection" tabindex="-1">OpenRouter: RC<\/button>/);
         const settings = html.slice(html.indexOf('id="panel-settings"'), html.indexOf('id="panel-connection"'));
         const connection = html.slice(html.indexOf('id="panel-connection"'), html.indexOf('<script nonce='));
         assert.ok(settings.includes('id="key"') && settings.includes('id="connectionForm"'));
@@ -1144,6 +1145,34 @@ suite('connection panel', () => {
         assert.strictEqual((view.state as { activeTab: string }).activeTab, 'tab-settings');
     });
 
+    test('new connections default to the original group name followed by numbered names', () => {
+        const connections: ConnectionDefinition[] = [];
+        for (const expected of ['OpenRouter: RC', 'OpenRouter: RC1', 'OpenRouter: RC2', 'OpenRouter: RC3']) {
+            const view = webviewHarness({ connections });
+            view.element('addConnection').fire('click');
+            assert.strictEqual(view.element('connectionName').value, expected);
+            view.element('connectionForm').fire('submit', { preventDefault() {} });
+            assert.strictEqual((view.messages.at(-1)!.value as { name: string }).name, expected);
+            connections.push({ ...connectionFixture(String(connections.length)), name: expected });
+        }
+    });
+
+    test('default names avoid disabled and case-insensitive collisions while custom names stay editable', () => {
+        const connections = [
+            { ...connectionFixture('a'), name: 'openrouter: rc', enabled: false },
+            { ...connectionFixture('b'), name: 'OpenRouter: RC1' },
+            { ...connectionFixture('c'), name: 'OpenRouter: RC3' },
+        ];
+        const view = webviewHarness({ connections, selectedConnectionId: 'b' });
+        view.element('addConnection').fire('click');
+        assert.strictEqual(view.element('connectionName').value, 'OpenRouter: RC2');
+        view.element('connectionName').value = 'Personal';
+        view.element('connectionForm').fire('submit', { preventDefault() {} });
+        assert.strictEqual((view.messages.at(-1)!.value as { name: string }).name, 'Personal');
+        view.element('cancelConnection').fire('click');
+        assert.strictEqual(view.element('connectionName').value, 'OpenRouter: RC1');
+    });
+
     test('escapes connection metadata and renders only one detail editor', () => {
         const hostile = { ...connectionFixture('a'), name: '</script><img src=x>', baseUrl: 'https://example.com/" onmouseover="bad' };
         const html = render({ connections: [hostile, connectionFixture('b')], selectedConnectionId: 'a' });
@@ -1163,6 +1192,81 @@ suite('connection panel', () => {
         assert.ok(html.includes('&quot;stream_options&quot;: {&quot;include_usage&quot;: true}'));
         assert.ok(!render().includes('To request token usage from servers that support it'));
 
+    });
+
+    test('gateway allowance uses separate effective interval budgets without unsupported controls', () => {
+        const budget = { limit: 5, remaining: 3.75, reset: 'daily', usage: 1.25,
+            resets_at: '2026-10-29T00:00:00Z', include_byok: true };
+        const lane: GatewayLaneAllowance = { ...budget, limit: null, remaining: null, usage: 999,
+            status: 'reported', effective_budget: budget, applicable_budgets: [budget], inherited_budgets: [budget] };
+        const allowance: GatewayAllowance = { cheap: lane,
+            default: { ...lane, effective_budget: { ...budget, limit: 20, remaining: 12.5, usage: 7.5, reset: 'weekly' } },
+            fetched_at: '2026-10-28T10:00:00Z' };
+        const html = render({ connections: [connectionFixture('gateway', 'gateway')],
+            gatewayAllowance: allowance, fetchedAt: new Date('2026-10-28T10:00:01Z'), sessions: [sessionFixture()] });
+        assert.ok(html.includes('Cheap lane') && html.includes('Default lane'));
+        assert.ok(html.includes('$3.75') && html.includes('$12.50'));
+        assert.ok(html.includes('$1.25') && html.includes('$7.50'));
+        assert.ok(!html.includes('$999'), 'cumulative key usage is not presented as interval usage');
+        assert.ok(!html.includes('$16.25'), 'daily and weekly balances are never summed');
+        assert.ok(html.includes('Gateway retrieved:') && html.includes('Retrieved locally:'));
+        assert.ok(html.includes('do not guarantee current billing counters'));
+        assert.ok(html.includes('using both does not add funds'));
+        assert.ok(html.includes('value="gateway" selected'));
+        for (const id of ['limit', 'includeByok', 'resetPeriod', 'hideUnavailableModels', 'manualModels', 'saveManualModels', 'presetSelect']) {
+            assert.ok(!html.includes(`id="${id}"`), `${id} is unsupported on gateway connections`);
+        }
+        assert.ok(html.includes('id="refresh"') && html.includes('Refresh allowance'));
+        assert.ok(html.includes('id="template"') && html.includes('Session spend'));
+    });
+
+    test('gateway partial, stale and missing allowance values remain unavailable', () => {
+        const budget = { limit: null, remaining: null, reset: null, usage: null, resets_at: null, include_byok: null };
+        const lane: GatewayLaneAllowance = { ...budget, status: 'reported', effective_budget: budget,
+            applicable_budgets: [], inherited_budgets: [] };
+        const html = render({ connections: [connectionFixture('gateway', 'gateway')], gatewayAllowanceStale: true,
+            gatewayAllowance: { cheap: lane, default: { ...lane, status: 'unknown',
+                effective_budget: { ...budget, limit: 7, remaining: 6, usage: 1 } }, fetched_at: null },
+            errorMessage: 'Allowance refresh failed' });
+        const table = html.match(/<table class="rows">([\s\S]*?)<\/table>/)![1];
+        assert.ok(table.includes('Reported') && table.includes('Unknown'));
+        assert.strictEqual((table.match(/Unavailable/g) ?? []).length, 10);
+        assert.ok(!table.includes('$0') && !table.includes('$6') && !table.includes('No limit'));
+        assert.ok(html.includes('Saved allowance is stale') && html.includes('Allowance refresh failed'));
+        assert.ok(html.includes('Gateway retrieved: Unavailable'));
+        const noEffectiveBudget = render({ connections: [connectionFixture('gateway', 'gateway')],
+            gatewayAllowance: { cheap: { ...lane, limit: 100, remaining: 90, usage: 10, effective_budget: null },
+                default: lane, fetched_at: null } });
+        assert.ok(!noEffectiveBudget.includes('$90') && !noEffectiveBudget.includes('$10'),
+            'missing effective budget never falls back to cumulative root counters');
+        const empty = render({ connections: [connectionFixture('gateway', 'gateway')] });
+        assert.ok(empty.includes('No gateway allowance yet'));
+        assert.strictEqual((empty.match(/<td>Unknown<\/td>/g) ?? []).length, 2);
+    });
+
+    test('gateway allowance escapes metadata and rejects non-finite display amounts', () => {
+        const budget = { limit: Number.POSITIVE_INFINITY, remaining: Number.NaN, reset: '</td><script>bad()</script>',
+            usage: 0, resets_at: '<img src=x onerror=bad()>', include_byok: null };
+        const lane: GatewayLaneAllowance = { ...budget, status: 'reported', effective_budget: budget,
+            applicable_budgets: [], inherited_budgets: [] };
+        const html = render({ connections: [connectionFixture('gateway', 'gateway')], gatewayAllowance: {
+            cheap: lane, default: lane, fetched_at: '</p><script>bad()</script>' },
+            errorMessage: '<img src=x onerror=bad()>' });
+        assert.ok(!html.includes('<script>bad()') && !html.includes('<img src=x'));
+        assert.ok(html.includes('&lt;/td&gt;&lt;script&gt;bad()&lt;/script&gt;'));
+        assert.ok(html.includes('&lt;img src=x onerror=bad()&gt;'));
+        assert.ok(!html.includes('$Infinity') && !html.includes('$NaN'));
+        assert.ok(html.includes('$0.00'), 'known zero remains distinct from unavailable values');
+    });
+
+    test('accepts explicit gateway connections from the Settings form', async () => {
+        const state = spyDeps();
+        const added: unknown[] = [];
+        state.deps.addConnection = async input => { added.push(input); };
+        await handlePanelMessage({ type: 'addConnection', value: { name: ' Gateway ', kind: 'gateway',
+            baseUrl: 'https://gateway.example/v1' } }, state.deps);
+        assert.deepStrictEqual(added, [{ name: 'Gateway', kind: 'gateway', baseUrl: 'https://gateway.example/v1' }]);
+        assert.deepStrictEqual(state.errors, []);
     });
 
     test('generic session history shows calls and tokens when cost is missing or zero', () => {

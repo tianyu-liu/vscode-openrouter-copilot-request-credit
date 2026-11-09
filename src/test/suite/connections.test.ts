@@ -64,7 +64,7 @@ suite('connection registry', () => {
         const registry = new ConnectionRegistry(data.state, data.secrets);
         await registry.initialize({ creditLimit: 7, creditResetPeriod: 'weekly' });
         assert.deepStrictEqual(registry.list().map(item => [item.id, item.name, item.baseUrl]), [
-            [LEGACY_CONNECTION_ID, 'OpenRouter', OPENROUTER_BASE_URL],
+            [LEGACY_CONNECTION_ID, 'OpenRouter: RC', OPENROUTER_BASE_URL],
         ]);
         assert.strictEqual(registry.get(LEGACY_CONNECTION_ID)!.settings.creditLimit, 7);
         assert.strictEqual(registry.get(LEGACY_CONNECTION_ID)!.settings.creditResetPeriod, 'weekly');
@@ -327,7 +327,7 @@ suite('connection registry', () => {
         const data = fixture();
         const registry = new ConnectionRegistry(data.state, data.secrets);
         await registry.initialize();
-        for (const name of ['', '   ', 'OPENROUTER']) {
+        for (const name of ['', '   ', 'OPENROUTER: RC']) {
             await assert.rejects(registry.add({ name, kind: 'openrouter' }));
         }
         for (const baseUrl of [
@@ -350,6 +350,24 @@ suite('connection registry', () => {
             const added = await registry.add({ name: baseUrl, kind: 'openai-compatible', baseUrl });
             assert.strictEqual(added.baseUrl, baseUrl.slice(0, -1));
         }
+        registry.dispose();
+    });
+
+    test('gateway connections retain their own endpoint and credential and reject manual models', async () => {
+        const data = fixture();
+        const registry = new ConnectionRegistry(data.state, data.secrets);
+        await registry.initialize();
+        const gateway = await registry.add({ name: 'Gateway', kind: 'gateway', baseUrl: 'https://gateway.test/v1/' });
+        assert.strictEqual(gateway.baseUrl, 'https://gateway.test/v1');
+        assert.strictEqual(gateway.kind, 'gateway');
+        await registry.storeKey(LEGACY_CONNECTION_ID, 'direct-key');
+        assert.strictEqual(await registry.readKey(gateway.id), undefined);
+        await registry.storeKey(gateway.id, 'gateway-key');
+        assert.strictEqual(await registry.readKey(LEGACY_CONNECTION_ID), 'direct-key');
+        assert.strictEqual(await registry.readKey(gateway.id), 'gateway-key');
+        await assert.rejects(registry.update(gateway.id, { models: [{ id: 'unlisted' }] }), /filtered catalog/);
+        await assert.rejects(registry.update(gateway.id, { baseUrl: 'https://other.test/v1' }), /Clear.*credential/);
+        await assert.rejects(registry.add({ name: 'Insecure', kind: 'gateway', baseUrl: 'http://gateway.test/v1' }));
         registry.dispose();
     });
 

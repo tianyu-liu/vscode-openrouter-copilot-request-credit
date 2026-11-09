@@ -1,8 +1,8 @@
-# Gateway allowance contract — next implementation milestone
+# Gateway allowance contract
 
 The deployed gateway's contract was located and read-only access verified on 2026-10-28. This document
 records its client-facing behavior without deployment addresses, credentials, or private account data.
-The extension does not implement this allowance adapter yet.
+Implemented in **0.5.0-test.3** as the explicit **Gateway** connection type.
 
 ## Authentication and routes
 
@@ -54,6 +54,17 @@ unauthenticated refusal, and both effective-budget response shapes. The OpenRout
 also reachable with its separate management credential. These checks made no inference calls and
 changed no keys, budgets, guardrails, or running services.
 
-Next: implement an explicit gateway adapter, validate the schema conservatively, add isolated allowance
-refresh/presentation and failure tests, then run bounded live streaming/tools checks through the
-extension. Deployment-specific access remains with the operator and is not part of the public repo.
+The adapter validates each lane independently, uses effective interval budgets in the panel/status bar,
+and retains failed readings as visibly stale. Missing or malformed counters remain unknown. Credential,
+endpoint, enabled-state, and deletion revisions prevent older reads from publishing new state. An
+allowance refresh calls only origin-relative `/lab/allowance`, with redirect following disabled.
+
+Bounded live checks through the compiled production provider verified tool streaming, tool-result
+continuation, direct/gateway credential and accounting isolation, and both allowance lanes. See
+[verification status](verification.md) for limits and client CA-trust settings. Stubbed regression tests
+remain network-free.
+
+Gateway discovery accepts only its filtered `/models` response; empty catalogs offer no models,
+malformed/error responses do not fall back, and manual model additions are unavailable. Requests retain
+OpenRouter session, reasoning, and cache fields while credit/preset APIs stay direct-only.
+Deployment-specific access remains with the operator and is not part of the public repo.

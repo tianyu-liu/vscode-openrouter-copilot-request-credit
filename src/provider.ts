@@ -1152,6 +1152,35 @@ export function buildRequestBody(
     return body;
 }
 
+function validGatewayCatalog(data: unknown[]): data is ModelCatalogEntry[] {
+    const record = (value: unknown): value is Record<string, unknown> =>
+        value !== null && typeof value === 'object' && !Array.isArray(value);
+    const strings = (value: unknown): boolean => Array.isArray(value) && value.every(item => typeof item === 'string');
+    const optional = (value: unknown, valid: (item: unknown) => boolean): boolean => value == null || valid(value);
+    const tokenLimit = (value: unknown): boolean => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+    const ids = new Set<string>();
+    return data.every(entry => {
+        if (!record(entry) || typeof entry.id !== 'string' || !entry.id.trim() || entry.id !== entry.id.trim()
+            || ids.has(entry.id)) { return false; }
+        ids.add(entry.id);
+        if (!optional(entry.name, value => typeof value === 'string')
+            || !optional(entry.context_length, tokenLimit)
+            || !optional(entry.supported_parameters, strings)
+            || !optional(entry.supports_tool_parameters, value => typeof value === 'boolean')) { return false; }
+        for (const field of ['architecture', 'top_provider', 'pricing', 'reasoning']) {
+            if (!optional(entry[field], record)) { return false; }
+        }
+        const architecture = entry.architecture as Record<string, unknown> | undefined;
+        const top = entry.top_provider as Record<string, unknown> | undefined;
+        const reasoning = entry.reasoning as Record<string, unknown> | undefined;
+        const pricing = entry.pricing as Record<string, unknown> | undefined;
+        return optional(architecture?.input_modalities, strings) && optional(architecture?.output_modalities, strings)
+            && optional(top?.context_length, tokenLimit) && optional(top?.max_completion_tokens, tokenLimit)
+            && optional(reasoning?.supported_efforts, strings)
+            && optional(pricing?.overrides, value => Array.isArray(value) && value.every(record));
+    });
+}
+
 export interface ProviderRuntimeConfig {
     connectionId?: string;
     baseUrl?: string;
@@ -1218,16 +1247,27 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         return getSessionCosts(this.ledger);
     }
 
-    private get isOpenRouter(): boolean {
-        return this.runtime.kind !== 'openai-compatible';
+    private get isDirectOpenRouter(): boolean {
+        return this.runtime.kind === undefined || this.runtime.kind === 'openrouter';
+    }
+
+    private get isGateway(): boolean {
+        return this.runtime.kind === 'gateway';
+    }
+
+    private get supportsOpenRouterRequestFields(): boolean {
+        return this.isDirectOpenRouter || this.isGateway;
     }
 
     private get baseUrl(): string {
+        if (this.isGateway && !this.runtime.baseUrl) {
+            throw new Error('A gateway API base URL is required.');
+        }
         return (this.runtime.baseUrl ?? OPENROUTER_API_BASE_URL).replace(/\/+$/, '');
     }
 
     private get hideUnavailable(): boolean {
-        return this.isOpenRouter && (this.runtime.hideUnavailableModels ?? hideUnavailableModelsEnabled());
+        return this.isDirectOpenRouter && (this.runtime.hideUnavailableModels ?? hideUnavailableModelsEnabled());
     }
 
     private headers(key: string | undefined): Record<string, string> {
@@ -1413,7 +1453,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         }
         const body = parsed as Record<string, unknown>;
         const { messages, prompt, model, tools, stream, ...params } = body;
-        if (this.isOpenRouter) {
+        if (this.supportsOpenRouterRequestFields) {
             delete params.session_id;
         }
         this.template = params;
@@ -1438,12 +1478,13 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         if (this.key) {
             return this.key;
         }
+        const generation = this.cacheGeneration;
         const stored = this.runtime.readKey ? await this.runtime.readKey() : await readKey(this.secrets);
         if (stored) {
-            this.key = stored;
+            if (generation === this.cacheGeneration) { this.key = stored; }
             return stored;
         }
-        if (silent || !this.isOpenRouter) {
+        if (silent || !this.isDirectOpenRouter) {
             return undefined;
         }
         const value = await vscode.window.showInputBox({
@@ -1465,11 +1506,15 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         if (this.cachedInfo) {
             return this.cachedInfo;
         }
+        const generation = this.cacheGeneration;
         const key = await this.getKey(options.silent);
-        if (!key && this.isOpenRouter) {
+        if (this.isGateway && generation !== this.cacheGeneration) { return []; }
+        if (!key && this.isGateway) {
+            throw vscode.LanguageModelError.NoPermissions(t('Gateway bearer key not configured. Add it in Settings.'));
+        }
+        if (!key && this.isDirectOpenRouter) {
             return [];
         }
-        const generation = this.cacheGeneration;
         const models = await this.ensureCatalog(key ?? '', token);
         const visible = await this.resolveVisibleCatalog(key ?? '', models, token, generation);
         const stale = generation !== this.cacheGeneration;
@@ -1478,10 +1523,10 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         }
         const info = visible.map(m => this.toInfo(m));
         if (stale) {
-            return info;
+            return this.isGateway ? [] : info;
         }
         this.cachedInfo = info;
-        if (!this.isOpenRouter) {
+        if (!this.isDirectOpenRouter) {
             return info;
         }
         if (this.cachedPresets) {
@@ -1670,15 +1715,30 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         progress: vscode.Progress<ResponsePart>,
         token: vscode.CancellationToken
     ): Promise<void> {
+        const generation = this.cacheGeneration;
         const template = structuredClone((await this.getTemplate()) ?? {});
         const key = await this.getKey(true);
         if (this.runtime.isCurrent && !this.runtime.isCurrent()) {
             throw vscode.LanguageModelError.NotFound('This connection changed while preparing the request. Select it again.');
         }
-        if (!key && this.isOpenRouter) {
+        if (!key && this.isDirectOpenRouter) {
             throw vscode.LanguageModelError.NoPermissions(
                 t('OpenRouter key not configured. Run "OpenRouter: Manage provider".')
             );
+        }
+
+        if (this.isGateway) {
+            if (generation !== this.cacheGeneration) {
+                throw vscode.LanguageModelError.NotFound('This connection changed while preparing the request. Select it again.');
+            }
+            if (!key) {
+                throw vscode.LanguageModelError.NoPermissions(t('Gateway bearer key not configured. Add it in Settings.'));
+            }
+            const catalog = await this.ensureCatalog(key, token);
+            if (generation !== this.cacheGeneration || (this.runtime.isCurrent && !this.runtime.isCurrent())
+                || !catalog.some(entry => entry.id === model.id)) {
+                throw vscode.LanguageModelError.NotFound(t('This model is unavailable in the gateway catalog. Select it again.'));
+            }
         }
 
         const modelConfiguration = (
@@ -1705,7 +1765,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             this.ledger
         );
         const sessionId = costKey === UNATTRIBUTED_SESSION_ID ? undefined : costKey;
-        const presetSlug = presetSlugFromModelId(model.id);
+        const presetSlug = this.isDirectOpenRouter ? presetSlugFromModelId(model.id) : undefined;
         const presetModel = presetSlug !== undefined ? presetModelOf(this.presetConfigs.get(presetSlug)) : undefined;
         const recordedModel =
             presetModel !== undefined
@@ -1716,7 +1776,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             template,
             model.id,
             toOpenAI(messages).map(message => {
-                if (this.isOpenRouter || !message || typeof message !== 'object') { return message; }
+                if (this.supportsOpenRouterRequestFields || !message || typeof message !== 'object') { return message; }
                 const { reasoning_content, ...common } = message as Record<string, unknown>;
                 return reasoning_content === '' ? common : message;
             }),
@@ -1732,7 +1792,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             presetModel,
             sessionId,
             requireToolCall,
-            this.isOpenRouter
+            this.supportsOpenRouterRequestFields
         );
 
         lastStreamUsage = undefined;
@@ -1747,7 +1807,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             usageAccounted = true;
             reportUsagePart(progress, usage);
             accumulateSessionCost(
-                costKey, usage, provider, recordedModel, this.ledger, this.runtime.connectionId, !this.isOpenRouter
+                costKey, usage, provider, recordedModel, this.ledger, this.runtime.connectionId, !this.isDirectOpenRouter
             );
         };
         const streamState = { reportedAnyPart: false, sawReasoning: false };
@@ -1770,7 +1830,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             const headers = {
                 'Content-Type': 'application/json',
                 ...this.headers(key),
-                ...(this.isOpenRouter ? {
+                ...(this.isDirectOpenRouter ? {
                     'HTTP-Referer': 'https://github.com/tianyu-liu/vscode-openrouter-copilot-request-credit',
                     'X-Title': 'OpenRouter for Copilot',
                 } : {}),
@@ -1958,13 +2018,17 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             } catch {
                 throw new Error(t('OpenRouter /models returned an unexpected (non-JSON) response body.'));
             }
-            if (!Array.isArray(json.data)) {
+            if (!json || !Array.isArray(json.data)) {
                 throw new Error(t('OpenRouter /models returned an unexpected response body (missing the data array).'));
             }
+            if (this.isGateway && !validGatewayCatalog(json.data)) {
+                throw new Error(t('Gateway /models returned an invalid filtered catalog.'));
+            }
             const models = (json.data as ModelCatalogEntry[]).filter(m => m && typeof m.id === 'string');
-            return this.isOpenRouter ? models : this.genericCatalog(models);
+            return this.isDirectOpenRouter ? models : this.genericCatalog(models, !this.isGateway);
         } catch (error) {
-            if (!this.isOpenRouter && this.runtime.manualModels?.length && !token.isCancellationRequested) {
+            if (this.runtime.kind === 'openai-compatible' && this.runtime.manualModels?.length
+                && !token.isCancellationRequested) {
                 return this.genericCatalog([]);
             }
             throw error;
@@ -1973,9 +2037,9 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         }
     }
 
-    private genericCatalog(models: ModelCatalogEntry[]): ModelCatalogEntry[] {
+    private genericCatalog(models: ModelCatalogEntry[], includeManualModels = true): ModelCatalogEntry[] {
         const merged = new Map(models.map(m => [m.id, m]));
-        for (const manual of this.runtime.manualModels ?? []) {
+        for (const manual of includeManualModels ? this.runtime.manualModels ?? [] : []) {
             const previous = merged.get(manual.id);
             merged.set(manual.id, {
                 ...previous,
@@ -2020,7 +2084,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
     }
 
     async getPresets(): Promise<PresetSummary[] | undefined> {
-        if (!this.isOpenRouter) { return []; }
+        if (!this.isDirectOpenRouter) { return []; }
         if (this.cachedPresets) {
             return this.cachedPresets;
         }
@@ -2102,7 +2166,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
     }
 
     async getPresetConfig(slug: string): Promise<Record<string, unknown> | undefined> {
-        if (!this.isOpenRouter) { return undefined; }
+        if (!this.isDirectOpenRouter) { return undefined; }
         const cached = this.presetConfigs.get(slug);
         if (cached) {
             return cached;
@@ -2216,7 +2280,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         const [family] = m.id.split('/');
         const budget = this.contextBudgetFor(m.id);
         const { detail, tooltip, maxInputTokens, maxOutputTokens } = buildModelInfo(m, budget);
-        const info: ChatModelInfo = {
+        let info: ChatModelInfo = {
             id: m.id,
             name: m.name ?? m.id,
             family: family ?? 'openrouter',
@@ -2230,7 +2294,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
                 imageInput: (m.architecture?.input_modalities ?? []).includes('image'),
             },
         };
-        if (!this.isOpenRouter) {
+        if (!this.isDirectOpenRouter) {
             const knownPrice = (value: unknown): boolean => typeof value === 'string' && value.trim() !== ''
                 && Number.isFinite(Number(value)) && Number(value) >= 0;
             const completePricing = knownPrice(m.pricing?.prompt) && knownPrice(m.pricing?.completion);
@@ -2240,18 +2304,20 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
                 context: t('context window'), output: t('maximum output tokens'),
                 tools: t('tool calling'), images: t('image input'),
             };
-            const assumptionNote = assumed.length > 0 ? t(
-                'Missing endpoint metadata: conservative defaults for {0}. Manual models can override them.',
-                assumed.map(field => labels[field]).join(', ')
-            ) : undefined;
+            const missingFields = assumed.map(field => labels[field]).join(', ');
+            const assumptionNote = assumed.length === 0 ? undefined : this.isGateway
+                ? t('Missing endpoint metadata: conservative defaults for {0}.', missingFields)
+                : t('Missing endpoint metadata: conservative defaults for {0}. Manual models can override them.',
+                    missingFields);
             const pricingDetail = genericInfo.detail ?? t('Pricing: unknown');
-            return {
+            info = {
                 ...info,
                 tooltip: [genericInfo.tooltip.replace(
                     t('Pricing: not listed by OpenRouter'), t('Pricing: not listed by the endpoint')
                 ), assumptionNote].filter(Boolean).join('\n\n'),
                 detail: assumptionNote ? `${pricingDetail} \u00b7 ${t('conservative defaults')}` : pricingDetail,
             };
+            if (!this.supportsOpenRouterRequestFields) return info;
         }
         const reasoningSchema = buildReasoningSchema(m);
         const capSchema = buildContextCapSchema(m, this.getContextCaps()[m.id], budget.outputReserve);

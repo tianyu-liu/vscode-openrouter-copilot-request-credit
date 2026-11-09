@@ -18,6 +18,7 @@ import {
 } from './connections';
 import { ConnectionChatProvider } from './connectionProvider';
 import { NativeGroupManager } from './nativeGroups';
+import { GatewayAllowanceRefreshState, refreshGatewayAllowanceState } from './gatewayAllowanceRefresh';
 
 export { readConfig } from './panel';
 
@@ -44,11 +45,9 @@ const CONNECTION_MESSAGES = new Set([
     'setConnectionEnabled', 'saveManualModels',
 ]);
 
-interface CreditState {
+interface CreditState extends GatewayAllowanceRefreshState {
     info?: KeyInfo;
-    fetchedAt?: Date;
     accountCredits?: AccountCredits;
-    error?: string;
     currentRun?: { controller: AbortController; done: Promise<KeyInfo | undefined> };
 }
 const connectionCredits = new Map<string, CreditState>();
@@ -256,6 +255,8 @@ async function updatePanel(
         maskedKey: key ? maskKey(key) : undefined,
         accountCredits: state ? state.accountCredits : legacyCredits.accountCredits,
         errorMessage: state ? state.error : legacyCredits.error,
+        gatewayAllowance: state?.gatewayAllowance,
+        gatewayAllowanceStale: state?.gatewayAllowanceStale,
         template,
         presets,
         presetConfig,
@@ -501,7 +502,7 @@ async function doRefreshRun(
         if (stale() || (connectionId !== undefined && selectedConnectionId !== connectionId)) return;
         await updatePanel(secrets, state.info, signal, key);
     };
-    if (connection && (!connection.enabled || connection.kind !== 'openrouter')) {
+    if (connection && (!connection.enabled || connection.kind === 'openai-compatible')) {
         state.info = undefined;
         state.accountCredits = undefined;
         state.error = undefined;
@@ -510,7 +511,8 @@ async function doRefreshRun(
         await render();
         return undefined;
     }
-    status('$(sync~spin) …', t('Refreshing OpenRouter key info…'));
+    status('$(sync~spin) …', connection?.kind === 'gateway'
+        ? t('Refreshing gateway allowance…') : t('Refreshing OpenRouter key info…'));
     let apiKey: string | undefined;
     try {
         apiKey = connectionId ? await registry?.readKey(connectionId) : await readKey(secrets);
@@ -520,9 +522,32 @@ async function doRefreshRun(
             state.fetchedAt = undefined;
             state.accountCredits = undefined;
             state.error = undefined;
+            state.gatewayAllowance = undefined;
+            state.gatewayAllowanceStale = false;
             if (connectionId) status(t('$(key) No key'), t('Open Settings in the panel to set this connection’s API key.'));
             else showNoKey();
             await render(null);
+            return undefined;
+        }
+        if (connection?.kind === 'gateway') {
+            const outcome = await refreshGatewayAllowanceState(state, {
+                baseUrl: connection.baseUrl, apiKey, signal, isCurrent: () => !stale(),
+            });
+            if (outcome === 'superseded') return undefined;
+            if (outcome === 'failed') state.error = t('Gateway allowance refresh failed.');
+            const allowance = state.gatewayAllowance;
+            const labels = { cheap: t('Cheap'), default: t('Default') };
+            const lanes = (['cheap', 'default'] as const).map(name => {
+                const lane = allowance?.[name];
+                const budget = lane?.status === 'reported' ? lane.effective_budget : undefined;
+                const remaining = budget?.remaining;
+                return `${labels[name]} ${remaining == null ? t('Unknown') : `$${remaining.toFixed(2)}`}`;
+            });
+            const staleLabel = state.gatewayAllowanceStale ? ` · ${t('Stale')}` : '';
+            status(`${lanes.join(' · ')}${staleLabel}`, state.error ?? t(
+                'Gateway allowances are separate. Open the panel for usage and reset details. Billing counters may lag.'
+            ));
+            await render(apiKey);
             return undefined;
         }
         const info = await fetchApi<KeyInfo>(apiKey, 'key', signal);

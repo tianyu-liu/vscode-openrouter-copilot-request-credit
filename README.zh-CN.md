@@ -17,9 +17,10 @@
 - **已用上下文大小：** 每一轮都会把 OpenRouter 自身的 `usage` 块（提示/补全 token、缓存读取）转发给 Copilot，因此上下文用量环会显示*已用 / 最大 token*。
 - **会话支出：** 面板的“会话支出”部分会累计每个聊天会话在此窗口中的花费，并提供按提供程序和模型划分的可折叠明细（见下文）。聊天记录中不会添加任何内容。
 - **每个聊天一个 OpenRouter 会话：** `session_id` 是聊天自身持久化的 id，因此即使在窗口重新加载后，各轮仍会归属于同一个 OpenRouter 会话（粘性路由 + Logs → Sessions 视图；按设计，完整重启后也应保留，但尚未验证）。新聊天是新的 OpenRouter 会话。后台/内部调用（子代理以及 Copilot 自身的辅助流程）会并入触发它们的聊天；当不存在这样的聊天时，不发送 `session_id`，因此不会创建多余的会话。
-- **状态栏：** 显示剩余额度；面板中有用量仪表板。
+- **网关额度：** 选择 Gateway API 类型，分别显示 Cheap 和 Default 的周期额度，并区分未知数据和已过期的读取结果。
+- **状态栏：** 显示面板中所选连接的余额或网关额度。
 
-由宿主管理的字段始终会被替换：`model`、`messages` 和 `tools` 来自 Copilot，`stream` 始终为 `true`，粘贴的 `prompt` 会被丢弃。OpenRouter 连接还会管理 `session_id`、缓存和选择器中的推理选项。兼容端点会接收粘贴的请求选项，但不会附加这些自动生成的 OpenRouter 专用字段。
+由宿主管理的字段始终会被替换：`model`、`messages` 和 `tools` 来自 Copilot，`stream` 始终为 `true`，粘贴的 `prompt` 会被丢弃。OpenRouter 和 Gateway 连接还会管理 `session_id`、缓存和选择器中的推理选项。兼容端点会接收粘贴的请求选项，但不会附加这些自动生成的 OpenRouter 专用字段。
 
 ## 面板
 
@@ -48,7 +49,9 @@
 2. 打开目标连接的标签页，将其粘贴到**自定义请求**，然后选择**保存请求**。
 3. 使用该连接的请求会遵循已保存设置，直到你清除或替换它。
 
-对于 OpenAI 兼容端点，请设置 API 基础 URL（例如 `https://example.com/v1`）。除环回 HTTP 服务器外，必须使用 HTTPS。支持流式 Chat Completions；不支持仅提供 Responses API 的服务。可用手动模型 ID 和可选的上下文/能力元数据补充 `/models` 中缺失的信息。没有价格信息时，成本会显示为未知。若服务器支持，可在请求 JSON 中粘贴 `"stream_options": {"include_usage": true}` 以请求 token 数量。暂不支持网关专用的额度查询 API。
+对于 OpenAI 兼容端点，请设置 API 基础 URL（例如 `https://example.com/v1`）。除环回 HTTP 服务器外，必须使用 HTTPS。支持流式 Chat Completions；不支持仅提供 Responses API 的服务。可用手动模型 ID 和可选的上下文/能力元数据补充 `/models` 中缺失的信息。没有价格信息时，成本会显示为未知。若服务器支持，可在请求 JSON 中粘贴 `"stream_options": {"include_usage": true}` 以请求 token 数量。
+
+对于提供[额度契约](docs/agent/gateway-allowance.md)的网关，请选择 **Gateway** 并使用其独立的 Bearer 令牌。服务器控制模型可用性，不支持手动添加模型。网关与直接连接可能共享同一笔上游资金。使用私有 CA 时，需要让扩展宿主信任公开 CA 证书。
 
 ## 设置
 
@@ -93,5 +96,5 @@
 ## 说明
 
 - **兼容性：** 支持聊天和智能体模式（工具调用）；不支持内联补全（与 BYOK 相同）。
-- **网络：** 密钥只会以 Authorization 标头的形式离开你的机器，且仅发往 OpenRouter。
+- **网络：** 每个连接只向其配置的 API 来源发送凭据，并禁止跟随重定向。
 - **本地限制：** 本地 `limit` 仅用于显示辅助；OpenRouter 的服务器端护栏才强制执行真正的上限。

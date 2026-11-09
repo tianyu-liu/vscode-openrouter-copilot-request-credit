@@ -3,7 +3,7 @@
   "displayName": "%displayName%",
   "description": "%description%",
   "l10n": "./l10n",
-  "version": "0.5.0-test.2",
+  "version": "0.5.0-test.3",
   "publisher": "tianyu-liu",
   "license": "MIT",
   "repository": {

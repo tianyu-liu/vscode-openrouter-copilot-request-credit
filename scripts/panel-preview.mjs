@@ -125,7 +125,8 @@ function injectPreviewHarness(html) {
         .replace('<head>', `<head>${THEME_SHIM}${HARNESS}`);
 }
 
-function buildFixtures(selectedConnectionId = 'personal') {
+// Review alternate gateway states with ?connection=gateway&allowance=partial|unknown|stale.
+function buildFixtures(selectedConnectionId = 'personal', allowanceState = 'reported') {
     const settings = { creditLimit: 10, creditResetPeriod: 'daily', creditIncludeByok: true,
         hideUnavailableModels: true };
     const connections = [
@@ -136,6 +137,8 @@ function buildFixtures(selectedConnectionId = 'personal') {
         { id: 'local', name: 'Local', kind: 'openai-compatible', baseUrl: 'http://localhost:1234/v1',
             enabled: true, revision: 1, settings,
             models: [{ id: 'local-model', name: 'Local model', contextLength: 32768, toolCalling: true }] },
+        { id: 'gateway', name: 'Gateway', kind: 'gateway', baseUrl: 'https://gateway.example/v1',
+            enabled: true, revision: 1, settings },
     ];
     const info = {
         label: 'sk-or-v1-preview',
@@ -236,6 +239,22 @@ function buildFixtures(selectedConnectionId = 'personal') {
         promptTokens: 1536, completionTokens: 256, cachedTokens: 512, calls: 2,
         byok: false, updatedAt: 1759569800000,
     };
+    const budget = { limit: null, remaining: null, reset: null, usage: 124.5,
+        resets_at: null, include_byok: true };
+    const lane = (effective) => ({ ...budget, status: 'reported', effective_budget: effective,
+        applicable_budgets: [effective], inherited_budgets: [effective] });
+    const gatewayAllowance = {
+        cheap: lane({ limit: 5, remaining: 3.75, reset: 'daily', usage: 1.25,
+            resets_at: '2026-10-29T00:00:00Z', include_byok: true }),
+        default: lane({ limit: 20, remaining: 12.5, reset: 'weekly', usage: 7.5,
+            resets_at: '2026-11-02T00:00:00Z', include_byok: true }),
+        fetched_at: '2026-10-28T10:00:00Z',
+    };
+    if (['partial', 'unknown'].includes(allowanceState)) {
+        gatewayAllowance.default = { ...budget, status: 'unknown', effective_budget: null,
+            applicable_budgets: [], inherited_budgets: [] };
+        if (allowanceState === 'unknown') gatewayAllowance.cheap = gatewayAllowance.default;
+    }
     return {
         connections,
         selectedConnectionId,
@@ -244,10 +263,15 @@ function buildFixtures(selectedConnectionId = 'personal') {
         resetPeriod: 'daily',
         includeByok: true,
         refreshIntervalMinutes: 5,
-        fetchedAt: new Date(1759570000000),
-        maskedKey: selectedConnectionId === 'local' ? undefined : 'sk-or-v1-preview...1234',
+        fetchedAt: new Date(selectedConnectionId === 'gateway' ? '2026-10-28T10:00:01Z' : 1759570000000),
+        maskedKey: selectedConnectionId === 'local' ? undefined
+            : selectedConnectionId === 'gateway' ? 'gateway-preview...1234' : 'sk-or-v1-preview...1234',
         accountCredits,
-        template: selectedConnectionId === 'local' ? { temperature: 0.2 } : template,
+        gatewayAllowance: selectedConnectionId === 'gateway' ? gatewayAllowance : undefined,
+        gatewayAllowanceStale: selectedConnectionId === 'gateway' && allowanceState === 'stale',
+        errorMessage: selectedConnectionId === 'gateway' && allowanceState === 'stale'
+            ? 'Gateway allowance refresh failed.' : undefined,
+        template: ['local', 'gateway'].includes(selectedConnectionId) ? { temperature: 0.2 } : template,
         presets: selectedConnectionId === 'local' ? undefined : presets,
         presetConfig: selectedConnectionId === 'local' ? undefined : presetConfig,
         sessions: selectedConnectionId === 'local' ? [{
@@ -490,9 +514,9 @@ ${LIVE_RELOAD_SCRIPT}
 </html>`;
 }
 
-function renderHtml(selectedConnectionId) {
+function renderHtml(selectedConnectionId, allowanceState) {
     const { renderPanelHtml } = freshRequire('panel.js');
-    return injectPreviewHarness(renderPanelHtml(buildFixtures(selectedConnectionId)));
+    return injectPreviewHarness(renderPanelHtml(buildFixtures(selectedConnectionId, allowanceState)));
 }
 
 function outMtime() {
@@ -513,7 +537,8 @@ http.createServer((req, res) => {
         return;
     }
     try {
-        const html = url.pathname === '/model-info' ? renderModelInfoHtml() : renderHtml(url.searchParams.get('connection') || 'personal');
+        const html = url.pathname === '/model-info' ? renderModelInfoHtml()
+            : renderHtml(url.searchParams.get('connection') || 'personal', url.searchParams.get('allowance') || 'reported');
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
         res.end(html);
     } catch (error) {

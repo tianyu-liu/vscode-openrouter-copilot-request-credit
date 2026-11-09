@@ -1,17 +1,21 @@
 # Multi-provider endpoint update plan
 
-Status: in progress for **0.5.0**. Current development build: **0.5.0-test.2**.
+Status: in progress for **0.5.0**. Current development build: **0.5.0-test.3**.
 
 Implemented: recoverable connection migration, multiple OpenRouter connections, generic streaming
-Chat Completions endpoints, connection-scoped model IDs/accounting, and the regrouped panel. The
-existing package/vendor identifiers are retained. The isolated grouping prototype remains available as
+Chat Completions endpoints, connection-scoped model IDs/accounting, the regrouped panel,
+explicit gateway allowance lanes, and conservative gateway discovery. The existing package/vendor
+identifiers are retained. The isolated grouping prototype remains available as
 `npm run test:groups`; see [native grouping verification](agent/native-model-groups.md).
 
 A normal isolated host also exercised the production panel, native groups, key rotation, per-connection
 template saves, rename, restart persistence, and generic inference through `vscode.lm`, with fake keys
 and stubbed fetch responses. Subsequent read-only checks verified real management access and gateway
-HTTPS health, discovery, and both allowance lanes. Live inference through the extension and the gateway
-allowance adapter remain pending; see [the located contract](agent/gateway-allowance.md).
+HTTPS health, discovery, and both allowance lanes. The gateway adapter now implements
+[the located contract](agent/gateway-allowance.md), including independent unknown/stale lane states.
+Bounded live provider checks passed for gateway tools/continuation, a direct same-model control,
+allowance refresh, and connection-isolated accounting; see [verification status](agent/verification.md).
+The packaged test.3 VSIX also passed installed activation in an isolated profile with fake credentials.
 
 Use **named connections, each appearing as a separate Copilot model group**. Users can configure several
 OpenRouter keys, custom OpenAI-compatible endpoints, or both—for example, “Personal OpenRouter,”
@@ -132,12 +136,12 @@ Implement in this order:
 2. Registry and migration — implemented with failure-injection coverage.
 3. Multiple OpenRouter connections — implemented and exercised in the real client using fixtures.
 4. Generic endpoint adapter — implemented for streaming Chat Completions and manual metadata.
-5. Gateway allowance support — pending; [contract located](agent/gateway-allowance.md) and read-only
-   deployment access verified. Implement the adapter and lane semantics next.
+5. Gateway allowance support — implemented with [contract validation](agent/gateway-allowance.md),
+   per-connection refresh isolation, separate effective interval budgets, and no catalog fallback.
 6. UI completion — shared/per-connection regrouping implemented, localized, and browser/client checked.
 
-Direct OpenRouter credit behavior is retained per connection. Effective inherited account budgets and
-gateway lane accounting still need their adapter/contract work; they are not inferred by summing limits.
+Direct OpenRouter credit behavior is retained per connection. Its effective inherited account budget
+presentation remains pending. Gateway lanes are implemented and never summed into a combined limit.
 
 Regression coverage should include migration failures, duplicate model IDs, concurrent requests,
 credential rotation, stale refreshes, deletion, missing metadata, and connection-isolated accounting.

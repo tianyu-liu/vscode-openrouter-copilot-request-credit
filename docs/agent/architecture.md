@@ -50,6 +50,14 @@ and [font generator](../../scripts/build-status-icons.py).
   discarded. Selecting a panel tab changes editing and status display, while Copilot's model group
   controls inference routing. `renderPanelHtml`, `handlePanelMessage`, and injected `PanelDeps` remain
   testable without a live webview. `readConfig` reads/validates application/global settings only.
+- [gatewayAllowance.ts](../../src/gatewayAllowance.ts) validates the gateway contract without VS Code
+  imports. Invalid lanes become unknown independently; missing numeric fields stay null. The origin URL
+  helper resolves `/lab/allowance` independently of an API prefix.
+- [gatewayAllowanceRefresh.ts](../../src/gatewayAllowanceRefresh.ts) reads only that allowance route
+  with the captured gateway bearer, bounded cancellation, redirect refusal, and revision checks. Errors
+  retain previous readings as stale and publish a fixed message without server bodies or credentials.
+  Activation uses the existing per-connection refresh scheduling and cancellation. Gateway status/panel
+  show the Cheap and Default effective interval budgets separately, with reset times and unknown values.
 
 - [modelInfo.ts](../../src/modelInfo.ts) — pure model-card rendering for the picker tooltip (`buildModelInfo`): OpenRouter per-token pricing → per-1M display; a **plain GFM pricing table** (no heading), whose first column is `%` (the agentic-usage mix `3 uncached : 6 cache write : 85 cache read : 5 thinking : 1 output`, cache-write → input fallback), then `Type` (one row per component: uncached/cache write/cache read/thinking/output), then one column per pricing segment (`$Mtok` when flat, `≤ <bound>` / `> <bound>` when tiered), closed by a bold weighted `**Blended**` row (ratio `100`, per-column blended `~$X.XXX`); plain info lines
 `Context window:` / `Effective prompt cap:` / `Effective completion cap:` / `Max completion:`, followed by one capability line each (`Tools: \u2713`, `Image: input \u2713 / output \u2717`, likewise video and audio — `architecture.output_modalities` included); and a reasoning line (`None/Low/**Medium**/High` with the default bolded, `(required)` appended when mandatory) — plus `buildReasoningSchema` (navigation-grouped Thinking Effort schema; it honors `default_enabled: false` by pre-selecting the off choice wherever one exists, and never offers `none` when `mandatory`), `effortFromModelConfiguration`, and the stepped-model **Context size** picker schema (`contextCapOptions`/`contextCapSelection`/`contextCapFromPicker`/`buildContextCapSchema`/`defaultContextCap`/`formatSize`/`sizeAdvisory`: one entry per step plus the whole window as **prompt budgets**, `sizeAdvisory` giving `<64K` a stop sign and `≤128K` a warning, `defaultContextCap` picking the step closest to 256K at or above a 196K floor; offered only for a model with a price step). Intentionally imports no `vscode`; unit-tested in `modelInfo.test.ts`.
@@ -76,10 +84,12 @@ saved generic credential before changing its endpoint.
 
 First initialization copies the existing primary `openrouterApiKey` (or old `openrouterCopilot.apiKey`)
 and `requestTemplate`, `contextCaps`, `contextCapsBase`, `contextMarginPercent`, `sessionCosts`, and
-`parentSession` into **OpenRouter**, ID `default-openrouter`. It also copies the four old connection
+`parentSession` into **OpenRouter: RC**, ID `default-openrouter`. It also copies the four old connection
 settings. Secret read failures abort migration. Original data is preserved until the registry commit;
 post-commit cleanup is retryable. The default exists even without a key, and an intentionally empty
 registry never recreates it. New connections never inherit a legacy key, template, or history.
+New connection names default to **OpenRouter: RC1**, **OpenRouter: RC2**, and so on, using the first
+available name (case-insensitive). Users can edit these names before saving.
 
 ## Settings
 
@@ -92,7 +102,8 @@ after migration the panel edits their equivalents in the selected connection def
 
 Request templates live in connection state and remain paste-apply JSON. Manual model metadata is a
 compact optional override for generic endpoints, not a parameter-by-parameter request builder.
-Gateway-specific allowance APIs are not implemented.
+The explicit Gateway type uses the filtered catalog and separate allowance lanes described in
+[gateway-allowance.md](gateway-allowance.md). Gateway model definitions cannot bypass server discovery.
 
 Test seams remain in their modules: `refresh`, `doRefresh`, `getStatusText`, `createPanelDeps`,
 `stopRefreshTimerForTesting`, and `readConfig` cover refresh/panel compatibility; fake Memento and

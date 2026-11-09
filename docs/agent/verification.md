@@ -2,11 +2,19 @@
 
 ## What is verified
 
-**0.5.0-test.2:** strict compilation passes, **504 integration tests** pass on the Linux client, and
+**0.5.0-test.3:** strict compilation passes, **552 integration tests** pass on the Linux client, and
 VSIX packaging succeeds. The suite covers migration/rotation/deletion failure recovery, connection
 routing and accounting, stale handles/caches, captured retry bodies, conservative generic metadata,
-unknown costs, native JSONC edits, and panel message/draft isolation. Tests stub fetch and credentials.
+unknown costs, native JSONC edits, and panel message/draft isolation. Gateway coverage adds independent
+schema validation, partial/stale/unknown allowance reads, revision/cancellation isolation, filtered
+discovery without fallback, streaming/tools, missing metadata, and private bearer routing.
+Tests stub fetch and credentials.
 Earlier Windows/WSL runs cover the prior baseline, not the new connection implementation.
+
+The packaged VSIX also activated as an installed extension in an isolated client profile. Its Manage
+command, provider/icons, gateway modules, and initial keyless registry passed. A separate helper
+injected in-memory SecretStorage before activation; no extension fetches or real keychain operations
+occurred, and scheduled refresh callbacks were suppressed.
 
 A normal isolated VS Code 1.143.1 host also exercised the production manifest and copied compiled
 modules using fake SecretStorage and fetch responses: Settings/named tabs, scoped key/template saves,
@@ -18,12 +26,24 @@ remaining picker/menu checks.
 
 Read-only live access was subsequently verified: management API authentication, strict-TLS gateway
 health/discovery, unauthenticated refusal, and both gateway allowance lane schemas. No inference calls
-or deployment changes were made. The [gateway contract](gateway-allowance.md) is available for the next
-milestone; its adapter remains unimplemented.
+or deployment changes were made at that stage. The [gateway contract](gateway-allowance.md) is now
+implemented. Browser checks cover reported/partial/unknown/stale allowance views and a 380px panel,
+with the allowance table scrolling inside the page and session summaries wrapping.
 
-The new multi-connection inference path has not been tested with live credentials or deployed from its
-packaged VSIX. API usage matches the installed types plus local
-structural fields; the runtime `LanguageModelThinkingPart` class exists despite the proposed-API warning.
+Bounded live checks on 2026-10-28 exercised the compiled production registry/router in an isolated
+VS Code host with in-memory credentials: gateway streamed tool call, tool-result continuation, and a
+direct connection using the same `mistralai/mistral-nemo` model. Three inference calls were capped at
+128 output tokens each. Bearer/origin isolation, redirect refusal, metadata, streamed usage, separate
+connection accounting, and the production two-lane allowance refresh passed. Total reported cost was
+$0.00000343440; no deployment, key, or budget settings changed.
+
+TLS certificate and hostname verification stayed enabled. On this client, the default Electron-backed
+extension-host fetch ignored `NODE_EXTRA_CA_CERTS`. The disposable profile used `http.electronFetch=false`
+and `http.fetchAdditionalSupport=false` so Node fetch honored the supplied public CA. No trust bypass
+was used. This is a client trust requirement, not a gateway health or billing guarantee.
+
+API usage matches the installed types plus local structural fields; the runtime
+`LanguageModelThinkingPart` class exists despite the proposed-API warning.
 Earlier P10 usage-reporting and P11/P12 session/cost behavior was checked against the installed Copilot
 bundle (see [Provider internals](provider.md)) and a stubbed stream harness.
 
