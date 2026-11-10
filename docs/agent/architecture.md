@@ -22,8 +22,8 @@ and [font generator](../../scripts/build-status-icons.py).
 - [connections.ts](../../src/connections.ts) — `ConnectionRegistry` stores named definitions in
   `connectionRegistry.v1`. IDs are permanent (`default-openrouter` for the migrated connection; UUIDs
   for new ones), independent of names. Definitions include kind, normalized base URL, enabled state,
-  revision, connection settings, and optional manual models. Names are nonempty and unique ignoring
-  case; snapshots are cloned. Definitions and credential commits advance revisions and emit changes;
+  revision, connection settings, and legacy manual models. Names are
+  nonempty and unique ignoring case; snapshots are cloned. Definitions and credential commits advance revisions and emit changes;
   scoped state updates do neither. Mutations use a serial queue that remains usable after rejection.
 - [connectionProvider.ts](../../src/connectionProvider.ts) — the registered router resolves discovery
   only from the native group's `configuration.connectionId`. It maintains one child provider per current
@@ -37,27 +37,27 @@ and [font generator](../../scripts/build-status-icons.py).
   connection IDs. Dirty documents, duplicate properties/groups, concurrent document changes, failed
   edits, and failed saves produce an error. The contributed `managementCommand` opens the panel and
   the contribution requires `configuration.connectionId`. A failed native add removes its new registry
-  connection; a failed rename restores the previous connection metadata. Renaming can retire native
-  model selections/pins, so the UI asks users to select the model again.
+  connection. Renames update the native group before committing registry metadata and credentials;
+  a failed registry save restores the old native name. A failed native rename leaves the registry and
+  credentials untouched. Renaming can retire native model selections/pins, so the UI asks users to
+  select the model again.
 - [panel.ts](../../src/panel.ts) — one webview with **Settings** and one tab per named connection.
-  Settings manages connection names, API types, endpoints, enabled state, deletion, and credentials,
-  plus shared refresh interval, prompt safeguard, and output reserve. A named direct-OpenRouter tab
+  Settings offers exactly **Direct OpenRouter** and **OpenRouter proxy**, and manages connection names,
+  endpoints, enabled state, deletion, and credentials,
+  with one **Save connection** action for the group form. Blank key inputs retain the existing secret;
+  **Clear key** is a separate immediate action. Saved masks appear as grey placeholders, never field
+  values; raw keys never enter webview draft state. Keyless saves are allowed for every API type.
+  Nonsecret connection edits survive key-clear refreshes when saved metadata is unchanged; Cancel or
+  a changed saved definition discards those drafts.
+  Settings also holds the shared refresh interval, prompt safeguard, and output reserve. A named direct-OpenRouter tab
   shows key credit details/budget, its availability filter, session spend, presets, and custom request
-  JSON. A generic tab shows usage, manual model definitions, session spend, and custom request JSON;
-  OpenRouter-only credit/preset controls are hidden. Output reserve uses a target percentage and
+  JSON. A proxy tab shows local token usage, returned costs, session spend, and custom request JSON;
+  direct credit/preset controls and manual model additions are unavailable. Output reserve uses a target percentage and
   lower/upper limits in decimal K (1 K = 1000 tokens). Per-model context-size choices remain in the
   model picker. Drafts and asynchronous panel messages are scoped by connection ID; stale renders are
   discarded. Selecting a panel tab changes editing and status display, while Copilot's model group
   controls inference routing. `renderPanelHtml`, `handlePanelMessage`, and injected `PanelDeps` remain
   testable without a live webview. `readConfig` reads/validates application/global settings only.
-- [gatewayAllowance.ts](../../src/gatewayAllowance.ts) validates the gateway contract without VS Code
-  imports. Invalid lanes become unknown independently; missing numeric fields stay null. The origin URL
-  helper resolves `/lab/allowance` independently of an API prefix.
-- [gatewayAllowanceRefresh.ts](../../src/gatewayAllowanceRefresh.ts) reads only that allowance route
-  with the captured gateway bearer, bounded cancellation, redirect refusal, and revision checks. Errors
-  retain previous readings as stale and publish a fixed message without server bodies or credentials.
-  Activation uses the existing per-connection refresh scheduling and cancellation. Gateway status/panel
-  show the Cheap and Default effective interval budgets separately, with reset times and unknown values.
 
 - [modelInfo.ts](../../src/modelInfo.ts) — pure model-card rendering for the picker tooltip (`buildModelInfo`): OpenRouter per-token pricing → per-1M display; a **plain GFM pricing table** (no heading), whose first column is `%` (the agentic-usage mix `3 uncached : 6 cache write : 85 cache read : 5 thinking : 1 output`, cache-write → input fallback), then `Type` (one row per component: uncached/cache write/cache read/thinking/output), then one column per pricing segment (`$Mtok` when flat, `≤ <bound>` / `> <bound>` when tiered), closed by a bold weighted `**Blended**` row (ratio `100`, per-column blended `~$X.XXX`); plain info lines
 `Context window:` / `Effective prompt cap:` / `Effective completion cap:` / `Max completion:`, followed by one capability line each (`Tools: \u2713`, `Image: input \u2713 / output \u2717`, likewise video and audio — `architecture.output_modalities` included); and a reasoning line (`None/Low/**Medium**/High` with the default bolded, `(required)` appended when mandatory) — plus `buildReasoningSchema` (navigation-grouped Thinking Effort schema; it honors `default_enabled: false` by pre-selecting the off choice wherever one exists, and never offers `none` when `mandatory`), `effortFromModelConfiguration`, and the stepped-model **Context size** picker schema (`contextCapOptions`/`contextCapSelection`/`contextCapFromPicker`/`buildContextCapSchema`/`defaultContextCap`/`formatSize`/`sizeAdvisory`: one entry per step plus the whole window as **prompt budgets**, `sizeAdvisory` giving `<64K` a stop sign and `≤128K` a warning, `defaultContextCap` picking the step closest to 256K at or above a 196K floor; offered only for a model with a price step). Intentionally imports no `vscode`; unit-tested in `modelInfo.test.ts`.
@@ -78,9 +78,14 @@ Credentials live only in SecretStorage. A rotation records a unique staging slot
 then atomically commits its slot reference and revision in the registry record. The previous slot is
 removed afterward. Interrupted staging/cleanup is tracked and retried; a failed pre-commit rotation
 keeps the old active credential. Direct OpenRouter URLs are fixed to `https://openrouter.ai/api/v1`.
-Generic URLs require HTTPS except loopback HTTP (`localhost`, `127.0.0.1`, `::1`), reject embedded
-credentials/query/fragments, and allow API paths such as `/v1`. Connection kind is immutable; clear a
-saved generic credential before changing its endpoint.
+[connectionCredentials.ts](../../src/connectionCredentials.ts) rejects the case-insensitive `sk-or-`
+prefix on every non-direct connection.
+Both storage mutations and outgoing provider credential acquisition enforce it. Existing
+blocked secrets remain readable for masking and explicit clearing, but cannot be sent to a proxy.
+Proxy URLs require HTTPS except loopback HTTP (`localhost`, `127.0.0.1`, `::1`), reject embedded
+credentials/query/fragments, and allow API paths such as `/v1`. API type is editable; converting to
+Direct OpenRouter fixes the base URL; conversion to OpenRouter proxy drops inherited manual models.
+Clear a saved credential before changing its endpoint, or explicitly replace it in the same save.
 
 First initialization copies the existing primary `openrouterApiKey` (or old `openrouterCopilot.apiKey`)
 and `requestTemplate`, `contextCaps`, `contextCapsBase`, `contextMarginPercent`, `sessionCosts`, and
@@ -100,10 +105,17 @@ They have controls in **Settings**. The four former global connection settings (
 `creditResetPeriod`, `creditIncludeByok`, `hideUnavailableModels`) are deprecated migration inputs;
 after migration the panel edits their equivalents in the selected connection definition.
 
-Request templates live in connection state and remain paste-apply JSON. Manual model metadata is a
-compact optional override for generic endpoints, not a parameter-by-parameter request builder.
-The explicit Gateway type uses the filtered catalog and separate allowance lanes described in
-[gateway-allowance.md](gateway-allowance.md). Gateway model definitions cannot bypass server discovery.
+Request templates live in connection state and remain paste-apply JSON. Internal `openrouter` means
+Direct OpenRouter; `gateway` means OpenRouter proxy. Proxies use the server's authoritative catalog,
+including empty catalogs, and never supplement or replace it with manual models. Proxy usage is
+tracked locally from returned token/cost data. No custom proxy balance or allowance API is called; old
+custom allowance flags are ignored and stripped from registry definitions.
+
+Older `openai-compatible` records remain readable with their previous runtime behavior until the user
+explicitly saves them as a proxy. The UI offers only the two supported modes and explains that saving
+converts the old connection. Conversion retains permanent ID, credentials, and scoped state, subject
+to endpoint/credential validation, but removes manual model definitions. Legacy manual metadata and
+fallback code exist only for compatibility, not as a third supported product mode.
 
 Test seams remain in their modules: `refresh`, `doRefresh`, `getStatusText`, `createPanelDeps`,
 `stopRefreshTimerForTesting`, and `readConfig` cover refresh/panel compatibility; fake Memento and

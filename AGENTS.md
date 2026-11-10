@@ -10,32 +10,35 @@
 ## What this is
 
 A small **VS Code extension** that registers the **"OpenRouter: RC"** provider vendor in
-**Copilot Chat**, with a native model group for each named connection. Connections support direct
-OpenRouter keys and OpenAI-compatible Chat Completions endpoints. The package/vendor identifiers stay
-unchanged; connection names and permanent internal IDs are separate.
+**Copilot Chat**, with a native model group for each named connection. The two supported modes are
+**Direct OpenRouter** and **OpenRouter proxy**: direct access or a proxy managing OpenRouter access.
+The package/vendor identifiers stay unchanged; connection names and permanent internal IDs are separate.
 
 Direct OpenRouter requests bypass Copilot's CAPI proxy so the extension can send OpenRouter's
 `provider` routing object, `session_id`, and other request-body options. Credit tracking from the retired
 `tianyu-liu.openrouter-key-credit-check` extension remains fully merged and is scoped to each direct
 OpenRouter connection.
 
-**Core flow (paste-apply):** add a connection and its key in **Settings**, then use the named connection
+**Core flow (paste-apply):** add a connection and an optional credential in **Settings**, then use the named connection
 tab to paste request JSON, inspect usage, and configure its request. For OpenRouter, build the JSON at
 the [OpenRouter Request Builder](https://openrouter.ai/request-builder). Shared Settings holds the
 refresh interval, prompt safeguard, and output reserve. The selected panel connection controls editing
 and the status bar; the model selected in Copilot determines request routing.
 
 The shared transport supports tools, image input, SSE streaming, cancellation, and thinking traces.
-Direct OpenRouter connections additionally send per-chat `session_id`, picker reasoning options, and
-Anthropic cache markers, and expose account credits and presets. Generic endpoints get no automatic
-OpenRouter additions or credit/preset API calls; unsupported metadata is conservative, with manual model
-configuration available. See [Request pipeline](docs/agent/request-pipeline.md).
+Both supported modes send OpenRouter session, reasoning, and cache fields. Only direct connections
+expose OpenRouter account credits and presets. Proxies use their authoritative server catalog, with
+no manual model additions or unrestricted fallback. Proxy usage consists only of local token and
+returned-cost tracking; no custom proxy balance, budget, or allowance API is called.
+All non-direct connections reject OpenRouter key syntax (`/^sk-or-/i` after trimming) during form/save
+validation and before network use; use a proxy token or no key. See [Request pipeline](docs/agent/request-pipeline.md).
 
-**Model choice is intentionally open:** each direct OpenRouter connection exposes the full catalog,
-with its optional account-availability filter. Generic endpoints expose their catalog plus manual
-model definitions. The extension adds no model allowlist; account/server restrictions still apply.
-Explicit gateway connections use a filtered catalog and show separate Cheap/Default allowance lanes.
-They retain OpenRouter request fields but make no direct OpenRouter credit or preset API calls.
+**Model choice is intentionally open:** direct connections expose the full OpenRouter catalog with an
+optional account-availability filter; proxies expose the server's permitted models. The extension
+adds no model allowlist. Internal `gateway` identifies the proxy adapter. Older `openai-compatible`
+records remain a migration detail: they retain their prior runtime behavior until explicitly saved
+as a proxy, preserving ID, credentials, and state while removing manual models. They are not a third
+supported mode.
 
 ## Repo naming and origin
 
@@ -115,10 +118,10 @@ the file first and open the copy read-only (Node's built-in `node:sqlite` `Datab
   panel selection, native group lifecycle, commands, and shared-setting listeners.
 - [connections.ts](src/connections.ts) — connection definitions, validation, isolated state/credentials, recoverable migration,
   and mutation revisions. Details: [architecture.md](docs/agent/architecture.md).
+- [connectionCredentials.ts](src/connectionCredentials.ts) — shared OpenRouter-key syntax rejection for proxy form,
+  storage, and request boundaries.
 - [connectionProvider.ts](src/connectionProvider.ts) — the registered `LanguageModelChatProvider`; dispatches native groups by
   connection ID, scopes model IDs, and rejects stale model revisions.
-- [gatewayAllowance.ts](src/gatewayAllowance.ts) and [gatewayAllowanceRefresh.ts](src/gatewayAllowanceRefresh.ts) —
-  conservative allowance validation and revision-checked gateway reads; see [contract](docs/agent/gateway-allowance.md).
 - [nativeGroups.ts](src/nativeGroups.ts) — explicit native group add/rename/remove and initial migration through the active
   client's profile. Details: [architecture.md](docs/agent/architecture.md).
 - [panel.ts](src/panel.ts) — the single webview with shared **Settings** and one tab per named connection.
@@ -137,6 +140,7 @@ the file first and open the copy read-only (Node's built-in `node:sqlite` `Datab
 - [Request pipeline](docs/agent/request-pipeline.md) — paste-apply semantics, enforced behaviors, canonical templates.
 - [Harness boundary](docs/agent/harness-boundary.md) — the single funnel and agent-host BYOK visibility; full evidence in [docs/copilot-harness-modes.md](docs/copilot-harness-modes.md).
 - [Verification status](docs/agent/verification.md) — what is verified, the closed live pilot, residual gaps.
+- [Next harness handoff](docs/agent/next-harness-handoff.md) — current implementation, evidence boundaries, and prioritized probes.
 - [Upstream limitations](docs/agent/upstream-limitations.md) — no-client-side-fix issues for the README.
 
 ## Conventions

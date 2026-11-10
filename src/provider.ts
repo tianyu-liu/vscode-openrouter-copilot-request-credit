@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { t } from './i18n';
 import { clearStoredKey, readKey, storeKey } from './storage';
+import { assertConnectionCredential } from './connectionCredentials';
 import {
     ASSUMED_CONTEXT_TOKENS,
     buildContextCapSchema,
@@ -1271,6 +1272,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
     }
 
     private headers(key: string | undefined): Record<string, string> {
+        assertConnectionCredential(this.runtime.kind, key);
         return key ? { Authorization: `Bearer ${key}` } : {};
     }
 
@@ -1315,6 +1317,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
     }
 
     async setKey(value: string): Promise<void> {
+        assertConnectionCredential(this.runtime.kind, value);
         this.key = value;
         this.invalidateCatalogCaches();
         await storeKey(this.secrets, value);
@@ -1476,10 +1479,12 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
 
     async getKey(silent: boolean): Promise<string | undefined> {
         if (this.key) {
+            assertConnectionCredential(this.runtime.kind, this.key);
             return this.key;
         }
         const generation = this.cacheGeneration;
         const stored = this.runtime.readKey ? await this.runtime.readKey() : await readKey(this.secrets);
+        assertConnectionCredential(this.runtime.kind, stored);
         if (stored) {
             if (generation === this.cacheGeneration) { this.key = stored; }
             return stored;
@@ -1509,9 +1514,6 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         const generation = this.cacheGeneration;
         const key = await this.getKey(options.silent);
         if (this.isGateway && generation !== this.cacheGeneration) { return []; }
-        if (!key && this.isGateway) {
-            throw vscode.LanguageModelError.NoPermissions(t('Gateway bearer key not configured. Add it in Settings.'));
-        }
         if (!key && this.isDirectOpenRouter) {
             return [];
         }
@@ -1731,10 +1733,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             if (generation !== this.cacheGeneration) {
                 throw vscode.LanguageModelError.NotFound('This connection changed while preparing the request. Select it again.');
             }
-            if (!key) {
-                throw vscode.LanguageModelError.NoPermissions(t('Gateway bearer key not configured. Add it in Settings.'));
-            }
-            const catalog = await this.ensureCatalog(key, token);
+            const catalog = await this.ensureCatalog(key ?? '', token);
             if (generation !== this.cacheGeneration || (this.runtime.isCurrent && !this.runtime.isCurrent())
                 || !catalog.some(entry => entry.id === model.id)) {
                 throw vscode.LanguageModelError.NotFound(t('This model is unavailable in the gateway catalog. Select it again.'));

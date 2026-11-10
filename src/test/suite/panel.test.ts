@@ -2,7 +2,6 @@ import * as assert from "assert";
 import * as vscode from "vscode";
 import { runInNewContext } from "vm";
 import type { ConnectionDefinition } from "../../connections";
-import type { GatewayAllowance, GatewayLaneAllowance } from "../../gatewayAllowance";
 import { handlePanelMessage, PanelDeps, PanelRenderOptions, renderPanelHtml, renderSessionCosts } from "../../panel";
 import { SessionCost, stripTemplateComments, UNATTRIBUTED_SESSION_ID } from "../../provider";
 import { KEY_SECRET } from "../../storage";
@@ -274,22 +273,24 @@ suite("renderPanelHtml", () => {
         assert.match(html, /vsc\.setState\(\{/);
     });
 
-    test("ships a per-render nonce CSP and escapes the masked key into the script", () => {
+    test("ships a per-render nonce CSP and escapes the saved key summary", () => {
         const html = render({ info: BASE_INFO, maskedKey: `<img src=x onerror="alert(1)">` });
         assert.ok(html.includes("default-src 'none'"), "CSP default-src 'none' present");
         assert.match(html, /script-src 'nonce-[0-9a-f]{32}'/, "per-render nonce present");
-        assert.ok(html.includes("\\u003cimg"), "masked key markup is escaped before embedding into the script");
+        assert.ok(html.includes('&lt;img src=x onerror=&quot;alert(1)&quot;&gt;'));
+        assert.ok(!html.includes('<img src=x'), 'masked key markup is never executable');
     });
 
-    test("the webview script posts currentKeyMasked for the saveKey no-op guard", () => {
+    test("keeps the key inside the connection form with a single save action", () => {
         const html = render({ maskedKey: "sk-or-v1-12…456" });
-        const payload = html.match(/vsc\.postMessage\(\{[^}]*type:\s*'saveKey'[^}]*\}\)/);
-        assert.ok(payload, "the Save Key button posts a saveKey message");
-        assert.match(
-            payload![0],
-            /currentKeyMasked:\s*currentKeyMask/,
-            "the script must post currentKeyMasked (the handler's guard key) or the mask overwrites the real key"
-        );
+        const form = html.match(/<form id="connectionForm"[\s\S]*?<\/form>/)![0];
+        for (const id of ['connectionName', 'connectionKind', 'connectionUrl', 'key', 'connectionEnabled', 'saveConnection']) {
+            assert.ok(form.includes(`id="${id}"`), `${id} belongs to the group editor`);
+        }
+        assert.ok(!html.includes('id="saveKey"'));
+        assert.ok(form.includes('id="clearKey"'), 'key clearing remains a separate action in the group editor');
+        assert.ok(!html.includes('id="toggleConnection"'));
+        assert.ok(!html.includes("type: 'saveKey'"));
     });
 
     test("marks the remaining figure as exhausted for an exhausted guardrail", () => {
@@ -344,10 +345,11 @@ suite("renderPanelHtml", () => {
         assert.ok(!html.includes("Next reset:"), "no fictional Monday reset date");
     });
 
-    test("offers a Clear key action wired to the clearKey message only when a key is set", () => {
+    test("offers a separate Clear key action only when a key is set", () => {
         const withKey = render({ maskedKey: "sk-or-v1-12\u2026456" });
-        assert.ok(withKey.includes('<button id="clearKey">Clear key</button>'));
+        assert.ok(withKey.includes('id="clearKey"'));
         assert.ok(withKey.includes("post('clearKey')"));
+        assert.ok(!withKey.includes('id="removeKey"'));
         assert.ok(!render().includes('id="clearKey"'), "nothing to clear without a stored key");
     });
 
@@ -373,10 +375,12 @@ suite("renderPanelHtml", () => {
         assert.ok(!/<div class="[^"]*'/.test(html), "every div class attribute is closed with a double quote");
     });
 
-    test("shows the no-key placeholder when there is no info", () => {
+    test("shows a neutral keyless state when there is no info", () => {
         const html = render();
         assert.ok(html.includes("No usage information yet."));
-        assert.ok(html.includes("No API key set"));
+        assert.ok(html.includes('<span class="muted">No key saved</span>'));
+        assert.ok(html.includes('You can save without one.'));
+        assert.ok(!html.includes('No API key set'));
     });
 
     test("renders editable controls for all contributed settings without key details", () => {
@@ -1006,6 +1010,10 @@ function webviewHarness(options: Partial<PanelRenderOptions>, savedState: unknow
         type = '';
         hidden = false;
         disabled = false;
+        checked = false;
+        required = false;
+        placeholder = '';
+        validationMessage = '';
         tabIndex = -1;
         dataset: Record<string, string> = {};
         attributes: Record<string, string> = {};
@@ -1020,6 +1028,8 @@ function webviewHarness(options: Partial<PanelRenderOptions>, savedState: unknow
         getAttribute(name: string) { return this.attributes[name]; }
         appendChild(element: Element) { this.options.push(element); }
         focus() {}
+        setCustomValidity(message: string) { this.validationMessage = message; }
+        reportValidity() { return this.validationMessage === ''; }
         fire(type: string, event = {}) { for (const listener of this.listeners[type] ?? []) listener(event); }
     }
     const html = render(options);
@@ -1030,10 +1040,20 @@ function webviewHarness(options: Partial<PanelRenderOptions>, savedState: unknow
         for (const attr of match[1].matchAll(/([\w-]+)="([^"]*)"/g)) element.attributes[attr[1]] = decode(attr[2]);
         element.value = element.attributes.value ?? '';
         element.type = element.attributes.type ?? '';
+        element.placeholder = element.attributes.placeholder ?? '';
+        element.checked = /(?:^|\s)checked(?:\s|$)/.test(match[1]);
+        element.disabled = /(?:^|\s)disabled(?:\s|$)/.test(match[1]);
+        element.hidden = /(?:^|\s)hidden(?:\s|$)/.test(match[1]);
+        element.required = /(?:^|\s)required(?:\s|$)/.test(match[1]);
         if (element.attributes['data-connection-id']) element.dataset.connectionId = element.attributes['data-connection-id'];
         elements.set(element.id, element);
     }
     const tabs = [...elements.values()].filter(element => element.attributes.role === 'tab');
+    for (const match of html.matchAll(/<select\b[^>]*id="([^"]+)"[^>]*>([\s\S]*?)<\/select>/g)) {
+        const options = [...match[2].matchAll(/<option\b([^>]*)>/g)];
+        const selected = options.find(option => /\bselected\b/.test(option[1])) ?? options[0];
+        if (selected) elements.get(match[1])!.value = decode(selected[1].match(/value="([^"]*)"/)?.[1] ?? '');
+    }
     const messages: Array<Record<string, unknown>> = [];
     const timers = new Map<number, () => void>();
     const incomingListeners: Array<(event: unknown) => void> = [];
@@ -1123,6 +1143,8 @@ suite('connection panel', () => {
 
     test('unsent credentials never enter persisted state and clear when switching tabs', () => {
         const view = webviewHarness({ connections, selectedConnectionId: 'a', maskedKey: 'masked…key' });
+        assert.strictEqual(view.element('key').value, '');
+        assert.strictEqual(view.element('key').attributes.placeholder, 'masked…key');
         view.element('key').value = 'secret-unsent-key';
         view.element('key').fire('input');
         view.element('template').value = '{}';
@@ -1130,11 +1152,76 @@ suite('connection panel', () => {
         view.flush();
         assert.ok(!JSON.stringify(view.state).includes('secret-unsent-key'));
         view.element('tab-connection-a').fire('click');
-        assert.strictEqual(view.element('key').value, 'masked…key');
-        view.element('saveKey').fire('click');
-        assert.deepStrictEqual(view.messages.at(-1), {
-            type: 'saveKey', value: 'masked…key', currentKeyMasked: 'masked…key', connectionId: 'a',
-        });
+        assert.strictEqual(view.element('key').value, '');
+        view.element('connectionForm').fire('submit', { preventDefault() {} });
+        assert.ok(!('apiKey' in (view.messages.at(-1)!.value as object)), 'blank input retains the real key');
+    });
+
+    test('saved key masks stay in the field hint and are never sent as replacement credentials', () => {
+        const view = webviewHarness({ connections, selectedConnectionId: 'a', maskedKey: 'sk-or-v1-12…456' });
+        assert.strictEqual(view.element('key').attributes.placeholder, 'sk-or-v1-12…456');
+        assert.strictEqual(view.element('key').type, 'password');
+        view.element('connectionForm').fire('submit', { preventDefault() {} });
+        assert.ok(!('apiKey' in (view.messages.at(-1)!.value as object)));
+        view.element('key').value = 'replacement-key';
+        view.element('connectionForm').fire('submit', { preventDefault() {} });
+        assert.strictEqual((view.messages.at(-1)!.value as { apiKey: string }).apiKey, 'replacement-key');
+        view.element('addConnection').fire('click');
+        assert.notStrictEqual(view.element('key').placeholder, 'sk-or-v1-12…456');
+        view.element('cancelConnection').fire('click');
+        assert.strictEqual(view.element('key').placeholder, 'sk-or-v1-12…456');
+        assert.strictEqual(view.element('key').value, '');
+    });
+
+    test('proxy forms reject OpenRouter key syntax but permit proxy tokens and no key', () => {
+        for (const kind of ['gateway', 'openai-compatible'] as const) {
+            const view = webviewHarness({ connections: [connectionFixture('proxy', kind)], selectedConnectionId: 'proxy' });
+            for (const value of ['sk-or-v1-pretend', '  SK-OR-V1-PRETEND  ', 'sk-or-']) {
+                view.element('key').value = value;
+                view.element('key').fire('input');
+                assert.ok(view.element('key').validationMessage.includes('cannot be used with a proxy'));
+                view.element('connectionForm').fire('submit', { preventDefault() {} });
+                assert.strictEqual(view.messages.length, 0, 'invalid keys never leave the form');
+            }
+            for (const value of ['proxy-token', '']) {
+                view.element('key').value = value;
+                view.element('key').fire('input');
+                assert.strictEqual(view.element('key').validationMessage, '');
+                view.element('connectionForm').fire('submit', { preventDefault() {} });
+                assert.strictEqual(view.messages.at(-1)!.type, 'updateConnection');
+            }
+        }
+    });
+
+    test('switching to proxy rejects a retained OpenRouter key while Clear key remains available', () => {
+        const view = webviewHarness({ connections, selectedConnectionId: 'a', maskedKey: 'sk-or-v1-12…456' });
+        assert.strictEqual(view.element('key').validationMessage, '');
+        view.element('connectionKind').value = 'gateway';
+        view.element('connectionKind').fire('change');
+        view.element('connectionUrl').value = 'https://proxy.example/v1';
+        assert.ok(view.element('key').validationMessage);
+        view.element('connectionForm').fire('submit', { preventDefault() {} });
+        assert.strictEqual(view.messages.length, 0);
+        view.element('clearKey').fire('click');
+        assert.deepStrictEqual(view.messages.at(-1), { type: 'clearKey', connectionId: 'a' });
+        const refreshed = webviewHarness({ connections, selectedConnectionId: 'a' }, view.state);
+        assert.strictEqual(refreshed.element('connectionKind').value, 'gateway');
+        assert.strictEqual(refreshed.element('key').validationMessage, '');
+        refreshed.element('connectionForm').fire('submit', { preventDefault() {} });
+        assert.strictEqual(refreshed.messages.at(-1)!.type, 'updateConnection');
+    });
+
+    test('clearing an invalid key by switching tabs restores native validity for a keyless proxy', () => {
+        const view = webviewHarness({ connections: [connectionFixture('proxy', 'gateway')], selectedConnectionId: 'proxy' });
+        view.element('key').value = 'sk-or-v1-pretend';
+        view.element('key').fire('input');
+        assert.strictEqual(view.element('key').reportValidity(), false);
+        view.element('tab-connection-proxy').fire('click');
+        view.element('tab-settings').fire('click');
+        assert.strictEqual(view.element('key').value, '');
+        assert.strictEqual(view.element('key').reportValidity(), true);
+        view.element('connectionForm').fire('submit', { preventDefault() {} });
+        assert.strictEqual(view.messages.at(-1)!.type, 'updateConnection');
     });
 
     test('Settings connection selector stays in Settings and identifies the connection being edited', () => {
@@ -1143,6 +1230,120 @@ suite('connection panel', () => {
         view.element('connectionSelect').fire('change');
         assert.deepStrictEqual(view.messages.at(-1), { type: 'selectConnection', connectionId: 'b', value: 'settings' });
         assert.strictEqual((view.state as { activeTab: string }).activeTab, 'tab-settings');
+    });
+
+    test('one form submission saves connection details, enabled state and a new key together', () => {
+        const view = webviewHarness({ connections, selectedConnectionId: 'a', maskedKey: 'masked…key' });
+        view.element('addConnection').fire('click');
+        view.element('connectionName').value = 'Work';
+        view.element('connectionEnabled').checked = false;
+        view.element('key').value = '  fixture-new-key  ';
+        assert.strictEqual(view.messages.length, 0, 'editing the form does not save individual fields');
+        view.element('connectionForm').fire('submit', { preventDefault() {} });
+        assert.deepStrictEqual(view.messages, [{ type: 'addConnection', value: {
+            name: 'Work', kind: 'openrouter', baseUrl: 'https://openrouter.ai/api/v1',
+            enabled: false, apiKey: 'fixture-new-key',
+        } }]);
+        view.element('cancelConnection').fire('click');
+        assert.strictEqual(view.element('key').value, '');
+        assert.strictEqual(view.element('connectionName').value, 'A');
+        assert.strictEqual(view.element('connectionEnabled').checked, true);
+        view.flush();
+        assert.ok(!JSON.stringify(view.state).includes('fixture-new-key'));
+    });
+
+    test('Clear key sends a separate scoped action without saving other pending edits', () => {
+        const view = webviewHarness({ connections, selectedConnectionId: 'a', maskedKey: 'masked…key' });
+        view.element('connectionName').value = 'Renamed';
+        view.element('key').value = 'unsaved-key';
+        view.element('clearKey').fire('click');
+        assert.deepStrictEqual(view.messages, [{ type: 'clearKey', connectionId: 'a' }]);
+        assert.strictEqual(view.element('key').value, '');
+        assert.strictEqual(view.element('connectionName').value, 'Renamed');
+    });
+
+    test('Clear key preserves nonsecret connection edits across its refresh and Cancel discards them', () => {
+        const view = webviewHarness({ connections, selectedConnectionId: 'a', maskedKey: 'masked…key' });
+        view.element('connectionName').value = 'Pending rename';
+        view.element('connectionKind').value = 'gateway';
+        view.element('connectionKind').fire('change');
+        view.element('connectionUrl').value = 'https://pending.example/v1';
+        view.element('connectionEnabled').checked = false;
+        view.element('key').value = 'never-persist-this-key';
+        view.element('clearKey').fire('click');
+        assert.ok(!JSON.stringify(view.state).includes('never-persist-this-key'));
+        const refreshedConnections = connections.map(connection => ({ ...connection, revision: connection.revision + 1 }));
+        const refreshed = webviewHarness({ connections: refreshedConnections, selectedConnectionId: 'a' }, view.state);
+        assert.strictEqual(refreshed.element('connectionName').value, 'Pending rename');
+        assert.strictEqual(refreshed.element('connectionKind').value, 'gateway');
+        assert.strictEqual(refreshed.element('connectionUrl').value, 'https://pending.example/v1');
+        assert.strictEqual(refreshed.element('connectionEnabled').checked, false);
+        assert.strictEqual(refreshed.element('key').value, '');
+        refreshed.element('connectionForm').fire('submit', { preventDefault() {} });
+        assert.deepStrictEqual(refreshed.messages.at(-1), { type: 'updateConnection', connectionId: 'a', value: {
+            name: 'Pending rename', kind: 'gateway', baseUrl: 'https://pending.example/v1', enabled: false,
+        } });
+        refreshed.element('cancelConnection').fire('click');
+        const cancelled = webviewHarness({ connections, selectedConnectionId: 'a' }, refreshed.state);
+        assert.strictEqual(cancelled.element('connectionName').value, 'A');
+        assert.strictEqual(cancelled.element('connectionKind').value, 'openrouter');
+        const saved = webviewHarness({ connections: [{ ...connections[0], name: 'Saved' }, connections[1]],
+            selectedConnectionId: 'a' }, view.state);
+        assert.strictEqual(saved.element('connectionName').value, 'Saved', 'stale draft cannot overwrite saved metadata');
+    });
+
+    test('API type is editable and OpenRouter fixes the URL while custom endpoint drafts survive toggling', () => {
+        const view = webviewHarness({ connections, selectedConnectionId: 'a', maskedKey: 'masked…key' });
+        assert.strictEqual(view.element('connectionKind').disabled, false);
+        assert.strictEqual(view.element('connectionUrl').disabled, true);
+        assert.strictEqual(view.element('connectionUrl').value, 'https://openrouter.ai/api/v1');
+        view.element('connectionKind').value = 'gateway';
+        view.element('connectionKind').fire('change');
+        assert.strictEqual(view.element('connectionUrl').disabled, false);
+        view.element('connectionUrl').value = 'https://custom.example/v1';
+        view.element('connectionUrl').fire('input');
+        assert.strictEqual(view.element('endpointKeyHelp').hidden, false);
+        view.element('connectionKind').value = 'gateway';
+        view.element('connectionKind').fire('change');
+        assert.strictEqual(view.element('connectionUrl').value, 'https://custom.example/v1');
+        view.element('connectionKind').value = 'openrouter';
+        view.element('connectionKind').fire('change');
+        assert.strictEqual(view.element('connectionUrl').disabled, true);
+        assert.strictEqual(view.element('connectionUrl').value, 'https://openrouter.ai/api/v1');
+        view.element('connectionKind').value = 'gateway';
+        view.element('connectionKind').fire('change');
+        assert.strictEqual(view.element('connectionUrl').value, 'https://custom.example/v1');
+        assert.strictEqual(view.messages.length, 0, 'type changes apply only on Save connection');
+        view.element('cancelConnection').fire('click');
+        assert.strictEqual(view.element('connectionKind').value, 'openrouter');
+        assert.strictEqual(view.element('connectionKind').disabled, false);
+        assert.strictEqual(view.element('connectionUrl').disabled, true);
+    });
+
+    test('existing custom connections can switch API type and the form allows keyless saves for every type', () => {
+        const local = { ...connectionFixture('local', 'openai-compatible'), models: [{ id: 'manual-model' }] };
+        const view = webviewHarness({ connections: [local], selectedConnectionId: 'local' });
+        assert.strictEqual(view.element('connectionUrl').disabled, false);
+        view.element('connectionKind').value = 'gateway';
+        view.element('connectionKind').fire('change');
+        assert.ok(view.element('connectionTypeHint').textContent.includes('removes manual model definitions'));
+        assert.strictEqual(view.element('connectionUrl').value, local.baseUrl);
+        view.element('cancelConnection').fire('click');
+        assert.strictEqual(view.element('connectionKind').value, 'gateway');
+        assert.strictEqual(view.element('connectionUrl').disabled, false);
+        for (const kind of ['openrouter', 'gateway']) {
+            view.element('addConnection').fire('click');
+            view.element('connectionKind').value = kind;
+            view.element('connectionKind').fire('change');
+            if (kind !== 'openrouter') view.element('connectionUrl').value = 'https://custom.example/v1';
+            assert.strictEqual(view.element('key').required, false, 'an API key is never required by the form');
+            view.element('connectionForm').fire('submit', { preventDefault() {} });
+            const message = view.messages.at(-1)!;
+            assert.strictEqual(message.type, 'addConnection');
+            assert.strictEqual((message.value as { kind: string }).kind, kind);
+            assert.ok(!('apiKey' in (message.value as object)));
+            view.element('cancelConnection').fire('click');
+        }
     });
 
     test('new connections default to the original group name followed by numbered names', () => {
@@ -1155,6 +1356,32 @@ suite('connection panel', () => {
             assert.strictEqual((view.messages.at(-1)!.value as { name: string }).name, expected);
             connections.push({ ...connectionFixture(String(connections.length)), name: expected });
         }
+    });
+
+    test('new group mode choices are exactly direct OpenRouter and OpenRouter proxy', () => {
+        for (const connections of [[], [connectionFixture('a')], [connectionFixture('proxy', 'gateway')]]) {
+            const html = render({ connections });
+            const modes = html.match(/<select id="connectionKind">([\s\S]*?)<\/select>/)![1];
+            assert.strictEqual((modes.match(/<option /g) ?? []).length, 2);
+            assert.ok(modes.includes('Direct OpenRouter') && modes.includes('OpenRouter proxy'));
+            assert.ok(!modes.includes('openai-compatible'));
+            const view = webviewHarness({ connections });
+            view.element('addConnection').fire('click');
+            view.element('connectionKind').value = 'gateway';
+            view.element('connectionKind').fire('change');
+            assert.ok(!html.includes('id="proxyAllowance"'));
+        }
+    });
+
+    test('proxy panels omit server allowance controls even for old saved flags', () => {
+        const proxy = { ...connectionFixture('proxy', 'gateway'), proxyAllowance: true };
+        const html = render({ connections: [proxy], sessions: [sessionFixture()] });
+        for (const id of ['proxyAllowance', 'proxyOptions', 'manualModels', 'saveManualModels', 'presetSelect', 'limit', 'refresh']) {
+            assert.ok(!html.includes(`id="${id}"`));
+        }
+        assert.ok(!html.includes('Cheap') && !html.includes('Default lane'));
+        assert.ok(html.includes('Session spend') && html.includes('reported cost are tracked locally'));
+        assert.ok(html.includes('The proxy supplies the available models'));
     });
 
     test('default names avoid disabled and case-insensitive collisions while custom names stay editable', () => {
@@ -1182,81 +1409,24 @@ suite('connection panel', () => {
         assert.strictEqual((html.match(/id="template"/g) ?? []).length, 1);
     });
 
-    test('compatible APIs show manual models and honest cost availability without OpenRouter controls', () => {
+    test('legacy compatible records expose only two modes and keep behavior until explicit proxy conversion', () => {
         const html = render({ connections: [connectionFixture('local', 'openai-compatible')], selectedConnectionId: 'local' });
-        assert.ok(html.includes('id="manualModels"') && html.includes('id="saveManualModels"'));
-        assert.ok(html.includes('does not provide OpenRouter credits or authoritative cost data'));
+        assert.ok(!html.includes('id="manualModels"') && !html.includes('id="saveManualModels"'));
+        assert.ok(html.includes('keeps its previous behavior until you save it as an OpenRouter proxy'));
+        assert.ok(html.includes('Direct OpenRouter credit and preset APIs are not called through a proxy'));
         assert.ok(!html.includes('id="presetSelect"') && !html.includes('id="limit"'));
         assert.ok(!html.includes('id="hideUnavailableModels"'));
-        assert.ok(html.includes('id="connectionKind" disabled'));
-        assert.ok(html.includes('&quot;stream_options&quot;: {&quot;include_usage&quot;: true}'));
-        assert.ok(!render().includes('To request token usage from servers that support it'));
-
-    });
-
-    test('gateway allowance uses separate effective interval budgets without unsupported controls', () => {
-        const budget = { limit: 5, remaining: 3.75, reset: 'daily', usage: 1.25,
-            resets_at: '2026-10-29T00:00:00Z', include_byok: true };
-        const lane: GatewayLaneAllowance = { ...budget, limit: null, remaining: null, usage: 999,
-            status: 'reported', effective_budget: budget, applicable_budgets: [budget], inherited_budgets: [budget] };
-        const allowance: GatewayAllowance = { cheap: lane,
-            default: { ...lane, effective_budget: { ...budget, limit: 20, remaining: 12.5, usage: 7.5, reset: 'weekly' } },
-            fetched_at: '2026-10-28T10:00:00Z' };
-        const html = render({ connections: [connectionFixture('gateway', 'gateway')],
-            gatewayAllowance: allowance, fetchedAt: new Date('2026-10-28T10:00:01Z'), sessions: [sessionFixture()] });
-        assert.ok(html.includes('Cheap lane') && html.includes('Default lane'));
-        assert.ok(html.includes('$3.75') && html.includes('$12.50'));
-        assert.ok(html.includes('$1.25') && html.includes('$7.50'));
-        assert.ok(!html.includes('$999'), 'cumulative key usage is not presented as interval usage');
-        assert.ok(!html.includes('$16.25'), 'daily and weekly balances are never summed');
-        assert.ok(html.includes('Gateway retrieved:') && html.includes('Retrieved locally:'));
-        assert.ok(html.includes('do not guarantee current billing counters'));
-        assert.ok(html.includes('using both does not add funds'));
-        assert.ok(html.includes('value="gateway" selected'));
-        for (const id of ['limit', 'includeByok', 'resetPeriod', 'hideUnavailableModels', 'manualModels', 'saveManualModels', 'presetSelect']) {
-            assert.ok(!html.includes(`id="${id}"`), `${id} is unsupported on gateway connections`);
-        }
-        assert.ok(html.includes('id="refresh"') && html.includes('Refresh allowance'));
-        assert.ok(html.includes('id="template"') && html.includes('Session spend'));
-    });
-
-    test('gateway partial, stale and missing allowance values remain unavailable', () => {
-        const budget = { limit: null, remaining: null, reset: null, usage: null, resets_at: null, include_byok: null };
-        const lane: GatewayLaneAllowance = { ...budget, status: 'reported', effective_budget: budget,
-            applicable_budgets: [], inherited_budgets: [] };
-        const html = render({ connections: [connectionFixture('gateway', 'gateway')], gatewayAllowanceStale: true,
-            gatewayAllowance: { cheap: lane, default: { ...lane, status: 'unknown',
-                effective_budget: { ...budget, limit: 7, remaining: 6, usage: 1 } }, fetched_at: null },
-            errorMessage: 'Allowance refresh failed' });
-        const table = html.match(/<table class="rows">([\s\S]*?)<\/table>/)![1];
-        assert.ok(table.includes('Reported') && table.includes('Unknown'));
-        assert.strictEqual((table.match(/Unavailable/g) ?? []).length, 10);
-        assert.ok(!table.includes('$0') && !table.includes('$6') && !table.includes('No limit'));
-        assert.ok(html.includes('Saved allowance is stale') && html.includes('Allowance refresh failed'));
-        assert.ok(html.includes('Gateway retrieved: Unavailable'));
-        const noEffectiveBudget = render({ connections: [connectionFixture('gateway', 'gateway')],
-            gatewayAllowance: { cheap: { ...lane, limit: 100, remaining: 90, usage: 10, effective_budget: null },
-                default: lane, fetched_at: null } });
-        assert.ok(!noEffectiveBudget.includes('$90') && !noEffectiveBudget.includes('$10'),
-            'missing effective budget never falls back to cumulative root counters');
-        const empty = render({ connections: [connectionFixture('gateway', 'gateway')] });
-        assert.ok(empty.includes('No gateway allowance yet'));
-        assert.strictEqual((empty.match(/<td>Unknown<\/td>/g) ?? []).length, 2);
-    });
-
-    test('gateway allowance escapes metadata and rejects non-finite display amounts', () => {
-        const budget = { limit: Number.POSITIVE_INFINITY, remaining: Number.NaN, reset: '</td><script>bad()</script>',
-            usage: 0, resets_at: '<img src=x onerror=bad()>', include_byok: null };
-        const lane: GatewayLaneAllowance = { ...budget, status: 'reported', effective_budget: budget,
-            applicable_budgets: [], inherited_budgets: [] };
-        const html = render({ connections: [connectionFixture('gateway', 'gateway')], gatewayAllowance: {
-            cheap: lane, default: lane, fetched_at: '</p><script>bad()</script>' },
-            errorMessage: '<img src=x onerror=bad()>' });
-        assert.ok(!html.includes('<script>bad()') && !html.includes('<img src=x'));
-        assert.ok(html.includes('&lt;/td&gt;&lt;script&gt;bad()&lt;/script&gt;'));
-        assert.ok(html.includes('&lt;img src=x onerror=bad()&gt;'));
-        assert.ok(!html.includes('$Infinity') && !html.includes('$NaN'));
-        assert.ok(html.includes('$0.00'), 'known zero remains distinct from unavailable values');
+        assert.ok(html.includes('id="connectionKind">'));
+        const modes = html.match(/<select id="connectionKind">([\s\S]*?)<\/select>/)![1];
+        assert.strictEqual((modes.match(/<option /g) ?? []).length, 2);
+        assert.ok(modes.includes('Direct OpenRouter') && modes.includes('OpenRouter proxy'));
+        assert.ok(!modes.includes('openai-compatible'));
+        const view = webviewHarness({ connections: [connectionFixture('local', 'openai-compatible')],
+            selectedConnectionId: 'local' });
+        assert.strictEqual(view.messages.length, 0);
+        assert.strictEqual(view.element('connectionKind').value, 'gateway');
+        view.element('connectionForm').fire('submit', { preventDefault() {} });
+        assert.strictEqual((view.messages.at(-1)!.value as { kind: string }).kind, 'gateway');
     });
 
     test('accepts explicit gateway connections from the Settings form', async () => {
@@ -1293,13 +1463,14 @@ suite('connection panel', () => {
         state.deps.updateConnection = async (id, patch) => { actions.push(['update', id, patch]); };
         state.deps.deleteConnection = async id => { actions.push(['delete', id]); };
         state.deps.selectConnection = async id => { actions.push(['select', id]); };
-        await handlePanelMessage({ type: 'addConnection', value: { name: ' Local ', kind: 'openai-compatible', baseUrl: 'http://localhost:1234/v1' } }, state.deps);
+        await handlePanelMessage({ type: 'addConnection', value: { name: ' Local ', kind: 'gateway',
+            baseUrl: 'http://localhost:1234/v1' } }, state.deps);
         await handlePanelMessage({ type: 'setConnectionEnabled', connectionId: 'a', value: false }, state.deps);
         await handlePanelMessage({ type: 'saveManualModels', connectionId: 'b', value: '[{"id":"m","contextLength":32768,"toolCalling":true}]' }, state.deps);
         await handlePanelMessage({ type: 'deleteConnection', connectionId: 'a' }, state.deps);
         await handlePanelMessage({ type: 'selectConnection', connectionId: 'b' }, state.deps);
         assert.deepStrictEqual(actions, [
-            ['add', { name: 'Local', kind: 'openai-compatible', baseUrl: 'http://localhost:1234/v1' }],
+            ['add', { name: 'Local', kind: 'gateway', baseUrl: 'http://localhost:1234/v1' }],
             ['update', 'a', { enabled: false }],
             ['update', 'b', { models: [{ id: 'm', contextLength: 32768, toolCalling: true }] }],
             ['delete', 'a'], ['select', 'b'],
@@ -1307,8 +1478,43 @@ suite('connection panel', () => {
         for (const value of ['{}', '[{"id":"m"},{"id":"m"}]', '[{"id":"m","contextLength":-1}]', '[{"id":"m","toolCalling":"yes"}]']) {
             await handlePanelMessage({ type: 'saveManualModels', connectionId: 'b', value }, state.deps);
         }
-        await handlePanelMessage({ type: 'addConnection', value: { name: 'bad', kind: 'openai-compatible', baseUrl: 'https://user:pass@example.com/v1' } }, state.deps);
+        await handlePanelMessage({ type: 'addConnection', value: { name: 'bad', kind: 'gateway', baseUrl: 'https://user:pass@example.com/v1' } }, state.deps);
         assert.strictEqual(actions.length, 5, 'invalid input never reaches persistence');
         assert.strictEqual(state.errors.length, 5);
     });
+
+    test('combined saves separate credential changes from connection metadata', async () => {
+        const state = spyDeps();
+        const actions: unknown[] = [];
+        state.deps.addConnection = async (input, key) => { actions.push(['add', input, key]); };
+        state.deps.updateConnection = async (id, patch, key) => { actions.push(['update', id, patch, key]); };
+        const input = { name: 'Work', kind: 'openrouter', baseUrl: 'https://openrouter.ai/api/v1', enabled: false };
+        await handlePanelMessage({ type: 'addConnection', value: { ...input, apiKey: '  fixture-new-key  ' } }, state.deps);
+        await handlePanelMessage({ type: 'updateConnection', connectionId: 'a', value: input }, state.deps);
+        await handlePanelMessage({ type: 'updateConnection', connectionId: 'a', value: { ...input, apiKey: null } }, state.deps);
+        await handlePanelMessage({ type: 'updateConnection', connectionId: 'a', value: { ...input, apiKey: '  ' } }, state.deps);
+        assert.deepStrictEqual(actions, [
+            ['add', input, 'fixture-new-key'], ['update', 'a', input, undefined],
+            ['update', 'a', input, null], ['update', 'a', input, undefined],
+        ]);
+        for (const value of [{ ...input, apiKey: 123 }, { ...input, enabled: 'false' }]) {
+            await handlePanelMessage({ type: 'updateConnection', connectionId: 'a', value }, state.deps);
+        }
+        assert.strictEqual(actions.length, 4, 'malformed fields cannot partially save the connection');
+        assert.strictEqual(state.errors.length, 2);
+        assert.deepStrictEqual(state.setKeys, [], 'no separate key write is dispatched');
+    });
+
+    test('form messages reject legacy mode and ignore obsolete allowance options', async () => {
+        const state = spyDeps();
+        const saved: unknown[] = [];
+        state.deps.addConnection = async input => { saved.push(input); };
+        const input = { name: 'Proxy', kind: 'gateway', baseUrl: 'https://proxy.example/v1' };
+        await handlePanelMessage({ type: 'addConnection', value: { ...input, proxyAllowance: true } }, state.deps);
+        assert.deepStrictEqual(saved, [input]);
+        await handlePanelMessage({ type: 'addConnection', value: { ...input, kind: 'openai-compatible' } }, state.deps);
+        assert.strictEqual(saved.length, 1);
+        assert.strictEqual(state.errors.length, 1);
+    });
+
 });

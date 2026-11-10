@@ -2,17 +2,37 @@
 
 ## What is verified
 
-**0.5.0-test.3:** strict compilation passes, **552 integration tests** pass on the Linux client, and
-VSIX packaging succeeds. The suite covers migration/rotation/deletion failure recovery, connection
-routing and accounting, stale handles/caches, captured retry bodies, conservative generic metadata,
-unknown costs, native JSONC edits, and panel message/draft isolation. Gateway coverage adds independent
-schema validation, partial/stale/unknown allowance reads, revision/cancellation isolation, filtered
-discovery without fallback, streaming/tools, missing metadata, and private bearer routing.
-Tests stub fetch and credentials.
+**0.5.0-test.3:** strict compilation and **562 integration tests** pass on the Linux client
+(VS Code 1.145.2, rerun 2026-11-10), after removal of the custom proxy allowance implementation and its tests.
+The current candidate also packages successfully; its VSIX contains the credential guard and excludes
+removed allowance modules, source/tests, preview scripts, and scratch data. Installed activation of
+this exact candidate has not been checked. See the [next harness handoff](next-harness-handoff.md) for
+the current priorities and reproducible entry points.
+
+Regression coverage includes migration/rotation/deletion failure recovery, connection routing and
+accounting, stale handles/caches, captured retry bodies, conservative legacy metadata, unknown costs,
+native JSONC edits, and panel message/draft isolation. The unified editor covers combined metadata/key
+saves, separate key clearing, blank-key retention, native rename rollback, credential-write recovery,
+endpoint/key isolation, type conversion, keyless saves, masked hints, and preserving edits through key
+clearing. The editor offers only Direct OpenRouter and OpenRouter proxy, with explicit legacy conversion.
+Proxy discovery remains authoritative without fallback; keyless discovery/inference omit Authorization
+and never borrow a direct connection's key. Credential guards cover saves, retained-key conversions,
+legacy setters, and stored/cached provider credentials before network use. Tests stub fetch and secrets.
+
+The final two-mode editor was browser-reviewed at 1000px and 380px widths, including the proxy usage tab.
+Earlier native Chromium checks covered exactly two choices, editable proxy/fixed direct URLs,
+OpenRouter-key rejection, proxy-token/keyless acceptance, and validity after tab switching. Custom
+allowance controls, calls, and schema support are removed; preview checks confirm they are absent for
+both modes. Proxy usage is local token and returned-cost tracking only. Regression tests verify obsolete
+saved flags are stripped without changing IDs, revisions, keys, or scoped data. Independent source review
+found no actionable issues. Generated outputs for deleted modules/tests were removed before the suite ran.
+An extension refresh/panel harness verifies zero HTTP or direct preset reads across 18 proxy cases,
+including old flags and missing credentials. Its direct positive control still reads OpenRouter key and
+credit data. Disabling the nondirect guard makes the zero-fetch regression fail as expected.
 Earlier Windows/WSL runs cover the prior baseline, not the new connection implementation.
 
-The packaged VSIX also activated as an installed extension in an isolated client profile. Its Manage
-command, provider/icons, gateway modules, and initial keyless registry passed. A separate helper
+An earlier packaged VSIX also activated as an installed extension in an isolated client profile. Its Manage
+command, provider/icons, and initial keyless registry passed against that earlier package. A separate helper
 injected in-memory SecretStorage before activation; no extension fetches or real keychain operations
 occurred, and scheduled refresh callbacks were suppressed.
 
@@ -24,17 +44,16 @@ upstream model ID, without automatic OpenRouter fields. The panel was also brows
 a narrow viewport. See [native grouping evidence](native-model-groups.md) for the initial prototype and
 remaining picker/menu checks.
 
-Read-only live access was subsequently verified: management API authentication, strict-TLS gateway
-health/discovery, unauthenticated refusal, and both gateway allowance lane schemas. No inference calls
-or deployment changes were made at that stage. The [gateway contract](gateway-allowance.md) is now
-implemented. Browser checks cover reported/partial/unknown/stale allowance views and a 380px panel,
-with the allowance table scrolling inside the page and session summaries wrapping.
+Earlier read-only live access verified management authentication, strict-TLS proxy health/discovery,
+and unauthenticated refusal without inference or deployment changes. Custom allowance checks also
+occurred in that earlier implementation; the feature has since been removed and those results do not
+establish any current proxy API requirement.
 
 Bounded live checks on 2026-10-28 exercised the compiled production registry/router in an isolated
 VS Code host with in-memory credentials: gateway streamed tool call, tool-result continuation, and a
 direct connection using the same `mistralai/mistral-nemo` model. Three inference calls were capped at
 128 output tokens each. Bearer/origin isolation, redirect refusal, metadata, streamed usage, separate
-connection accounting, and the production two-lane allowance refresh passed. Total reported cost was
+connection accounting passed in that earlier implementation. Total reported cost was
 $0.00000343440; no deployment, key, or budget settings changed.
 
 TLS certificate and hostname verification stayed enabled. On this client, the default Electron-backed

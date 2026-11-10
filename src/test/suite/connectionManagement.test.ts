@@ -1,5 +1,6 @@
 import * as assert from 'assert';
-import type { ConnectionDefinition, ConnectionPatch } from '../../connections';
+import { ConnectionRegistry, type ConnectionDefinition, type ConnectionPatch } from '../../connections';
+import * as vscode from 'vscode';
 import { updateConnectionWithGroup } from '../../extension';
 
 function fixture() {
@@ -34,7 +35,7 @@ suite('connection metadata and native group edits', () => {
         }), /Native configuration is dirty/);
         const after = snapshot();
         assert.deepStrictEqual({ ...after, revision: before.revision }, before);
-        assert.ok(after.revision > before.revision, 'stale model selections remain invalidated');
+        assert.strictEqual(after.revision, before.revision, 'a rejected native edit never changes the connection');
     });
 
     test('successful rename synchronizes the same permanent identity and retains endpoint edits', async () => {
@@ -54,5 +55,61 @@ suite('connection metadata and native group edits', () => {
             update: async () => { assert.fail('Native configuration must stay closed'); },
         }, 'local', { settings: { creditLimit: 12 } });
         assert.strictEqual(result.settings.creditLimit, 12);
+    });
+
+    test('a native rename failure leaves the saved endpoint and credential untouched', async () => {
+        const values = new Map<string, unknown>();
+        const keys = new Map<string, string>();
+        const registry = new ConnectionRegistry({
+            keys: () => [...values.keys()],
+            get: ((key: string) => values.get(key)) as vscode.Memento['get'],
+            update: async (key, value) => { values.set(key, value); },
+        }, {
+            keys: async () => [...keys.keys()], get: async key => keys.get(key),
+            store: async (key, value) => { keys.set(key, value); },
+            delete: async key => { keys.delete(key); },
+            onDidChange: new vscode.EventEmitter<vscode.SecretStorageChangeEvent>().event,
+        });
+        await registry.initialize();
+        const connection = await registry.add({ name: 'Local', kind: 'openai-compatible',
+            baseUrl: 'https://one.test/v1' }, 'old-key');
+        for (const apiKey of ['new-key', null]) {
+            await assert.rejects(updateConnectionWithGroup(registry, {
+                update: async () => { throw new Error('Native configuration is dirty'); },
+            }, connection.id, { name: 'Renamed', baseUrl: 'https://two.test/v1' }, apiKey), /dirty/);
+            assert.deepStrictEqual(registry.get(connection.id), connection);
+            assert.strictEqual(await registry.readKey(connection.id), 'old-key');
+        }
+        registry.dispose();
+    });
+
+    test('a registry save failure restores the previous native group name and forwards the key action', async () => {
+        const { store, snapshot } = fixture();
+        const names: string[] = [];
+        await assert.rejects(updateConnectionWithGroup({
+            get: store.get,
+            update: async (_id, _patch, apiKey) => {
+                assert.strictEqual(apiKey, 'replacement-key');
+                throw new Error('Credential storage failed');
+            },
+        }, { update: async connection => { names.push(connection.name); } }, 'local',
+        { name: ' Renamed ' }, 'replacement-key'), /Credential storage failed/);
+        assert.deepStrictEqual(names, ['Renamed', snapshot().name]);
+        assert.strictEqual(snapshot().revision, 1);
+    });
+
+    test('cleanup failure after a committed save keeps the matching native group name', async () => {
+        const { store, snapshot } = fixture();
+        const names: string[] = [];
+        await assert.rejects(updateConnectionWithGroup({
+            get: store.get,
+            update: async (id, patch) => {
+                await store.update(id, patch);
+                throw new Error('Old credential cleanup failed');
+            },
+        }, { update: async connection => { names.push(connection.name); } }, 'local',
+        { name: 'Renamed' }, null), /cleanup failed/);
+        assert.deepStrictEqual(names, ['Renamed']);
+        assert.strictEqual(snapshot().name, 'Renamed');
     });
 });

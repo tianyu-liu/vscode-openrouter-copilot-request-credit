@@ -2,10 +2,10 @@ import * as vscode from 'vscode';
 import { randomBytes } from 'crypto';
 import { t } from './i18n';
 import {
-    DEFAULT_CONNECTION_NAME, nextConnectionName,
+    DEFAULT_CONNECTION_NAME, OPENROUTER_BASE_URL, nextConnectionName,
     type ConnectionDefinition, type ConnectionInput, type ConnectionPatch, type ManualModel,
 } from './connections';
-import type { GatewayAllowance, GatewayBudget } from './gatewayAllowance';
+import { isOpenRouterApiKey } from './connectionCredentials';
 import {
     presetSlugFromPickerValue,
     stripTemplateComments,
@@ -282,54 +282,12 @@ export interface PanelRenderOptions {
     fetchedAt?: Date;
     maskedKey?: string;
     accountCredits?: AccountCredits;
-    gatewayAllowance?: GatewayAllowance;
-    gatewayAllowanceStale?: boolean;
     errorMessage?: string;
     template?: Record<string, unknown>;
     presets?: PresetRow[];
     presetConfig?: Record<string, unknown>;
     sessions?: SessionCost[];
     settings?: Partial<PanelSettings>;
-}
-
-function gatewayAmount(value: number | null | undefined): string {
-    return typeof value === 'number' && Number.isFinite(value)
-        ? `$${value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}`
-        : t('Unavailable');
-}
-
-function gatewayTime(value: string | null | undefined): string {
-    if (!value) return t('Unavailable');
-    const date = new Date(value);
-    return Number.isFinite(date.getTime()) ? formatReset(date, true) : t('Unavailable');
-}
-
-function renderGatewayAllowance(allowance: GatewayAllowance | undefined, stale: boolean): string {
-    const rows = (['cheap', 'default'] as const).map(name => {
-        const lane = allowance?.[name];
-        const reported = lane?.status === 'reported';
-        const budget: GatewayBudget | null | undefined = reported ? lane.effective_budget : undefined;
-        const period = budget?.reset;
-        const periodText = period && isResetPeriod(period) ? resetPeriodLabel(period) : period || t('Unavailable');
-        return `<tr data-lane="${name}">
-            <th scope="row" class="label">${name === 'cheap' ? t('Cheap lane') : t('Default lane')}</th>
-            <td>${reported ? t('Reported') : t('Unknown')}</td>
-            <td class="col">${esc(gatewayAmount(budget?.remaining))}</td>
-            <td class="col">${esc(gatewayAmount(budget?.limit))}</td>
-            <td class="col">${esc(gatewayAmount(budget?.usage))}</td>
-            <td>${esc(periodText)}</td><td>${esc(gatewayTime(budget?.resets_at))}</td>
-        </tr>`;
-    }).join('');
-    return `${stale ? `<p class="warn">${t('Saved allowance is stale. Refresh to try again.')}</p>` : ''}
-        ${allowance ? '' : emptyState(t('No gateway allowance yet. Save a gateway token, then refresh.'))}
-        <div class="table-scroll"><table class="rows">
-            <thead><tr><th class="label">${t('Lane')}</th><th>${t('Status')}</th>
-            <th>${t('Remaining')}</th><th>${t('Interval allowance')}</th><th>${t('Interval usage')}</th>
-            <th>${t('Reset period')}</th><th>${t('Next reset')}</th></tr></thead><tbody>${rows}</tbody>
-        </table></div>
-        <p class="helptext">${t('Each lane shows its effective interval budget. Unavailable values do not mean zero usage or unlimited access. Lanes are not added together.')}</p>
-        <p class="helptext">${t('Gateway retrieved: {0}. Retrieval times do not guarantee current billing counters.', esc(gatewayTime(allowance?.fetched_at)))}</p>
-        <p class="helptext">${t('Direct and gateway connections may share the same upstream funds; using both does not add funds.')}</p>`;
 }
 
 export function renderPanelHtml(options: PanelRenderOptions): string {
@@ -359,7 +317,7 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
     const connectionId = connection?.id ?? '';
     const newConnectionName = nextConnectionName(connections);
     const isOpenRouter = !connection || connection.kind === 'openrouter';
-    const isGateway = connection?.kind === 'gateway';
+    const isLegacyCompatible = connection?.kind === 'openai-compatible';
     const jsonForScript = (value: unknown): string => JSON.stringify(value).replace(/</g, '\\u003c');
     const nonce = randomBytes(16).toString('hex');
     const detail = info ? buildDetail(info, limit, resetPeriod, includeByok, accountCredits) : undefined;
@@ -399,8 +357,8 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
         ? `<div class="errbanner">${esc(errorMessage)}</div>`
         : '';
     const keyState = maskedKey
-        ? `<span class="ok">\u2713 ${t('Key set')}</span>`
-        : `<span class="warn">${t('No API key set')}</span>`;
+        ? `<span class="ok">\u2713 ${t('Key saved')}</span>`
+        : `<span class="muted">${t('No key saved')}</span>`;
     const autoMode = detail?.mode === 'auto';
     const includeByokShown = autoMode && info ? effectiveIncludeByok(info, includeByok) : includeByok;
     const limitFieldValue = autoMode
@@ -419,8 +377,8 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
            ${autoMode ? renderNote('autoLimit') : ''}`;
     const sessionCostHtml = renderSessionCosts(sessions, !isOpenRouter);
     const updatedLine = `<div class="keyline updatedline">
-            ${fetchedAt ? `<span class="muted">${t(isGateway ? 'Retrieved locally: {0}' : 'Updated {0}', esc(formatReset(fetchedAt, true)))}</span>` : ''}
-            <button id="refresh">${isGateway ? t('Refresh allowance') : t('Refresh')}</button>
+            ${fetchedAt ? `<span class="muted">${t('Updated {0}', esc(formatReset(fetchedAt, true)))}</span>` : ''}
+            <button id="refresh">${t('Refresh')}</button>
         </div>`;
     const templateValue = template ? JSON.stringify(template, null, 2) : '';
     const selectedPreset = templatePresetSlug(template) ?? '';
@@ -466,10 +424,8 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'">
 <style>
     .wrap { max-width: 1100px; }
-    .connection-form { display: grid; gap: 10px; max-width: 700px; }
-    .connection-form label { display: grid; gap: 5px; }
-    .connection-form input[type=text], .connection-form select { width: 100%; box-sizing: border-box; }
-    .connection-form .optlabel { display: flex; }
+    .group-management { max-width: 700px; }
+    .group-management [hidden] { display: none !important; }
     .connection-url { overflow-wrap: anywhere; }
     .table-scroll { overflow-x: auto; }
     @media (max-width: 480px) { body { padding: 12px; } input[type=password], input[type=text] { max-width: 100%; } .keyline { align-items: stretch; } .sessionbody { padding-left: 0; overflow-x: auto; } }
@@ -483,6 +439,19 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
     .section-title { font-size: 12px; text-transform: uppercase; letter-spacing: .05em;
                      font-weight: 600; color: var(--vscode-foreground); margin-bottom: 10px; }
     .keyline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+    .connection-toolbar { margin-top: 12px; }
+    .connection-toolbar select { flex: 1; min-width: 0; }
+    .connection-form { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; }
+    .connection-form .form-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+    .connection-form .form-wide { grid-column: 1 / -1; }
+    .connection-form .form-field > input, .connection-form .form-field > select { width: 100%; }
+    .connection-form .keyline { margin-bottom: 0; }
+    .connection-form .credential-summary { overflow-wrap: anywhere; }
+    .connection-actions { border-top: 1px solid var(--vscode-panel-border); padding-top: 14px; }
+    button.secondary { background: var(--vscode-button-secondaryBackground, #e5e5e5);
+                       color: var(--vscode-button-secondaryForeground, #333); }
+    button.secondary:hover { background: var(--vscode-button-secondaryHoverBackground, #d8d8d8); }
+    .connection-actions #deleteConnection { margin-left: auto; }
     .fieldgroup { display: inline-flex; align-items: center; gap: 8px; }
     .fieldgroup .muted { font-style: normal; }
     .sep { color: var(--vscode-descriptionForeground, #888); }
@@ -495,6 +464,8 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
         background: var(--vscode-input-background); color: var(--vscode-input-foreground);
         border: 1px solid var(--vscode-input-border, transparent); padding: 4px 8px; width: 320px; box-sizing: border-box;
         font: inherit; }
+    input::placeholder { color: var(--vscode-input-placeholderForeground, var(--vscode-descriptionForeground));
+                         opacity: 1; }
     input[type=number] {
         background: var(--vscode-input-background); color: var(--vscode-input-foreground);
         border: 1px solid var(--vscode-input-border, transparent); padding: 4px 8px; width: 90px;
@@ -570,6 +541,11 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
     table.routes td:last-child, table.routes th:last-child { padding-right: 0; }
     table.routes td.num { text-align: right; }
     @media (max-width: 480px) {
+        body { padding: 12px; }
+        .connection-form { grid-template-columns: minmax(0, 1fr); }
+        .connection-toolbar { align-items: stretch; }
+        .connection-toolbar .optlabel { flex-basis: 100%; }
+        .connection-toolbar select { min-width: 100px; }
         details.session summary { flex-wrap: wrap; }
         .sessionname { flex-basis: 160px; min-width: 0; overflow-wrap: anywhere; }
         .sessiontime { white-space: normal; overflow-wrap: anywhere; }
@@ -586,32 +562,41 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
     </div>
     ${errorBanner}
     <section class="tab-panel" id="panel-settings" role="tabpanel" aria-labelledby="tab-settings" tabindex="0">
-    <div class="section">
-        <div class="section-title">${t('Keys')}</div>
+    <div class="section group-management">
+        <div class="section-title">${t('Group management')}</div>
         <p class="helptext">${t('Manage named connections here. Choose a model from its connection group in Copilot to route a request.')}</p>
-        <div class="keyline">
+        <div class="keyline connection-toolbar">
             <label class="optlabel" for="connectionSelect">${t('Connection')}</label>
             <select id="connectionSelect">${connections.map(item => `<option value="${esc(item.id)}"${item.id === connectionId ? ' selected' : ''}>${esc(item.name)}${item.enabled ? '' : ` (${t('Disabled')})`}</option>`).join('')}</select>
             <button id="addConnection">${t('Add connection')}</button>
-            ${connection ? `<button id="toggleConnection">${connection.enabled ? t('Disable') : t('Enable')}</button><button id="deleteConnection">${t('Delete connection')}</button>` : ''}
         </div>
         <form id="connectionForm" class="connection-form">
-            <label>${t('Connection name')}<input id="connectionName" type="text" required value="${esc(connection?.name ?? newConnectionName)}" placeholder="${t('For example: Personal, Work, Local')}" /></label>
-            <label>${t('API type')}<select id="connectionKind"${connection ? ' disabled' : ''}><option value="openrouter"${isOpenRouter ? ' selected' : ''}>OpenRouter</option><option value="gateway"${isGateway ? ' selected' : ''}>${t('Gateway')}</option><option value="openai-compatible"${connection?.kind === 'openai-compatible' ? ' selected' : ''}>${t('OpenAI compatible')}</option></select></label>
-            <label>${t('Base URL')}<input id="connectionUrl" type="text" required value="${esc(connection?.baseUrl ?? 'https://openrouter.ai/api/v1')}" placeholder="http://localhost:1234/v1" /></label>
-            <div class="keyline"><button id="saveConnection" type="submit">${t('Save connection')}</button><button id="cancelConnection" type="button" hidden>${t('Cancel')}</button><span id="newConnectionHint" class="helptext" hidden>${t('Enter the new connection details, then save.')}</span></div>
+            <label class="form-field">${t('Connection name')}<input id="connectionName" type="text" required value="${esc(connection?.name ?? newConnectionName)}" placeholder="${t('For example: Personal, Work, Local')}" /></label>
+            <label class="form-field">${t('Connection mode')}<select id="connectionKind"><option value="openrouter"${isOpenRouter ? ' selected' : ''}>${t('Direct OpenRouter')}</option><option value="gateway"${!isOpenRouter ? ' selected' : ''}>${t('OpenRouter proxy')}</option></select></label>
+            <p class="helptext form-wide" id="connectionTypeHint"></p>
+            ${isLegacyCompatible ? `<p class="helptext form-wide" id="legacyConnectionHint">${t('This older connection keeps its previous behavior until you save it as an OpenRouter proxy.')}</p>` : ''}
+            <label class="form-field form-wide">${t('Base URL')}<input id="connectionUrl" type="text" required value="${esc(connection?.baseUrl ?? OPENROUTER_BASE_URL)}"${isOpenRouter ? ' disabled' : ''} placeholder="http://localhost:1234/v1" /></label>
+            <div class="form-field form-wide">
+                <label for="key">${t('API key')}</label>
+                <input type="password" id="key" autocomplete="off" aria-label="${isOpenRouter ? t('OpenRouter API key') : t('Proxy token')}" placeholder="${maskedKey ? esc(maskedKey) : isOpenRouter ? t('OpenRouter API key (sk-or-v1-...)') : t('Proxy token (optional)')}" />
+                <div id="savedKeyState" class="keyline credential-summary">
+                    ${keyState}${maskedKey ? `<button id="clearKey" class="secondary" type="button">${t('Clear key')}</button>` : ''}
+                </div>
+                <p class="helptext" id="keyHelp">${t(maskedKey ? 'Enter a new key to replace the saved key. Leave blank to keep it.' : 'Add a key if this endpoint requires authentication. You can save without one.')}</p>
+                ${maskedKey ? `<p class="helptext" id="endpointKeyHelp" hidden>${t('To change the base URL, enter a replacement key or clear the saved key first.')}</p>` : ''}
+                ${renderNote('storage')}
+            </div>
+            <div class="form-wide">
+                <label class="optlabel"><input type="checkbox" id="connectionEnabled"${connection?.enabled !== false ? ' checked' : ''} /> ${t('Enable connection')}</label>
+                <p class="helptext">${t('Disable to hide its models in Copilot. Saved keys, settings, and history are kept.')}</p>
+            </div>
+            <div class="keyline connection-actions form-wide">
+                <button id="saveConnection" type="submit">${t('Save connection')}</button>
+                <button id="cancelConnection" class="secondary" type="button"${connection ? '' : ' hidden'}>${t('Cancel')}</button>
+                ${connection ? `<button id="deleteConnection" class="secondary" type="button">${t('Delete connection')}</button>` : ''}
+                <span id="newConnectionHint" class="helptext" hidden>${t('Enter the new connection details, then save.')}</span>
+            </div>
         </form>
-        ${maskedKey && !isOpenRouter ? `<p class="helptext">${t('Clear the saved key before changing this connection’s base URL.')}</p>` : ''}
-    </div>
-    <div class="section">
-        <div class="section-title">${isOpenRouter ? t('OpenRouter API key') : t('API key')}</div>
-        <div class="keyline">
-            <input type="${maskedKey ? 'text' : 'password'}" id="key" aria-label="${isOpenRouter ? t('OpenRouter API key') : t('API key')}" placeholder="${isOpenRouter ? t('OpenRouter API key (sk-or-v1-...)') : isGateway ? t('Gateway bearer token') : t('API key (optional for local servers)')}" />
-            <button id="saveKey"${connection ? '' : ' disabled'}>${t('Save key')}</button>
-            ${maskedKey ? `<button id="clearKey">${t('Clear key')}</button>` : ''}
-            ${keyState}
-        </div>
-        ${renderNote('storage')}
     </div>
     <div class="section">
         <div class="section-title">${t('Shared settings')}</div>
@@ -662,17 +647,11 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
         <label class="optlabel"><input type="checkbox" id="hideUnavailableModels" ${hideUnavailableModels ? 'checked' : ''} /> ${t('Hide models this key cannot use')}</label>
         ${renderNote('hideUnavailable')}
     </div>
-` : isGateway ? `<div class="section"><div class="section-title">${t('Gateway allowance')}</div>
-        ${renderGatewayAllowance(options.gatewayAllowance, options.gatewayAllowanceStale ?? false)}
-        ${updatedLine}
+` : `<div class="section"><div class="section-title">${t('Usage')}</div>
+        ${emptyState(t('Session usage and reported cost are tracked locally. Direct OpenRouter credit and preset APIs are not called through a proxy.'))}
     </div>
     <div class="section"><div class="section-title">${t('Model availability')}</div>
-        <p class="helptext">${t('The gateway supplies the models available to this token. If discovery fails, no models are offered until it succeeds.')}</p>
-    </div>` : `<div class="section"><div class="section-title">${t('Usage')}</div>${emptyState(t('This API does not provide OpenRouter credits or authoritative cost data. Token counts may be reported by the server.'))}</div>
-    <div class="section"><div class="section-title">${t('Manual models')}</div>
-        <p class="helptext">${t('Optional model definitions override or supplement /models. Use an array with id, name, contextLength, maxOutputTokens, toolCalling, and imageInput.')}</p>
-        <textarea id="manualModels" rows="6" aria-label="${t('Manual model definitions JSON')}">${esc(JSON.stringify(connection?.models ?? [], null, 2))}</textarea>
-        <button id="saveManualModels">${t('Save models')}</button>
+        <p class="helptext">${t('The proxy supplies the available models. If discovery fails, no models are offered until it succeeds.')}</p>
     </div>`}
     <div class="section">
         <div class="section-title">${t('Session spend')}</div>
@@ -691,12 +670,11 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
 
     <div class="section">
         <div class="section-title">${t('Custom request')}</div>
-        ${isOpenRouter ? '' : `<p class="helptext">${esc(t('To request token usage from servers that support it, include "stream_options": {"include_usage": true} in the request JSON.'))}</p>`}
-        <textarea id="template" aria-label="${t('Custom request JSON')}" rows="10" placeholder="${t('Paste a request body from the OpenRouter Request Builder (or any Chat Completions JSON).')}"></textarea>
+        <textarea id="template" aria-label="${t('Custom request JSON')}" rows="10" placeholder="${t('Paste a request body from the OpenRouter Request Builder.')}"></textarea>
         <div class="keyline">
             <button id="saveTemplate">${t('Save request')}</button>
         </div>
-        ${renderNoteList(isOpenRouter ? ['streaming', 'liveConversation', 'thinkingEffort', 'providerRouting', 'anthropicCaching'] : ['streaming', 'liveConversation'])}
+        ${renderNoteList(isLegacyCompatible ? ['streaming', 'liveConversation'] : ['streaming', 'liveConversation', 'thinkingEffort', 'providerRouting', 'anthropicCaching'])}
     </div>
     </section>
 
@@ -705,7 +683,6 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
         const savedState = vsc.getState() || {};
         const connectionId = ${jsonForScript(connectionId)};
         const requireConnectionScope = ${JSON.stringify(options.connections !== undefined)};
-        const connectionEnabled = ${JSON.stringify(connection?.enabled ?? false)};
         const connectionDrafts = savedState.connectionDrafts || {};
         const draft = { ...(connectionDrafts[connectionId] || {}), activeTab: savedState.activeTab };
         const sharedDraft = savedState.sharedDraft || {};
@@ -722,6 +699,8 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
                 template: draft.template, templateBase: draft.templateBase,
                 preset: draft.preset, presetBase: draft.presetBase,
                 manualModels: draft.manualModels, manualModelsBase: draft.manualModelsBase,
+                connectionEditor: draft.connectionEditor, connectionEditorBase: draft.connectionEditorBase,
+                connectionCustomBaseUrl: draft.connectionCustomBaseUrl,
             };
             const sharedDraft = {};
             for (const prop of ['reservePercent', 'reservePercentBase', 'reserveMin', 'reserveMinBase', 'reserveMax', 'reserveMaxBase']) {
@@ -742,7 +721,8 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
         const activateTab = (tab, notify = true) => {
             const targetId = tab.dataset.connectionId;
             const nextKey = document.getElementById('key');
-            if (nextKey) { nextKey.value = currentKeyMask; nextKey.type = currentKeyMask ? 'text' : 'password'; }
+            if (nextKey) { nextKey.value = ''; nextKey.disabled = false; }
+            validateConnectionKey();
             tabs.forEach((item) => {
                 const selected = item === tab;
                 item.setAttribute('aria-selected', String(selected));
@@ -789,15 +769,20 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
             persistStateSoon();
         });
         const keyEl = document.getElementById('key');
-        const currentKeyMask = ${JSON.stringify(maskedKey ?? '').replace(/</g, '\\u003c')};
-        keyEl.value = currentKeyMask;
-        keyEl.addEventListener('input', () => {
-            if (keyEl.value !== currentKeyMask) keyEl.type = 'password';
-        });
-        bind('saveKey', 'click', () => {
-            vsc.postMessage({ type: 'saveKey', value: keyEl.value, currentKeyMasked: currentKeyMask, connectionId });
-        });
+        const looksLikeOpenRouterKey = ${isOpenRouterApiKey.toString()};
+        const validateConnectionKey = () => {
+            const kind = document.getElementById('connectionKind').value;
+            const value = keyEl.value.trim() || (!creatingConnection ? ${jsonForScript(maskedKey ?? '')} : '');
+            const prohibited = kind !== 'openrouter' && looksLikeOpenRouterKey(value);
+            keyEl.setCustomValidity(prohibited
+                ? ${jsonForScript(t('OpenRouter API keys cannot be used with a proxy. Use a proxy token or leave the key blank.'))}
+                : '');
+            return !prohibited;
+        };
+        bind('key', 'input', validateConnectionKey);
         bind('clearKey', 'click', () => {
+            keyEl.value = '';
+            rememberConnectionEditor();
             post('clearKey');
         });
         const presetEl = document.getElementById('presetSelect');
@@ -867,23 +852,102 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
             post('saveTemplate', templateEl.value);
         });
         let creatingConnection = false;
+        const connectionUrl = document.getElementById('connectionUrl');
+        let customBaseUrl = ${jsonForScript(!isOpenRouter ? connection?.baseUrl ?? '' : '')};
+        const connectionEditorBase = ${jsonForScript(JSON.stringify({
+            name: connection?.name ?? newConnectionName, kind: connection?.kind ?? 'openrouter',
+            baseUrl: connection?.baseUrl ?? OPENROUTER_BASE_URL, enabled: connection?.enabled ?? true,
+        }))};
+        const rememberConnectionEditor = () => {
+            draft.connectionEditor = {
+                name: document.getElementById('connectionName').value,
+                kind: document.getElementById('connectionKind').value,
+                baseUrl: connectionUrl.value,
+                enabled: document.getElementById('connectionEnabled').checked,
+            };
+            draft.connectionEditorBase = connectionEditorBase;
+            draft.connectionCustomBaseUrl = customBaseUrl;
+            persistState();
+        };
+        const updateKeyHint = () => {
+            const kind = document.getElementById('connectionKind').value;
+            const keepingKey = !creatingConnection && ${JSON.stringify(!!maskedKey)};
+            keyEl.placeholder = keepingKey ? ${jsonForScript(maskedKey ?? '')}
+                : kind === 'openrouter' ? ${jsonForScript(t('OpenRouter API key (sk-or-v1-...)'))}
+                : ${jsonForScript(t('Proxy token (optional)'))};
+            document.getElementById('keyHelp').textContent = keepingKey
+                ? ${jsonForScript(t('Enter a new key to replace the saved key. Leave blank to keep it.'))}
+                : kind === 'openrouter'
+                    ? ${jsonForScript(t('Add a key if this endpoint requires authentication. You can save without one.'))}
+                    : ${jsonForScript(t('Use a proxy token, or leave blank if authentication is not required. OpenRouter keys (sk-or-...) are not accepted.'))};
+            const endpointHelp = document.getElementById('endpointKeyHelp');
+            if (endpointHelp) endpointHelp.hidden = !keepingKey
+                || connectionUrl.value.trim().replace(/\\/+$/, '') === ${jsonForScript(connection?.baseUrl ?? '')};
+        };
+        const updateConnectionType = () => {
+            const kind = document.getElementById('connectionKind').value;
+            keyEl.setAttribute('aria-label', kind === 'openrouter'
+                ? ${jsonForScript(t('OpenRouter API key'))} : ${jsonForScript(t('Proxy token'))});
+            if (kind === 'openrouter') {
+                if (!connectionUrl.disabled && connectionUrl.value !== ${jsonForScript(OPENROUTER_BASE_URL)}) {
+                    customBaseUrl = connectionUrl.value;
+                }
+                connectionUrl.value = ${jsonForScript(OPENROUTER_BASE_URL)};
+                connectionUrl.disabled = true;
+            } else {
+                if (connectionUrl.disabled) connectionUrl.value = customBaseUrl;
+                connectionUrl.disabled = false;
+            }
+            document.getElementById('connectionTypeHint').textContent = kind === 'openrouter'
+                ? ${jsonForScript(t('Direct OpenRouter access with account credits, presets, and OpenRouter request options.'))}
+                : ${jsonForScript(t('Access OpenRouter through a proxy. OpenRouter request options are retained; the proxy supplies the available models.'))};
+            if (kind === 'gateway' && !creatingConnection && ${JSON.stringify(connection?.kind !== 'gateway' && !!connection?.models?.length)}) {
+                document.getElementById('connectionTypeHint').textContent += ' '
+                    + ${jsonForScript(t('Saving as an OpenRouter proxy removes manual model definitions.'))};
+            }
+            const legacyHint = document.getElementById('legacyConnectionHint');
+            if (legacyHint) legacyHint.hidden = creatingConnection || kind !== 'gateway';
+            updateKeyHint();
+            validateConnectionKey();
+        };
+        bind('connectionKind', 'change', updateConnectionType);
+        bind('connectionUrl', 'input', updateKeyHint);
+        const editorDraft = draft.connectionEditor;
+        if (draft.connectionEditorBase === connectionEditorBase && editorDraft
+            && typeof editorDraft.name === 'string' && typeof editorDraft.baseUrl === 'string'
+            && typeof editorDraft.enabled === 'boolean'
+            && ['openrouter', 'gateway', 'openai-compatible'].includes(editorDraft.kind)) {
+            document.getElementById('connectionName').value = editorDraft.name;
+            document.getElementById('connectionKind').value = editorDraft.kind === 'openai-compatible'
+                ? 'gateway' : editorDraft.kind;
+            connectionUrl.value = editorDraft.baseUrl;
+            document.getElementById('connectionEnabled').checked = editorDraft.enabled;
+            customBaseUrl = editorDraft.kind !== 'openrouter' ? editorDraft.baseUrl
+                : typeof draft.connectionCustomBaseUrl === 'string' ? draft.connectionCustomBaseUrl : '';
+        } else {
+            delete draft.connectionEditor;
+            delete draft.connectionEditorBase;
+            delete draft.connectionCustomBaseUrl;
+        }
+        updateConnectionType();
         bind('connectionSelect', 'change', () => {
             persistState();
             vsc.postMessage({ type: 'selectConnection', connectionId: document.getElementById('connectionSelect').value, value: 'settings' });
         });
         bind('addConnection', 'click', () => {
             creatingConnection = true;
+            customBaseUrl = '';
             document.getElementById('connectionName').value = ${jsonForScript(newConnectionName)};
             document.getElementById('connectionUrl').value = 'https://openrouter.ai/api/v1';
             document.getElementById('connectionKind').value = 'openrouter';
             document.getElementById('newConnectionHint').hidden = false;
             document.getElementById('cancelConnection').hidden = false;
-            document.getElementById('connectionKind').disabled = false;
-            document.getElementById('key').value = '';
-            document.getElementById('saveKey').disabled = true;
-            const clear = document.getElementById('clearKey');
-            if (clear) clear.disabled = true;
-            for (const id of ['toggleConnection', 'deleteConnection', 'addConnection']) {
+            document.getElementById('connectionEnabled').checked = true;
+            keyEl.value = '';
+            keyEl.disabled = false;
+            updateConnectionType();
+            document.getElementById('savedKeyState').hidden = true;
+            for (const id of ['deleteConnection', 'addConnection']) {
                 const control = document.getElementById(id);
                 if (control) control.disabled = true;
             }
@@ -891,45 +955,45 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
         });
         bind('cancelConnection', 'click', () => {
             creatingConnection = false;
+            delete draft.connectionEditor;
+            delete draft.connectionEditorBase;
+            delete draft.connectionCustomBaseUrl;
+            persistState();
             const saved = ${jsonForScript(connection ?? {})};
+            customBaseUrl = saved.kind !== 'openrouter' ? saved.baseUrl || '' : '';
             document.getElementById('connectionName').value = saved.name || ${jsonForScript(newConnectionName)};
             document.getElementById('connectionUrl').value = saved.baseUrl || 'https://openrouter.ai/api/v1';
-            document.getElementById('connectionKind').value = saved.kind || 'openrouter';
-            document.getElementById('connectionKind').disabled = !!connectionId;
+            document.getElementById('connectionKind').value = saved.kind === 'openai-compatible'
+                ? 'gateway' : saved.kind || 'openrouter';
+            document.getElementById('connectionEnabled').checked = saved.enabled !== false;
             document.getElementById('newConnectionHint').hidden = true;
-            document.getElementById('cancelConnection').hidden = true;
-            keyEl.value = currentKeyMask;
-            document.getElementById('saveKey').disabled = !connectionId;
-            const clear = document.getElementById('clearKey');
-            if (clear) clear.disabled = false;
-            for (const id of ['toggleConnection', 'deleteConnection', 'addConnection']) {
+            document.getElementById('cancelConnection').hidden = !connectionId;
+            keyEl.value = '';
+            keyEl.disabled = false;
+            updateConnectionType();
+            document.getElementById('savedKeyState').hidden = false;
+            for (const id of ['deleteConnection', 'addConnection']) {
                 const control = document.getElementById(id);
                 if (control) control.disabled = false;
             }
         });
         bind('connectionForm', 'submit', (event) => {
             event.preventDefault();
+            if (!validateConnectionKey()) {
+                keyEl.reportValidity();
+                return;
+            }
             const value = {
                 name: document.getElementById('connectionName').value,
                 baseUrl: document.getElementById('connectionUrl').value,
                 kind: document.getElementById('connectionKind').value,
+                enabled: document.getElementById('connectionEnabled').checked,
             };
+            if (keyEl.value.trim()) value.apiKey = keyEl.value.trim();
             if (creatingConnection || !connectionId) vsc.postMessage({ type: 'addConnection', value });
             else post('updateConnection', value);
         });
-        bind('toggleConnection', 'click', () => post('setConnectionEnabled', !connectionEnabled));
         bind('deleteConnection', 'click', () => post('deleteConnection'));
-        const manualEl = document.getElementById('manualModels');
-        if (manualEl) {
-            const manualBase = manualEl.value;
-            if (typeof draft.manualModels === 'string' && draft.manualModelsBase === manualBase) manualEl.value = draft.manualModels;
-            manualEl.addEventListener('input', () => {
-                draft.manualModels = manualEl.value;
-                draft.manualModelsBase = manualBase;
-                persistStateSoon();
-            });
-            bind('saveManualModels', 'click', () => post('saveManualModels', manualEl.value));
-        }
         const initialTab = tabs.find((tab) => tab.id === draft.activeTab) || tabs[0];
         activateTab(initialTab, false);
         window.addEventListener('message', (event) => {
@@ -977,8 +1041,8 @@ export interface PanelMessage {
 
 export interface PanelDeps {
     selectConnection?: (id: string) => Promise<void>;
-    addConnection?: (input: ConnectionInput) => Promise<void>;
-    updateConnection?: (id: string, patch: ConnectionPatch) => Promise<void>;
+    addConnection?: (input: ConnectionInput, apiKey?: string | null) => Promise<void>;
+    updateConnection?: (id: string, patch: ConnectionPatch, apiKey?: string | null) => Promise<void>;
     deleteConnection?: (id: string) => Promise<void>;
     updateConfig: (key: string, value: unknown) => Thenable<void>;
     error: (message: string) => void;
@@ -1013,8 +1077,9 @@ function parseConnectionInput(value: unknown): ConnectionInput | undefined {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
     const input = value as Record<string, unknown>;
     if (typeof input.name !== 'string' || !input.name.trim()
-        || (input.kind !== 'openrouter' && input.kind !== 'openai-compatible' && input.kind !== 'gateway')
-        || typeof input.baseUrl !== 'string') return undefined;
+        || (input.kind !== 'openrouter' && input.kind !== 'gateway')
+        || typeof input.baseUrl !== 'string'
+        || (input.enabled !== undefined && typeof input.enabled !== 'boolean')) return undefined;
     try {
         const url = new URL(input.baseUrl.trim());
         if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
@@ -1023,7 +1088,9 @@ function parseConnectionInput(value: unknown): ConnectionInput | undefined {
     } catch {
         return undefined;
     }
-    return { name: input.name.trim(), kind: input.kind, baseUrl: input.baseUrl.trim() };
+    return { name: input.name.trim(), kind: input.kind, baseUrl: input.baseUrl.trim(),
+        ...(input.enabled !== undefined ? { enabled: input.enabled } : {}),
+    };
 }
 
 function parseManualModels(value: unknown): ManualModel[] | undefined {
@@ -1070,8 +1137,14 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Pr
                 deps.error(t('Enter a connection name, API type, and an HTTP or HTTPS base URL without credentials, query, or fragment.'));
                 return;
             }
-            if (msg.type === 'addConnection') await deps.addConnection?.(input);
-            else if (msg.connectionId) await deps.updateConnection?.(msg.connectionId, input);
+            const rawKey = (msg.value as Record<string, unknown>).apiKey;
+            if (rawKey !== undefined && rawKey !== null && typeof rawKey !== 'string') {
+                deps.error(t('Enter a valid API key.'));
+                return;
+            }
+            const apiKey = typeof rawKey === 'string' ? rawKey.trim() || undefined : rawKey;
+            if (msg.type === 'addConnection') await deps.addConnection?.(input, apiKey);
+            else if (msg.connectionId) await deps.updateConnection?.(msg.connectionId, input, apiKey);
             return;
         }
         case 'deleteConnection':

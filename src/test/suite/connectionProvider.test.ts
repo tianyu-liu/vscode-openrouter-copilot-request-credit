@@ -1,6 +1,6 @@
 import * as assert from 'assert';
 import * as vscode from 'vscode';
-import { ConnectionRegistry, type ConnectionDefinition } from '../../connections';
+import { ConnectionRegistry, OPENROUTER_BASE_URL, type ConnectionDefinition } from '../../connections';
 import { ConnectionChatProvider, connectionModelId } from '../../connectionProvider';
 import { formatMessage, resetTranslator, setTranslator } from '../../i18n';
 import { OpenRouterChatProvider, setRetryDelayForTesting, UNATTRIBUTED_SESSION_ID } from '../../provider';
@@ -98,6 +98,160 @@ suite('connection provider routing', () => {
         const headers = new Headers(calls.find(call => call.init?.method === 'POST')?.init?.headers);
         assert.ok(!headers.has('HTTP-Referer')); assert.ok(!headers.has('X-Title'));
     });
+
+    test('a combined endpoint and key save never discovers or requests the new endpoint with the old key', async () => {
+        const connection = await registry.add({ name: 'Combined', kind: 'openai-compatible',
+            baseUrl: 'https://one.test/v1' }, 'old-key');
+        const [staleModel] = await models(connection);
+        const discovery: Promise<vscode.LanguageModelChatInformation[]>[] = [];
+        registry.onDidChange(() => { discovery.push(models(registry.get(connection.id)!)); });
+        const updated = await registry.update(connection.id, { name: 'Updated', baseUrl: 'https://two.test/v1' }, 'new-key');
+        const [[model]] = await Promise.all(discovery);
+        await assert.rejects(request(staleModel), /changed|again|stale/i);
+        await request(model);
+        const newCalls = calls.filter(call => call.url.startsWith(updated.baseUrl));
+        assert.ok(newCalls.length >= 2);
+        assert.ok(newCalls.every(call => new Headers(call.init?.headers).get('Authorization') === 'Bearer new-key'));
+        assert.strictEqual(await registry.readKey(connection.id), 'new-key');
+    });
+
+    test('API type conversions recreate adapters, retire old handles and retain the scoped template and spend', async () => {
+        fetcher = async url => url.endsWith('/models') ? Response.json({ data: [{ id: 'anthropic/shared' }] })
+            : url.includes('/presets?') ? Response.json({ data: [] }) : completed();
+        let connection = await registry.add({ name: 'Converting', kind: 'openai-compatible',
+            baseUrl: OPENROUTER_BASE_URL, settings: { hideUnavailableModels: false } }, 'same-key');
+        let [model] = await models(connection);
+        let child = router.getProvider(connection.id)!;
+        await child.setTemplate('{"temperature":0.3}');
+        await request(model, 'conversion-chat');
+        for (const kind of ['gateway', 'openrouter', 'openai-compatible'] as const) {
+            const obsolete = model;
+            const previous = child;
+            connection = await registry.update(connection.id, { kind });
+            child = router.getProvider(connection.id)!;
+            assert.notStrictEqual(child, previous);
+            assert.deepStrictEqual(await child.getTemplate(), { temperature: 0.3 });
+            await assert.rejects(request(obsolete), /changed|unavailable/);
+            calls.length = 0;
+            [model] = await models(connection);
+            assert.deepStrictEqual(await child.getPresets(), []);
+            assert.strictEqual(model.id, obsolete.id);
+            assert.notStrictEqual(model.version, obsolete.version);
+            await request(model, 'conversion-chat');
+            const post = calls.find(call => call.init?.method === 'POST')!;
+            const body = JSON.parse(String(post.init?.body));
+            assert.strictEqual(body.temperature, 0.3);
+            assert.strictEqual(body.session_id, kind === 'openai-compatible' ? undefined : 'copilot-chat:conversion-chat');
+            assert.strictEqual(new Headers(post.init?.headers).has('HTTP-Referer'), kind === 'openrouter');
+            assert.strictEqual(calls.some(call => call.url.includes('/presets?')), kind === 'openrouter');
+            assert.ok(calls.every(call => new Headers(call.init?.headers).get('Authorization') === 'Bearer same-key'));
+            assert.ok(calls.every(call => !/credits|auth\/key|models\/user/.test(call.url)));
+        }
+        const history = router.getSessionCosts(connection.id);
+        assert.strictEqual(history.length, 1);
+        assert.strictEqual(history[0].calls, 4);
+        assert.strictEqual(history[0].paid, 1);
+    });
+
+    test('an obsolete Gateway catalog cannot publish models after conversion to a generic adapter', async () => {
+        const connection = await gateway();
+        let release!: (response: Response) => void;
+        fetcher = async () => new Promise<Response>(resolve => { release = resolve; });
+        const pending = models(connection);
+        await tick();
+        const converted = await registry.update(connection.id, { kind: 'openai-compatible' });
+        release(Response.json({ data: [{ id: 'obsolete-gateway-model' }] }));
+        assert.deepStrictEqual(await pending, []);
+        fetcher = async () => new Response('unsupported', { status: 404 });
+        await registry.update(connection.id, { models: [{ id: 'generic-manual' }] });
+        const available = await models(converted);
+        assert.deepStrictEqual(available.map(model => (model as { upstreamModelId?: string }).upstreamModelId),
+            ['generic-manual']);
+    });
+
+    test('a turn already sent before API type conversion retains its captured endpoint and credential on retry', async () => {
+        const connection = await registry.add({ name: 'Converting', kind: 'openai-compatible',
+            baseUrl: 'https://old.test/v1' }, 'old-key');
+        const [model] = await models(connection);
+        let release!: (response: Response) => void;
+        let posts = 0;
+        fetcher = async url => url.endsWith('/models') ? Response.json({ data: [{ id: 'anthropic/shared' }] })
+            : ++posts === 1 ? new Promise<Response>(resolve => { release = resolve; }) : completed();
+        const pending = request(model, 'conversion-chat');
+        await tick();
+        const updated = await registry.update(connection.id, { kind: 'gateway', baseUrl: 'https://new.test/v1' }, 'new-key');
+        const [fresh] = await models(updated);
+        release(new Response('retry', { status: 503 }));
+        await pending;
+        const oldPosts = calls.filter(call => call.init?.method === 'POST');
+        assert.strictEqual(oldPosts.length, 2);
+        assert.ok(oldPosts.every(call => call.url === 'https://old.test/v1/chat/completions'));
+        assert.ok(oldPosts.every(call => new Headers(call.init?.headers).get('Authorization') === 'Bearer old-key'));
+        assert.ok(oldPosts.every(call => JSON.parse(String(call.init?.body)).session_id === undefined));
+        await assert.rejects(request(model), /changed|unavailable/);
+        await request(fresh, 'conversion-chat');
+        const last = calls.at(-1)!;
+        assert.strictEqual(last.url, 'https://new.test/v1/chat/completions');
+        assert.strictEqual(new Headers(last.init?.headers).get('Authorization'), 'Bearer new-key');
+        assert.strictEqual(JSON.parse(String(last.init?.body)).session_id, 'copilot-chat:conversion-chat');
+        assert.strictEqual(router.getSessionCosts(connection.id)[0].calls, 2);
+    });
+
+    test('persisted OpenRouter keys cannot leave a proxy adapter through discovery, inference or preset paths', async () => {
+        for (const kind of ['gateway', 'openai-compatible'] as const) {
+            const secrets = memorySecrets();
+            const state = memoryState();
+            const saved = new ConnectionRegistry(state, secrets);
+            await saved.initialize();
+            const connection = await saved.add({ name: 'Legacy proxy', kind,
+                baseUrl: 'https://proxy.test/v1' }, 'proxy-token');
+            let local = new ConnectionChatProvider(saved);
+            try {
+                const [model] = await local.provideLanguageModelChatInformation({ silent: true,
+                    configuration: { connectionId: connection.id } } as never, token);
+                const slot = (await secrets.keys()).find(key => key.startsWith(`connection.${connection.id}.key.`))!;
+                await secrets.store(slot, '  SK-OR-V1-LEGACY-TEST  ');
+                local.dispose();
+                local = new ConnectionChatProvider(saved);
+                const child = local.getProvider(connection.id)!;
+                calls.length = 0;
+                await assert.rejects(local.provideLanguageModelChatInformation({ silent: true,
+                    configuration: { connectionId: connection.id } } as never, token), /cannot be used with a proxy/);
+                await assert.rejects(local.provideLanguageModelChatResponse(model, [], {
+                    toolMode: vscode.LanguageModelChatToolMode.Auto,
+                }, { report() {} }, token), /cannot be used with a proxy/);
+                assert.deepStrictEqual(await child.getPresets(), []);
+                assert.strictEqual(await child.getPresetConfig('test-preset'), undefined);
+                assert.strictEqual(calls.length, 0);
+                assert.strictEqual(await saved.readKey(connection.id), '  SK-OR-V1-LEGACY-TEST  ');
+                await saved.clearKey(connection.id);
+                assert.strictEqual(await saved.readKey(connection.id), undefined);
+            } finally { local.dispose(); saved.dispose(); }
+        }
+    });
+
+    test('proxy setters and cached credential reads reject OpenRouter key syntax without network or storage writes', async () => {
+        for (const kind of ['gateway', 'openai-compatible'] as const) {
+            const secrets = memorySecrets();
+            await secrets.store('openrouterApiKey', 'proxy-token');
+            const child = new OpenRouterChatProvider(secrets, memoryState(), { kind, baseUrl: 'https://proxy.test/v1' });
+            try {
+                await assert.rejects(child.setKey('sk-or-'), /cannot be used with a proxy/);
+                assert.strictEqual(await secrets.get('openrouterApiKey'), 'proxy-token');
+                assert.strictEqual(await child.getKey(true), 'proxy-token');
+                (child as unknown as { key: string }).key = 'sk-or-v99-cache-test';
+                await assert.rejects(child.getKey(true), /cannot be used with a proxy/);
+                assert.strictEqual(calls.length, 0);
+            } finally { child.dispose(); }
+        }
+        for (const kind of ['openrouter', undefined] as const) {
+            const child = new OpenRouterChatProvider(memorySecrets(), memoryState(), { kind });
+            try {
+                await child.setKey('sk-or-v1-direct-test');
+                assert.strictEqual(await child.getKey(true), 'sk-or-v1-direct-test');
+            } finally { child.dispose(); }
+        }
+    });
     test('generic templates preserve explicit provider fields while live model/messages stay authoritative', async () => {
         const connection = await generic('Local'); const [model] = await models(connection);
         await router.getProvider(connection.id)!.setTemplate(JSON.stringify({ session_id: 'custom', cache_control: null,
@@ -155,17 +309,48 @@ suite('connection provider routing', () => {
         await registry.storeKey(connection.id, 'gateway-key');
         return connection;
     }
-    test('gateway discovery requires its own bearer key and never borrows a direct connection key', async () => {
+    test('keyless proxy discovery and inference omit Authorization and never borrow a direct connection key', async () => {
         await registry.storeKey(registry.list()[0].id, 'direct-key');
         const connection = await registry.add({ name: 'Gateway', kind: 'gateway', baseUrl: 'https://gateway.test/v1' });
-        await assert.rejects(models(connection), /Gateway bearer key not configured/);
-        assert.strictEqual(calls.length, 0);
+        const [keylessModel] = await models(connection);
+        await request(keylessModel, 'keyless-proxy-chat');
+        assert.ok(calls.some(call => call.url.endsWith('/models')));
+        assert.ok(calls.some(call => call.url.endsWith('/chat/completions')));
+        assert.ok(calls.every(call => !new Headers(call.init?.headers).has('Authorization')));
+        assert.strictEqual(JSON.parse(String(calls.find(call => call.init?.method === 'POST')!.init?.body)).session_id,
+            'copilot-chat:keyless-proxy-chat');
+        calls.length = 0;
         await registry.storeKey(connection.id, 'gateway-key');
         const [model] = await models(connection);
         await request(model);
         assert.ok(calls.every(call => new Headers(call.init?.headers).get('Authorization') === 'Bearer gateway-key'));
         assert.ok(calls.every(call => call.url.startsWith('https://gateway.test/v1/')));
         assert.ok(calls.every(call => call.init?.redirect === 'error'));
+    });
+
+    test('a keyless proxy that requires authentication fails closed instead of offering a manual fallback', async () => {
+        const connection = await registry.add({ name: 'Protected proxy', kind: 'gateway',
+            baseUrl: 'https://protected.test/v1' });
+        fetcher = async () => new Response('Authentication required', { status: 401 });
+        await assert.rejects(models(connection));
+        const child = router.getProvider(connection.id)!;
+        await assert.rejects(child.provideLanguageModelChatResponse({ id: 'unlisted' } as never, [], {
+            toolMode: vscode.LanguageModelChatToolMode.Auto,
+        }, { report() {} }, token));
+        assert.ok(calls.length >= 2);
+        assert.ok(calls.every(call => call.url === 'https://protected.test/v1/models'));
+        assert.ok(calls.every(call => !new Headers(call.init?.headers).has('Authorization')));
+        assert.strictEqual(await registry.readKey(connection.id), undefined);
+    });
+
+    test('direct OpenRouter discovery and inference remain key-gated', async () => {
+        const connection = registry.list()[0];
+        assert.deepStrictEqual(await models(connection), []);
+        const child = router.getProvider(connection.id)!;
+        await assert.rejects(child.provideLanguageModelChatResponse({ id: 'anthropic/shared' } as never, [], {
+            toolMode: vscode.LanguageModelChatToolMode.Auto,
+        }, { report() {} }, token), /OpenRouter key not configured/);
+        assert.strictEqual(calls.length, 0);
     });
     test('gateway preserves metadata and OpenRouter body features while using only gateway inference routes', async () => {
         const connection = await gateway();

@@ -2,7 +2,7 @@
 
 **English** | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
 
-A VS Code extension for **named OpenRouter and OpenAI-compatible connections** in Copilot Chat. Each connection has its own key, endpoint, request JSON, model group, and usage history. OpenRouter connections also track credit and support routing and presets through direct API calls.
+A VS Code extension for **OpenRouter in Copilot Chat**, through named direct connections or an OpenRouter proxy. Each connection has its own credential, request JSON, model group, and usage history. Direct connections also track credit and offer account presets.
 
 ## What it does
 
@@ -17,18 +17,21 @@ A VS Code extension for **named OpenRouter and OpenAI-compatible connections** i
 - **Used context size:** every turn forwards OpenRouter's own `usage` chunk (prompt/completion tokens, cache reads) to Copilot, so the context-usage ring shows *used / max tokens*.
 - **Session spend:** the panel's Session spend section accumulates what each chat session has cost in this window, with a collapsible per-session breakdown by provider and model (see below). Nothing is added to the chat transcript.
 - **One OpenRouter session per chat:** the `session_id` is the chat's own persisted id, so turns stay grouped in one OpenRouter session (sticky routing + the Logs → Sessions view) even after a window reload (a full restart is expected by design but was not exercised). A new chat is a new OpenRouter session. Background/internal calls (sub-agents, and Copilot's own utility flows) join the chat that triggered them; when there is no such chat, no `session_id` is sent, so no stray session is created.
-- **Gateway allowances:** choose the Gateway API type for a compatible gateway. Its tab shows Cheap and Default interval allowances separately, including unknown or stale readings.
-- **Status bar:** shows credit or gateway allowances for the selected panel connection.
+- **Status bar:** shows direct OpenRouter credit or local usage tracking for the selected connection.
 
-Host-managed fields are always replaced: `model`, `messages`, and `tools` come from Copilot, `stream` is always `true`, and a pasted `prompt` is dropped. OpenRouter and Gateway connections also manage `session_id`, caching, and the picker's reasoning options. Compatible endpoints receive the pasted request options without those automatic OpenRouter additions.
+Host-managed fields are always replaced: `model`, `messages`, and `tools` come from Copilot, `stream` is always `true`, and a pasted `prompt` is dropped. Both modes manage OpenRouter `session_id`, caching, and the picker's reasoning options. Proxies use their server's model catalog without manual additions or unrestricted fallback.
 
 ## The panel
 
 Open **OpenRouter for Copilot** from the status bar or the **OpenRouter: Manage provider** command.
 
-- **Settings → Keys:** add, name, enable, disable, or delete connections; set each endpoint and credential.
+- **Settings → Group management:** choose **Direct OpenRouter** or **OpenRouter proxy**, then edit its name, endpoint, key, and enabled state together,
+  then select **Save connection**. The key field shows a grey masked hint; leave it blank to keep the
+  saved key, or use **Clear key** to remove it. Connections can be saved without a key.
+  OpenRouter keys (`sk-or-...`) are accepted only for direct OpenRouter connections; a proxy must use
+  its own token or no key.
 - **Settings → shared settings:** output reserve, text sanitization, and usage refresh interval apply to all connections.
-- **Each named connection tab:** view its usage and session spend, set its budget/model visibility, and paste its request JSON or choose an OpenRouter preset.
+- **Each named connection tab:** view usage and session spend, and paste request JSON. Direct OpenRouter tabs also offer budget/model visibility controls and account presets.
 
 Panel selection controls editing and the status bar display. The model selected in Copilot determines which connection sends a request. Renaming a group may require selecting its model again.
 
@@ -38,10 +41,10 @@ This extension is distributed as a VSIX only: it uses proposed VS Code APIs (`ch
 
 1. Build: `npm install && npm run package` → `openrouter-copilot-request-credit-<version>.vsix`.
 2. VS Code → Extensions → "…" → **Install from VSIX…** → select the file.
-3. Open **Settings → Keys**, choose or add a connection, and set its credential (kept in VS Code SecretStorage).
+3. Open **Settings → Group management**, choose or add a connection, enter its key, and select **Save connection** (keys stay in VS Code SecretStorage).
 4. In Chat, pick a model from that connection's named group.
 
-Existing keys, request settings, context choices, and history migrate into one **OpenRouter** connection.
+Existing keys, request settings, context choices, and history migrate into one **OpenRouter: RC** connection.
 
 ## Usage
 
@@ -49,9 +52,9 @@ Existing keys, request settings, context choices, and history migrate into one *
 2. Open the intended connection's tab, paste it into **Custom request**, then select **Save request**.
 3. Requests using that connection follow its saved settings until you clear or replace them.
 
-For an OpenAI-compatible endpoint, set its API base URL (for example `https://example.com/v1`). HTTPS is required except for loopback HTTP servers. Such connections support streaming Chat Completions; Responses-only APIs are not supported. Manual model IDs and optional context/capability metadata can fill gaps in `/models`. Missing prices are shown as unknown. To request token counts from a server that supports it, paste `"stream_options": {"include_usage": true}` into the request JSON.
+Choose **Direct OpenRouter** for the fixed OpenRouter API URL and an OpenRouter key. Choose **OpenRouter proxy** for a configurable API base URL and the proxy's own token, or no key if authentication is not required. HTTPS is required except for loopback HTTP. Proxies must provide streaming Chat Completions and their authoritative model catalog; they never use direct OpenRouter credit or preset APIs.
 
-For a gateway providing the [allowance contract](docs/agent/gateway-allowance.md), choose **Gateway** and use its own bearer token. The server controls model availability; manual model additions are unavailable. Its separate allowances may share funds with direct connections. Private-CA endpoints require the extension host to trust the public CA certificate.
+Proxy usage is tracked locally from reported token counts and returned costs; missing cost remains unavailable. No proxy balance or budget API is assumed. Private-CA endpoints require the extension host to trust the public CA certificate. Older saved connections retain their behavior until explicitly saved as an OpenRouter proxy; that conversion removes manual model definitions while preserving connection identity and history.
 
 ## Settings
 
@@ -63,13 +66,13 @@ For a gateway providing the [allowance contract](docs/agent/gateway-allowance.md
 | `openrouterCopilot.outputReserveMinTokens` | `16384` | Lower bound for the output reserve in tokens: tiny windows still hold back a sane reply budget. |
 | `openrouterCopilot.outputReserveMaxTokens` | `262144` | Upper bound for the output reserve in tokens: a real published cap is capped here. Set both limits equal for a fixed reserve. |
 
-These shared settings are application-scoped; workspace settings cannot change them. Credit limits, reset periods, BYOK inclusion, and model visibility are now saved per connection in the panel. Their old VS Code settings are imported during migration and deprecated afterward. Direct OpenRouter connections always use OpenRouter's API; custom endpoints keep separate credentials.
+These shared settings are application-scoped; workspace settings cannot change them. Credit limits, reset periods, BYOK inclusion, and model visibility are now saved per connection in the panel. Their old VS Code settings are imported during migration and deprecated afterward. Direct OpenRouter connections always use OpenRouter's API; proxies keep separate credentials.
 
 **Output reserve:** the reply budget held back from the context window. When OpenRouter publishes no real max-completion cap (or only a synthetic placeholder), the extension reserves `outputReservePercent` of the window, clamped between the lower and upper token limits; a real published cap is trusted and only capped at the upper limit. The rest of the window is reported to Copilot as the model's input budget.
 
 ## Session spend, in the panel
 
-Each connection's **Session spend** section has its own history, persisted across reloads. Expanding a session shows provider/model routes. Compatible endpoints also show reported input/output tokens; missing cost is labeled unavailable, and mixed known/unknown cost stays visibly incomplete.
+Each connection's **Session spend** section has its own history, persisted across reloads. Expanding a session shows provider/model routes. Proxies also show reported input/output tokens; missing cost is labeled unavailable, and mixed known/unknown cost stays visibly incomplete.
 
 - **One entry per chat session** (its OpenRouter `session_id`): newest first, newest expanded. Click to collapse/expand — implemented with `<details>`, so it needs no script.
 - **Named like Copilot names it:** a row is labelled with the Copilot chat title when VS Code has one (read locally from VS Code's own chat-session store — nothing is sent to OpenRouter), otherwise a short id; each row also shows the session's last-update time.

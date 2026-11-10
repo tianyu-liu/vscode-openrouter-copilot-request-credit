@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import * as vscode from 'vscode';
 import { KEY_SECRET } from './storage';
+import { assertConnectionCredential } from './connectionCredentials';
 
 export type ConnectionKind = 'openrouter' | 'gateway' | 'openai-compatible';
 export interface ConnectionSettings {
@@ -36,6 +37,7 @@ export interface ConnectionInput {
     models?: ManualModel[];
 }
 export type ConnectionPatch = Partial<ConnectionInput>;
+
 export const LEGACY_CONNECTION_ID = 'default-openrouter';
 export const DEFAULT_CONNECTION_NAME = 'OpenRouter: RC';
 export const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
@@ -247,6 +249,13 @@ export class ConnectionRegistry implements vscode.Disposable {
                     throw new Error('Invalid saved connection cleanup data.');
                 }
                 this.data = clone(saved);
+                this.data.connections = this.data.connections.map(item => {
+                    const { proxyAllowance, ...connection } = item as ConnectionDefinition & { proxyAllowance?: unknown };
+                    return connection;
+                });
+                if (saved.connections.some(item => Object.hasOwn(item, 'proxyAllowance'))) {
+                    await this.persist(this.data);
+                }
             } else {
                 const primary = await this.strictSecret(KEY_SECRET);
                 const credential = primary ?? await this.strictSecret(LEGACY_SECRET);
@@ -278,35 +287,70 @@ export class ConnectionRegistry implements vscode.Disposable {
         }
     }
 
-    add(input: ConnectionInput): Promise<ConnectionDefinition> {
+    private async saveDefinition(next: ConnectionDefinition, apiKey: string | null | undefined): Promise<void> {
+        if (apiKey !== undefined && apiKey !== null && (typeof apiKey !== 'string' || !apiKey.trim())) {
+            throw new Error('A nonempty API key is required.');
+        }
+        const retainedSlot = this.require().credentials[next.id];
+        const effectiveKey = apiKey === null ? undefined : apiKey !== undefined ? apiKey
+            : next.kind !== 'openrouter' && retainedSlot ? await this.strictSecret(retainedSlot) : undefined;
+        assertConnectionCredential(next.kind, effectiveKey);
+        if (apiKey !== undefined) await this.cleanup();
+        let current = this.require();
+        let slot: string | undefined;
+        if (typeof apiKey === 'string') {
+            slot = secretSlot(next.id);
+            // Staging is recoverable without exposing the new definition or credential to readers.
+            await this.persist({ ...current, garbageSecrets: [...current.garbageSecrets, slot] });
+            await this.secrets.store(slot, apiKey.trim());
+            current = this.require();
+        }
+        const credentials = { ...current.credentials };
+        const oldSlot = credentials[next.id];
+        if (apiKey === null) delete credentials[next.id];
+        else if (slot) credentials[next.id] = slot;
+        const exists = current.connections.some(item => item.id === next.id);
+        await this.persist({
+            ...current, credentials,
+            connections: exists ? current.connections.map(item => item.id === next.id ? next : item)
+                : [...current.connections, next],
+            garbageSecrets: [...current.garbageSecrets.filter(item => item !== slot),
+                ...(apiKey !== undefined && oldSlot ? [oldSlot] : [])],
+        });
+        this.changed.fire();
+        if (apiKey !== undefined) await this.cleanup();
+    }
+
+    add(input: ConnectionInput, apiKey?: string | null): Promise<ConnectionDefinition> {
         const snapshot = clone(input);
         return this.enqueue(async () => {
-            const current = this.require();
+            this.require();
             const next = definition(snapshot, randomUUID(), 1);
             this.uniqueName(next);
-            await this.persist({ ...current, connections: [...current.connections, next] });
-            this.changed.fire();
+            await this.saveDefinition(next, apiKey);
             return clone(next);
         });
     }
 
-    update(id: string, patch: ConnectionPatch): Promise<ConnectionDefinition> {
+    update(id: string, patch: ConnectionPatch, apiKey?: string | null): Promise<ConnectionDefinition> {
         const snapshot = clone(patch);
         return this.enqueue(async () => {
             const current = this.require(id);
             const previous = current.connections.find(item => item.id === id)!;
-            if (snapshot.kind !== undefined && snapshot.kind !== previous.kind) {
-                throw new Error('Create a new connection to change its endpoint type.');
+            const kind = snapshot.kind === undefined ? previous.kind : snapshot.kind;
+            const inheritedModels = kind === 'gateway' && previous.kind !== 'gateway' ? undefined : previous.models;
+            const next = definition({
+                ...previous, ...snapshot, kind,
+                baseUrl: snapshot.baseUrl !== undefined ? snapshot.baseUrl
+                    : kind === 'openrouter' ? undefined : previous.baseUrl,
+                models: snapshot.models === undefined ? inheritedModels : snapshot.models,
+                settings: { ...previous.settings, ...snapshot.settings },
+            }, id, previous.revision + 1);
+            if (next.baseUrl !== previous.baseUrl && current.credentials[id] && apiKey === undefined) {
+                throw new Error('Clear or replace the connection credential when changing its endpoint.');
             }
-            if (snapshot.baseUrl !== undefined && normalizeBaseUrl(previous.kind, snapshot.baseUrl) !== previous.baseUrl
-                && current.credentials[id]) {
-                throw new Error('Clear the connection credential before changing its endpoint.');
-            }
-            const next = definition({ ...previous, ...snapshot, settings: { ...previous.settings, ...snapshot.settings } },
-                id, previous.revision + 1);
             this.uniqueName(next);
-            await this.persist({ ...current, connections: current.connections.map(item => item.id === id ? next : item) });
-            this.changed.fire();
+            await this.saveDefinition(next, apiKey);
             return clone(next);
         });
     }
@@ -336,8 +380,9 @@ export class ConnectionRegistry implements vscode.Disposable {
 
     storeKey(id: string, value: string): Promise<void> {
         return this.enqueue(async () => {
-            this.require(id);
+            const connection = this.require(id).connections.find(item => item.id === id)!;
             if (typeof value !== 'string' || !value.trim()) throw new Error('A nonempty API key is required.');
+            assertConnectionCredential(connection.kind, value);
             await this.cleanup();
             const current = this.require(id);
             const slot = secretSlot(id);

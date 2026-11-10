@@ -1,7 +1,7 @@
 import * as assert from 'assert';
 import * as vscode from 'vscode';
 import {
-    ConnectionRegistry, LEGACY_CONNECTION_ID, OPENROUTER_BASE_URL,
+    ConnectionRegistry, LEGACY_CONNECTION_ID, OPENROUTER_BASE_URL, type ConnectionKind,
 } from '../../connections';
 import { clearStoredKey, readKey, storeKey } from '../../storage';
 
@@ -220,6 +220,112 @@ suite('connection registry', () => {
         registry.dispose();
     });
 
+    test('a combined add snapshots metadata and commits its key with one visible connection change', async () => {
+        const data = fixture('sk-existing');
+        const registry = new ConnectionRegistry(data.state, data.secrets);
+        await registry.initialize();
+        const snapshots: Array<{ name: string; enabled: boolean; slot?: string }> = [];
+        registry.onDidChange(() => {
+            const added = registry.list().find(item => item.id !== LEGACY_CONNECTION_ID)!;
+            const saved = data.values.get(REGISTRY) as { credentials: Record<string, string> };
+            snapshots.push({ name: added.name, enabled: added.enabled, slot: saved.credentials[added.id] });
+        });
+        const input = { name: 'Combined', kind: 'openrouter' as const, enabled: false,
+            settings: { creditLimit: 12 } };
+        const saving = registry.add(input, '  sk-combined  ');
+        input.name = 'Mutated'; input.settings.creditLimit = 99;
+        const added = await saving;
+        assert.strictEqual(added.name, 'Combined');
+        assert.strictEqual(added.settings.creditLimit, 12);
+        assert.strictEqual(added.enabled, false);
+        assert.strictEqual(added.revision, 1);
+        assert.strictEqual(await registry.readKey(added.id), 'sk-combined');
+        assert.strictEqual(await registry.readKey(LEGACY_CONNECTION_ID), 'sk-existing');
+        assert.strictEqual(snapshots.length, 1);
+        assert.deepStrictEqual(snapshots[0], { name: 'Combined', enabled: false, slot: snapshots[0].slot });
+        assert.ok(snapshots[0].slot);
+        registry.dispose();
+    });
+
+    test('combined endpoint and credential saves expose only the matching key and advance one revision', async () => {
+        const data = fixture('sk-other');
+        const registry = new ConnectionRegistry(data.state, data.secrets);
+        await registry.initialize();
+        const custom = await registry.add({ name: 'Custom', kind: 'openai-compatible',
+            baseUrl: 'https://one.test/v1' }, 'sk-private');
+        const observed: Array<{ baseUrl: string; key: string | undefined }> = [];
+        registry.onDidChange(() => {
+            const connection = registry.get(custom.id)!;
+            const saved = data.values.get(REGISTRY) as { credentials: Record<string, string> };
+            observed.push({ baseUrl: connection.baseUrl, key: data.credentials.get(saved.credentials[custom.id]) });
+        });
+        const patch = { name: 'Renamed', baseUrl: 'https://two.test/v1', enabled: false,
+            models: [{ id: 'fresh-model' }] };
+        const saving = registry.update(custom.id, patch, ' sk-replacement ');
+        patch.name = 'Mutated'; patch.models[0].id = 'mutated-model';
+        const updated = await saving;
+        assert.strictEqual(updated.name, 'Renamed');
+        assert.strictEqual(updated.models![0].id, 'fresh-model');
+        assert.strictEqual(updated.enabled, false);
+        assert.strictEqual(updated.revision, custom.revision + 1);
+        assert.deepStrictEqual(observed, [{ baseUrl: 'https://two.test/v1', key: 'sk-replacement' }]);
+        await registry.update(custom.id, { baseUrl: 'https://three.test/v1' }, null);
+        assert.strictEqual(await registry.readKey(custom.id), undefined);
+        assert.deepStrictEqual(observed[1], { baseUrl: 'https://three.test/v1', key: undefined });
+        assert.strictEqual(await registry.readKey(LEGACY_CONNECTION_ID), 'sk-other');
+        await registry.update(custom.id, { name: 'Without key' });
+        assert.strictEqual(await registry.readKey(custom.id), undefined);
+        registry.dispose();
+    });
+
+    test('failed combined credential writes preserve the entire previous definition and key', async () => {
+        for (const adding of [false, true]) {
+            for (let step = 1; step <= 3; step++) {
+                const data = fixture('sk-other');
+                const registry = new ConnectionRegistry(data.state, data.secrets);
+                await registry.initialize();
+                const custom = await registry.add({ name: 'Custom', kind: 'openai-compatible',
+                    baseUrl: 'https://one.test/v1' }, 'sk-private');
+                let events = 0;
+                registry.onDidChange(() => events++);
+                data.failure.at = data.calls.length + step;
+                const input = { name: 'Changed', kind: 'openai-compatible' as const,
+                    baseUrl: 'https://two.test/v1', enabled: false, settings: { creditLimit: 20 } };
+                await assert.rejects(adding ? registry.add(input, 'sk-new')
+                    : registry.update(custom.id, input, 'sk-new'), /Injected failure/);
+                data.failure.at = -1;
+                assert.deepStrictEqual(registry.get(custom.id), custom);
+                assert.strictEqual(registry.list().length, 2);
+                assert.strictEqual(await registry.readKey(custom.id), 'sk-private');
+                assert.strictEqual(events, 0);
+                await registry.initialize();
+                assert.strictEqual(data.credentials.size, 2);
+                registry.dispose();
+                const recovered = new ConnectionRegistry(data.state, data.secrets);
+                await recovered.initialize();
+                assert.deepStrictEqual(recovered.get(custom.id), custom);
+                assert.strictEqual(await recovered.readKey(custom.id), 'sk-private');
+                recovered.dispose();
+            }
+        }
+    });
+
+    test('combined saves validate all metadata and key actions before writing secrets', async () => {
+        const data = fixture('sk-original');
+        const registry = new ConnectionRegistry(data.state, data.secrets);
+        await registry.initialize();
+        const before = data.calls.length;
+        await assert.rejects(registry.add({ name: 'Invalid', kind: 'openrouter', enabled: 'yes' as never }, 'sk-new'));
+        await assert.rejects(registry.update(LEGACY_CONNECTION_ID, { name: '' }, 'sk-new'));
+        await assert.rejects(registry.update(LEGACY_CONNECTION_ID, { settings: { creditLimit: -1 } }, null));
+        await assert.rejects(registry.update(LEGACY_CONNECTION_ID, { name: 'Changed' }, '  '), /nonempty API key/);
+        await assert.rejects(registry.add({ name: 'New', kind: 'openrouter' }, 1 as never), /nonempty API key/);
+        assert.deepStrictEqual(data.calls.slice(before), []);
+        assert.strictEqual(await registry.readKey(LEGACY_CONNECTION_ID), 'sk-original');
+        assert.strictEqual(registry.get(LEGACY_CONNECTION_ID)!.revision, 1);
+        registry.dispose();
+    });
+
     test('failed rotations preserve the previously committed key and reclaim staging slots on retry', async () => {
         // Rotation performs: staging metadata, secret store, final metadata, old secret delete, cleanup metadata.
         for (let step = 1; step <= 5; step++) {
@@ -378,10 +484,269 @@ suite('connection registry', () => {
         const custom = await registry.add({ name: 'Custom', kind: 'openai-compatible', baseUrl: 'https://one.test/v1' });
         await registry.storeKey(custom.id, 'sk-private');
         await assert.rejects(registry.update(custom.id, { baseUrl: 'https://two.test/v1' }), /Clear.*credential/);
-        await assert.rejects(registry.update(custom.id, { kind: 'openrouter' }), /endpoint type/);
+        await assert.rejects(registry.update(custom.id, { kind: 'openrouter' }), /Clear.*credential/);
         await registry.clearKey(custom.id);
         await registry.update(custom.id, { baseUrl: 'https://two.test/v1' });
         assert.strictEqual(await registry.readKey(custom.id), undefined);
+        registry.dispose();
+    });
+
+    test('all API type conversions preserve permanent identity, same-endpoint keys and scoped state', async () => {
+        const kinds: ConnectionKind[] = ['openrouter', 'gateway', 'openai-compatible'];
+        for (const from of kinds) {
+            for (const to of kinds.filter(kind => kind !== from)) {
+                const data = fixture();
+                const registry = new ConnectionRegistry(data.state, data.secrets);
+                await registry.initialize();
+                const connection = await registry.add({ name: 'Converting', kind: from,
+                    baseUrl: OPENROUTER_BASE_URL, settings: { creditLimit: 23 }, enabled: false }, 'retained-key');
+                const scoped = registry.stateFor(connection.id);
+                await scoped.update('sessionCosts', { session: 2 });
+                await scoped.update('parentSession', { id: 'parent' });
+                await scoped.update('requestTemplate', { provider: { only: ['example'] } });
+                await scoped.update('contextCaps', { model: 16384 });
+                let changes = 0;
+                registry.onDidChange(() => changes++);
+                const updated = await registry.update(connection.id, { kind: to });
+                assert.strictEqual(updated.kind, to);
+                assert.strictEqual(updated.id, connection.id);
+                assert.strictEqual(updated.baseUrl, OPENROUTER_BASE_URL);
+                assert.strictEqual(updated.name, connection.name);
+                assert.deepStrictEqual(updated.settings, connection.settings);
+                assert.strictEqual(updated.enabled, false);
+                assert.strictEqual(updated.revision, connection.revision + 1);
+                assert.strictEqual(changes, 1);
+                assert.strictEqual(await registry.readKey(connection.id), 'retained-key');
+                assert.deepStrictEqual(scoped.get('sessionCosts'), { session: 2 });
+                assert.deepStrictEqual(scoped.get('parentSession'), { id: 'parent' });
+                assert.deepStrictEqual(scoped.get('requestTemplate'), { provider: { only: ['example'] } });
+                assert.deepStrictEqual(scoped.get('contextCaps'), { model: 16384 });
+                registry.dispose();
+                const restarted = new ConnectionRegistry(data.state, data.secrets);
+                await restarted.initialize();
+                assert.deepStrictEqual(restarted.get(connection.id), updated);
+                assert.strictEqual(await restarted.readKey(connection.id), 'retained-key');
+                restarted.dispose();
+            }
+        }
+    });
+
+    test('API type conversion validates endpoint and credential replacement together', async () => {
+        const data = fixture();
+        const registry = new ConnectionRegistry(data.state, data.secrets);
+        await registry.initialize();
+        const custom = await registry.add({ name: 'Custom', kind: 'openai-compatible',
+            baseUrl: 'https://custom.test/v1' }, 'custom-key');
+        await assert.rejects(registry.update(custom.id, { kind: 'openrouter' }), /Clear.*credential/);
+        assert.deepStrictEqual(registry.get(custom.id), custom);
+        assert.strictEqual(await registry.readKey(custom.id), 'custom-key');
+        const direct = await registry.update(custom.id, { kind: 'openrouter' }, 'direct-key');
+        assert.strictEqual(direct.baseUrl, OPENROUTER_BASE_URL);
+        assert.strictEqual(await registry.readKey(custom.id), 'direct-key');
+        await assert.rejects(registry.update(custom.id, {
+            kind: 'gateway', baseUrl: 'https://gateway.test/v1',
+        }), /Clear.*credential/);
+        const gateway = await registry.update(custom.id, {
+            kind: 'gateway', baseUrl: 'https://gateway.test/v1',
+        }, null);
+        assert.strictEqual(gateway.baseUrl, 'https://gateway.test/v1');
+        assert.strictEqual(await registry.readKey(custom.id), undefined);
+        const restored = await registry.update(custom.id, { kind: 'openrouter' });
+        assert.strictEqual(restored.baseUrl, OPENROUTER_BASE_URL);
+        assert.strictEqual(restored.revision, custom.revision + 3);
+        const beforeInvalid = data.calls.length;
+        await assert.rejects(registry.update(custom.id, {
+            kind: 'openrouter', baseUrl: 'https://other.test/v1',
+        }, 'rejected-key'), /OpenRouter API endpoint/);
+        await assert.rejects(registry.update(custom.id, {
+            kind: 'gateway', baseUrl: 'http://insecure.test/v1',
+        }, 'rejected-key'), /HTTPS/);
+        await assert.rejects(registry.update(custom.id, { kind: 'invalid' as ConnectionKind }, 'rejected-key'));
+        assert.deepStrictEqual(data.calls.slice(beforeInvalid), []);
+        assert.deepStrictEqual(registry.get(custom.id), restored);
+        registry.dispose();
+    });
+
+    test('all API types can be created and converted without saving a key', async () => {
+        const data = fixture();
+        const registry = new ConnectionRegistry(data.state, data.secrets);
+        await registry.initialize();
+        const kinds: ConnectionKind[] = ['openrouter', 'gateway', 'openai-compatible'];
+        for (const kind of kinds) {
+            let connection = await registry.add({ name: `Keyless ${kind}`, kind,
+                baseUrl: kind === 'openrouter' ? undefined : 'https://keyless.test/v1' });
+            assert.strictEqual(await registry.readKey(connection.id), undefined);
+            for (const target of kinds.filter(value => value !== kind)) {
+                connection = await registry.update(connection.id, { kind: target });
+                assert.strictEqual(connection.kind, target);
+                assert.strictEqual(await registry.readKey(connection.id), undefined);
+            }
+        }
+        assert.deepStrictEqual([...data.credentials], []);
+        registry.dispose();
+    });
+
+    test('conversion into Gateway drops inherited manual models and rejects explicit unsupported definitions', async () => {
+        const data = fixture();
+        const registry = new ConnectionRegistry(data.state, data.secrets);
+        await registry.initialize();
+        const custom = await registry.add({ name: 'Custom', kind: 'openai-compatible',
+            baseUrl: 'https://custom.test/v1', models: [{ id: 'manual-model', toolCalling: true }] }, 'custom-key');
+        await assert.rejects(registry.update(custom.id, {
+            kind: 'gateway', models: [{ id: 'bypass' }],
+        }, 'rejected-key'), /filtered catalog/);
+        assert.deepStrictEqual(registry.get(custom.id), custom);
+        assert.strictEqual(await registry.readKey(custom.id), 'custom-key');
+        const converted = await registry.update(custom.id, { kind: 'gateway' });
+        assert.strictEqual(converted.models, undefined);
+        assert.strictEqual(converted.revision, custom.revision + 1);
+        assert.strictEqual(await registry.readKey(custom.id), 'custom-key');
+        const generic = await registry.update(custom.id, { kind: 'openai-compatible' });
+        assert.strictEqual(generic.models, undefined, 'removed manual models cannot reappear after changing type again');
+        await registry.update(custom.id, { models: [{ id: 'new-manual' }] });
+        assert.strictEqual(registry.get(custom.id)!.models![0].id, 'new-manual');
+        registry.dispose();
+    });
+
+    test('proxy credential guards reject combined and legacy saves before any committed mutation', async () => {
+        const data = fixture();
+        const registry = new ConnectionRegistry(data.state, data.secrets);
+        await registry.initialize();
+        const direct = await registry.add({ name: 'Direct', kind: 'openrouter' }, 'sk-or-v1-direct-test');
+        let events = 0;
+        registry.onDidChange(() => events++);
+        for (const kind of ['gateway', 'openai-compatible'] as const) {
+            const before = copy([...data.values]);
+            const beforeKeys = [...data.credentials];
+            const beforeEvents = events;
+            const beforeCalls = data.calls.length;
+            await assert.rejects(registry.add({ name: 'Rejected', kind, baseUrl: 'https://proxy.test/v1' },
+                '  SK-OR-  '), /cannot be used with a proxy/);
+            await assert.rejects(registry.update(direct.id, { kind }), /cannot be used with a proxy/);
+            await assert.rejects(registry.update(direct.id, { kind, name: 'Rejected' },
+                'sk-or-v99-test'), /cannot be used with a proxy/);
+            assert.deepStrictEqual([...data.values], before);
+            assert.deepStrictEqual([...data.credentials], beforeKeys);
+            assert.strictEqual(events, beforeEvents);
+            assert.ok(data.calls.slice(beforeCalls).every(call => call.startsWith('secret.get:')));
+            assert.deepStrictEqual(registry.get(direct.id), direct);
+            const proxy = await registry.add({ name: kind, kind, baseUrl: 'https://proxy.test/v1' }, 'proxy-token');
+            const proxyBefore = copy([...data.values]);
+            const keysBefore = [...data.credentials];
+            const eventsBefore = events;
+            await assert.rejects(registry.storeKey(proxy.id, 'sk-or-v1-test'), /cannot be used with a proxy/);
+            await assert.rejects(registry.update(proxy.id, { name: 'Rejected' },
+                'sk-or-v1-test'), /cannot be used with a proxy/);
+            assert.deepStrictEqual([...data.values], proxyBefore);
+            assert.deepStrictEqual([...data.credentials], keysBefore);
+            assert.strictEqual(events, eventsBefore);
+            assert.strictEqual(await registry.readKey(proxy.id), 'proxy-token');
+        }
+        const cleared = await registry.update(direct.id, { kind: 'gateway' }, null);
+        assert.strictEqual(cleared.kind, 'gateway');
+        assert.strictEqual(await registry.readKey(direct.id), undefined);
+        registry.dispose();
+    });
+
+    test('prohibited persisted proxy keys remain readable for recovery but cannot be retained in another save', async () => {
+        for (const kind of ['gateway', 'openai-compatible'] as const) {
+            const data = fixture();
+            const registry = new ConnectionRegistry(data.state, data.secrets);
+            await registry.initialize();
+            const proxy = await registry.add({ name: 'Legacy proxy', kind, baseUrl: 'https://proxy.test/v1' }, 'proxy-token');
+            const saved = data.values.get(REGISTRY) as { credentials: Record<string, string> };
+            data.credentials.set(saved.credentials[proxy.id], 'sk-or-v1-legacy-test');
+            assert.strictEqual(await registry.readKey(proxy.id), 'sk-or-v1-legacy-test');
+            const before = copy([...data.values]);
+            await assert.rejects(registry.update(proxy.id, { name: 'Rejected' }), /cannot be used with a proxy/);
+            assert.deepStrictEqual([...data.values], before);
+            assert.strictEqual(await registry.readKey(proxy.id), 'sk-or-v1-legacy-test');
+            await registry.clearKey(proxy.id);
+            await registry.update(proxy.id, { name: 'Recovered' });
+            assert.strictEqual(await registry.readKey(proxy.id), undefined);
+            registry.dispose();
+        }
+    });
+
+    test('new connections and updates discard obsolete allowance input', async () => {
+        const data = fixture();
+        const registry = new ConnectionRegistry(data.state, data.secrets);
+        await registry.initialize();
+        for (const kind of ['openrouter', 'gateway', 'openai-compatible'] as const) {
+            const input = { name: kind, kind, baseUrl: OPENROUTER_BASE_URL, proxyAllowance: true };
+            const connection = await registry.add(input, 'connection-token');
+            assert.strictEqual(Object.hasOwn(connection, 'proxyAllowance'), false);
+            const patch = { name: `${kind} renamed`, proxyAllowance: true };
+            const updated = await registry.update(connection.id, patch);
+            assert.strictEqual(Object.hasOwn(updated, 'proxyAllowance'), false);
+            assert.strictEqual(await registry.readKey(connection.id), 'connection-token');
+        }
+        registry.dispose();
+    });
+
+    test('loading obsolete allowance flags removes only that field and preserves every connection and scoped value', async () => {
+        for (const obsolete of [true, false, 'old-value', null]) {
+            const data = fixture();
+            const initial = new ConnectionRegistry(data.state, data.secrets);
+            await initial.initialize();
+            for (const kind of ['gateway', 'openai-compatible'] as const) {
+                await initial.add({ name: kind, kind, baseUrl: 'https://proxy.test/v1' }, `${kind}-token`);
+            }
+            for (const connection of initial.list()) {
+                await initial.stateFor(connection.id).update('sessionCosts', { chat: 2 });
+                await initial.stateFor(connection.id).update('requestTemplate', { temperature: 0.3 });
+                await initial.stateFor(connection.id).update('contextCaps', { model: 16384 });
+            }
+            const before = initial.list();
+            const beforeKeys = [...data.credentials];
+            initial.dispose();
+            const saved = data.values.get(REGISTRY) as { connections: Array<{ proxyAllowance?: unknown }> };
+            for (const connection of saved.connections) connection.proxyAllowance = obsolete;
+            const registry = new ConnectionRegistry(data.state, data.secrets);
+            let changes = 0;
+            registry.onDidChange(() => changes++);
+            await registry.initialize();
+            assert.deepStrictEqual(registry.list(), before);
+            assert.deepStrictEqual([...data.credentials], beforeKeys);
+            assert.strictEqual(changes, 0);
+            for (const connection of registry.list()) {
+                assert.strictEqual(Object.hasOwn(connection, 'proxyAllowance'), false);
+                assert.deepStrictEqual(registry.stateFor(connection.id).get('sessionCosts'), { chat: 2 });
+                assert.deepStrictEqual(registry.stateFor(connection.id).get('requestTemplate'), { temperature: 0.3 });
+                assert.deepStrictEqual(registry.stateFor(connection.id).get('contextCaps'), { model: 16384 });
+            }
+            const normalized = data.values.get(REGISTRY) as { connections: object[] };
+            assert.ok(normalized.connections.every(connection => !Object.hasOwn(connection, 'proxyAllowance')));
+            registry.dispose();
+            const reopened = new ConnectionRegistry(data.state, data.secrets);
+            await reopened.initialize();
+            assert.deepStrictEqual(reopened.list(), before);
+            assert.deepStrictEqual([...data.credentials], beforeKeys);
+            reopened.dispose();
+        }
+    });
+
+    test('a failed obsolete-field cleanup can retry without changing saved identity, keys or history', async () => {
+        const data = fixture();
+        const initial = new ConnectionRegistry(data.state, data.secrets);
+        await initial.initialize();
+        const proxy = await initial.add({ name: 'Proxy', kind: 'gateway', baseUrl: 'https://proxy.test/v1' }, 'proxy-token');
+        await initial.stateFor(proxy.id).update('sessionCosts', { chat: 3 });
+        initial.dispose();
+        const saved = data.values.get(REGISTRY) as { connections: Array<{ proxyAllowance?: boolean }> };
+        for (const connection of saved.connections) connection.proxyAllowance = true;
+        const before = copy([...data.values]);
+        const beforeKeys = [...data.credentials];
+        data.failure.at = data.calls.length + 2;
+        const registry = new ConnectionRegistry(data.state, data.secrets);
+        await assert.rejects(registry.initialize(), /Injected failure/);
+        assert.deepStrictEqual([...data.values], before);
+        assert.deepStrictEqual([...data.credentials], beforeKeys);
+        data.failure.at = -1;
+        await registry.initialize();
+        assert.deepStrictEqual(registry.get(proxy.id), proxy);
+        assert.strictEqual(await registry.readKey(proxy.id), 'proxy-token');
+        assert.deepStrictEqual(registry.stateFor(proxy.id).get('sessionCosts'), { chat: 3 });
         registry.dispose();
     });
 });

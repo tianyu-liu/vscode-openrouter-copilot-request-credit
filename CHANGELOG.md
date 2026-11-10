@@ -2,17 +2,23 @@
 
 ## Unreleased
 
-- Add named OpenRouter and OpenAI-compatible connections with isolated credentials, request settings,
+- Combine connection details, enabled state, and API key management in one group editor with a single
+  **Save connection** action. Show saved keys as masked field hints, retain them on blank input, keep
+  a separate **Clear key** action, and allow keyless saves. API type remains editable; OpenRouter fixes
+  and disables its base URL.
+- Reject OpenRouter key syntax on non-direct connections during saves and before authenticated network
+  requests, including retained keys and legacy saved credentials. Proxy tokens and keyless saves remain allowed.
+- Add named direct OpenRouter and OpenRouter proxy connections with isolated credentials, request settings,
   model identities, and session accounting; migrate the existing setup into one default connection.
 - Regroup the panel into shared **Settings** and connection-name tabs. Settings manages connections,
   output reserve, refresh frequency, and text sanitization; each connection tab owns usage and requests.
-- Support generic Chat Completions endpoints, manual model metadata, unknown pricing, and token-only
-  usage history. Keep direct credit and preset APIs scoped to OpenRouter.
+- Offer exactly two connection modes: **Direct OpenRouter** and **OpenRouter proxy**. Proxies retain
+  OpenRouter request fields and use the server catalog without manual additions or unrestricted fallback.
+  Preserve older compatible connections until explicitly converted; retain unknown pricing and token-only usage.
 - Block request redirects and stale connection selection; preserve captured request settings across retries.
-- Add an explicit Gateway connection type with isolated bearer authentication, filtered discovery,
-  OpenRouter request features, and separate Cheap/Default interval allowance displays. Preserve unknown
-  and stale readings; never combine lane budgets or fall back to an unrestricted model catalog.
-- Use conservative limits and capabilities for incomplete gateway metadata, and wrap session summaries
+- Remove custom proxy allowance APIs and configuration. Proxy usage uses locally tracked token counts
+  and returned costs only; direct credit/preset APIs remain direct-only.
+- Use conservative limits and capabilities for incomplete proxy metadata, and wrap session summaries
   on narrow panels.
 - Use `0.5.0-test.3` for this development build.
 - Replace the status bar's `OR` label with the official OpenRouter glyph, using Ink for light themes

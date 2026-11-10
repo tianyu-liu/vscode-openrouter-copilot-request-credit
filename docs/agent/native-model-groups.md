@@ -113,5 +113,5 @@ and named tabs, isolated key rotation and template saves, renamed a native group
 after restart, and streamed a generic response through a real `vscode.lm` model handle. The captured
 fixture request used the intended endpoint, rotated key, original upstream ID, and saved template.
 
-Authenticated live streaming/tools, gateway allowances, and a packaged production rollout remain
-release verification work. Fixture success does not establish live endpoint compatibility.
+A packaged production rollout remains release verification work. Later live streaming/tool checks are
+recorded in [verification status](verification.md); fixture success alone does not establish live endpoint compatibility.

@@ -18,7 +18,6 @@ import {
 } from './connections';
 import { ConnectionChatProvider } from './connectionProvider';
 import { NativeGroupManager } from './nativeGroups';
-import { GatewayAllowanceRefreshState, refreshGatewayAllowanceState } from './gatewayAllowanceRefresh';
 
 export { readConfig } from './panel';
 
@@ -45,9 +44,11 @@ const CONNECTION_MESSAGES = new Set([
     'setConnectionEnabled', 'saveManualModels',
 ]);
 
-interface CreditState extends GatewayAllowanceRefreshState {
+interface CreditState {
     info?: KeyInfo;
     accountCredits?: AccountCredits;
+    fetchedAt?: Date;
+    error?: string;
     currentRun?: { controller: AbortController; done: Promise<KeyInfo | undefined> };
 }
 const connectionCredits = new Map<string, CreditState>();
@@ -236,10 +237,12 @@ async function updatePanel(
     if (stale()) return;
     const template = await activeProvider?.getTemplate();
     if (stale()) return;
-    const presets = activeProvider ? await activeProvider.getPresets() : [];
+    const directApi = !connection || connection.kind === 'openrouter';
+    const presets = directApi && activeProvider ? await activeProvider.getPresets() : [];
     if (stale()) return;
     const presetSlug = templatePresetSlug(template);
-    const presetConfig = presetSlug && activeProvider ? await activeProvider.getPresetConfig(presetSlug) : undefined;
+    const presetConfig = directApi && presetSlug && activeProvider
+        ? await activeProvider.getPresetConfig(presetSlug) : undefined;
     if (stale()) return;
     const sessions = await withSessionTitles(id ? router?.getSessionCosts(id) ?? [] : getSessionCosts());
     if (stale()) return;
@@ -255,8 +258,6 @@ async function updatePanel(
         maskedKey: key ? maskKey(key) : undefined,
         accountCredits: state ? state.accountCredits : legacyCredits.accountCredits,
         errorMessage: state ? state.error : legacyCredits.error,
-        gatewayAllowance: state?.gatewayAllowance,
-        gatewayAllowanceStale: state?.gatewayAllowanceStale,
         template,
         presets,
         presetConfig,
@@ -309,23 +310,29 @@ export async function updateConnectionWithGroup(
     store: Pick<ConnectionRegistry, 'get' | 'update'>,
     groups: Pick<NativeGroupManager, 'update'>,
     id: string,
-    patch: ConnectionPatch
+    patch: ConnectionPatch,
+    apiKey?: string | null
 ): Promise<ConnectionDefinition> {
     const before = store.get(id);
     if (!before) throw new Error(t('Connection no longer exists.'));
-    const updated = await store.update(id, patch);
-    if (updated.name !== before.name) {
-        try {
-            await groups.update(updated);
-        } catch (error) {
-            await store.update(id, {
-                name: before.name, kind: before.kind, baseUrl: before.baseUrl,
-                enabled: before.enabled, settings: before.settings, models: before.models,
-            });
-            throw error;
+    const snapshot: ConnectionPatch = JSON.parse(JSON.stringify(patch));
+    const name = typeof snapshot.name === 'string' ? snapshot.name.trim() : before.name;
+    const rename = name.length > 0 && name !== before.name;
+    if (rename) await groups.update({ id, name });
+    try {
+        return await store.update(id, snapshot, apiKey);
+    } catch (error) {
+        // Cleanup may fail after the definition and credential have already committed together.
+        if (rename && store.get(id)?.name === before.name) {
+            try {
+                await groups.update(before);
+            } catch (rollbackError) {
+                throw new AggregateError([error, rollbackError],
+                    'Connection save failed and the native model group name could not be restored.');
+            }
         }
+        throw error;
     }
-    return updated;
 }
 
 function createConnectionPanelDeps(secrets: vscode.SecretStorage, id: string | undefined): PanelDeps {
@@ -369,8 +376,8 @@ function createConnectionPanelDeps(secrets: vscode.SecretStorage, id: string | u
             }
         },
         selectConnection: selected => selectConnection(selected, secrets),
-        addConnection: async input => {
-            const connection = await store.add(input);
+        addConnection: async (input, apiKey) => {
+            const connection = await store.add(input, apiKey);
             try {
                 await nativeGroups?.add(connection);
             } catch (error) {
@@ -381,11 +388,11 @@ function createConnectionPanelDeps(secrets: vscode.SecretStorage, id: string | u
             }
             await selectConnection(connection.id, secrets);
         },
-        updateConnection: async (connectionId, patch) => {
+        updateConnection: async (connectionId, patch, apiKey) => {
             const before = store.get(connectionId);
             if (!before) throw new Error(t('Connection no longer exists.'));
             try {
-                const updated = await updateConnectionWithGroup(store, nativeGroups!, connectionId, patch);
+                const updated = await updateConnectionWithGroup(store, nativeGroups!, connectionId, patch, apiKey);
                 if (updated.name !== before.name) {
                     void vscode.window.showInformationMessage(t(
                         'Connection renamed. Select its model again in Copilot; saved selections may use the old group name.'
@@ -502,17 +509,17 @@ async function doRefreshRun(
         if (stale() || (connectionId !== undefined && selectedConnectionId !== connectionId)) return;
         await updatePanel(secrets, state.info, signal, key);
     };
-    if (connection && (!connection.enabled || connection.kind === 'openai-compatible')) {
+    if (connection && (!connection.enabled || connection.kind !== 'openrouter')) {
         state.info = undefined;
         state.accountCredits = undefined;
+        state.fetchedAt = undefined;
         state.error = undefined;
         status(connection.enabled ? t('Usage tracked') : t('Disabled'),
             connection.enabled ? t('Token usage and reported cost are tracked per connection.') : t('Connection disabled.'));
         await render();
         return undefined;
     }
-    status('$(sync~spin) …', connection?.kind === 'gateway'
-        ? t('Refreshing gateway allowance…') : t('Refreshing OpenRouter key info…'));
+    status('$(sync~spin) …', t('Refreshing OpenRouter key info…'));
     let apiKey: string | undefined;
     try {
         apiKey = connectionId ? await registry?.readKey(connectionId) : await readKey(secrets);
@@ -522,32 +529,9 @@ async function doRefreshRun(
             state.fetchedAt = undefined;
             state.accountCredits = undefined;
             state.error = undefined;
-            state.gatewayAllowance = undefined;
-            state.gatewayAllowanceStale = false;
             if (connectionId) status(t('$(key) No key'), t('Open Settings in the panel to set this connection’s API key.'));
             else showNoKey();
             await render(null);
-            return undefined;
-        }
-        if (connection?.kind === 'gateway') {
-            const outcome = await refreshGatewayAllowanceState(state, {
-                baseUrl: connection.baseUrl, apiKey, signal, isCurrent: () => !stale(),
-            });
-            if (outcome === 'superseded') return undefined;
-            if (outcome === 'failed') state.error = t('Gateway allowance refresh failed.');
-            const allowance = state.gatewayAllowance;
-            const labels = { cheap: t('Cheap'), default: t('Default') };
-            const lanes = (['cheap', 'default'] as const).map(name => {
-                const lane = allowance?.[name];
-                const budget = lane?.status === 'reported' ? lane.effective_budget : undefined;
-                const remaining = budget?.remaining;
-                return `${labels[name]} ${remaining == null ? t('Unknown') : `$${remaining.toFixed(2)}`}`;
-            });
-            const staleLabel = state.gatewayAllowanceStale ? ` · ${t('Stale')}` : '';
-            status(`${lanes.join(' · ')}${staleLabel}`, state.error ?? t(
-                'Gateway allowances are separate. Open the panel for usage and reset details. Billing counters may lag.'
-            ));
-            await render(apiKey);
             return undefined;
         }
         const info = await fetchApi<KeyInfo>(apiKey, 'key', signal);

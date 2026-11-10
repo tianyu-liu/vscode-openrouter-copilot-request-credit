@@ -112,8 +112,8 @@ const HARNESS = `
                 const url = new URL(location.href);
                 url.searchParams.set('connection', m.connectionId);
                 location.href = url;
-            } else if (m.type !== 'saveKey') {
-                console.log('Preview action', m);
+            } else {
+                console.log('Preview action', m.type);
             }
         },
     });
@@ -125,19 +125,17 @@ function injectPreviewHarness(html) {
         .replace('<head>', `<head>${THEME_SHIM}${HARNESS}`);
 }
 
-// Review alternate gateway states with ?connection=gateway&allowance=partial|unknown|stale.
-function buildFixtures(selectedConnectionId = 'personal', allowanceState = 'reported') {
+function buildFixtures(selectedConnectionId = 'personal') {
     const settings = { creditLimit: 10, creditResetPeriod: 'daily', creditIncludeByok: true,
         hideUnavailableModels: true };
     const connections = [
-        { id: 'personal', name: 'Personal', kind: 'openrouter', baseUrl: 'https://openrouter.ai/api/v1',
+        { id: 'personal', name: 'OpenRouter: RC', kind: 'openrouter', baseUrl: 'https://openrouter.ai/api/v1',
             enabled: true, revision: 1, settings },
-        { id: 'work', name: 'Work', kind: 'openrouter', baseUrl: 'https://openrouter.ai/api/v1',
+        { id: 'work', name: 'OpenRouter: RC1', kind: 'openrouter', baseUrl: 'https://openrouter.ai/api/v1',
             enabled: true, revision: 1, settings: { ...settings, creditLimit: 50 } },
-        { id: 'local', name: 'Local', kind: 'openai-compatible', baseUrl: 'http://localhost:1234/v1',
-            enabled: true, revision: 1, settings,
-            models: [{ id: 'local-model', name: 'Local model', contextLength: 32768, toolCalling: true }] },
-        { id: 'gateway', name: 'Gateway', kind: 'gateway', baseUrl: 'https://gateway.example/v1',
+        { id: 'local', name: 'Local proxy', kind: 'gateway', baseUrl: 'http://localhost:1234/v1',
+            enabled: true, revision: 1, settings },
+        { id: 'gateway', name: 'Managed proxy', kind: 'gateway', baseUrl: 'https://gateway.example/v1',
             enabled: true, revision: 1, settings },
     ];
     const info = {
@@ -239,22 +237,6 @@ function buildFixtures(selectedConnectionId = 'personal', allowanceState = 'repo
         promptTokens: 1536, completionTokens: 256, cachedTokens: 512, calls: 2,
         byok: false, updatedAt: 1759569800000,
     };
-    const budget = { limit: null, remaining: null, reset: null, usage: 124.5,
-        resets_at: null, include_byok: true };
-    const lane = (effective) => ({ ...budget, status: 'reported', effective_budget: effective,
-        applicable_budgets: [effective], inherited_budgets: [effective] });
-    const gatewayAllowance = {
-        cheap: lane({ limit: 5, remaining: 3.75, reset: 'daily', usage: 1.25,
-            resets_at: '2026-10-29T00:00:00Z', include_byok: true }),
-        default: lane({ limit: 20, remaining: 12.5, reset: 'weekly', usage: 7.5,
-            resets_at: '2026-11-02T00:00:00Z', include_byok: true }),
-        fetched_at: '2026-10-28T10:00:00Z',
-    };
-    if (['partial', 'unknown'].includes(allowanceState)) {
-        gatewayAllowance.default = { ...budget, status: 'unknown', effective_budget: null,
-            applicable_budgets: [], inherited_budgets: [] };
-        if (allowanceState === 'unknown') gatewayAllowance.cheap = gatewayAllowance.default;
-    }
     return {
         connections,
         selectedConnectionId,
@@ -263,17 +245,13 @@ function buildFixtures(selectedConnectionId = 'personal', allowanceState = 'repo
         resetPeriod: 'daily',
         includeByok: true,
         refreshIntervalMinutes: 5,
-        fetchedAt: new Date(selectedConnectionId === 'gateway' ? '2026-10-28T10:00:01Z' : 1759570000000),
+        fetchedAt: ['local', 'gateway'].includes(selectedConnectionId) ? undefined : new Date(1759570000000),
         maskedKey: selectedConnectionId === 'local' ? undefined
             : selectedConnectionId === 'gateway' ? 'gateway-preview...1234' : 'sk-or-v1-preview...1234',
         accountCredits,
-        gatewayAllowance: selectedConnectionId === 'gateway' ? gatewayAllowance : undefined,
-        gatewayAllowanceStale: selectedConnectionId === 'gateway' && allowanceState === 'stale',
-        errorMessage: selectedConnectionId === 'gateway' && allowanceState === 'stale'
-            ? 'Gateway allowance refresh failed.' : undefined,
         template: ['local', 'gateway'].includes(selectedConnectionId) ? { temperature: 0.2 } : template,
-        presets: selectedConnectionId === 'local' ? undefined : presets,
-        presetConfig: selectedConnectionId === 'local' ? undefined : presetConfig,
+        presets: ['local', 'gateway'].includes(selectedConnectionId) ? undefined : presets,
+        presetConfig: ['local', 'gateway'].includes(selectedConnectionId) ? undefined : presetConfig,
         sessions: selectedConnectionId === 'local' ? [{
             ...localUsage, sessionId: 'copilot-chat:local-preview', title: 'Local coding session',
             routes: [{ ...localUsage, provider: 'Local', model: 'local-model' }],
@@ -514,9 +492,9 @@ ${LIVE_RELOAD_SCRIPT}
 </html>`;
 }
 
-function renderHtml(selectedConnectionId, allowanceState) {
+function renderHtml(selectedConnectionId) {
     const { renderPanelHtml } = freshRequire('panel.js');
-    return injectPreviewHarness(renderPanelHtml(buildFixtures(selectedConnectionId, allowanceState)));
+    return injectPreviewHarness(renderPanelHtml(buildFixtures(selectedConnectionId)));
 }
 
 function outMtime() {
@@ -538,7 +516,7 @@ http.createServer((req, res) => {
     }
     try {
         const html = url.pathname === '/model-info' ? renderModelInfoHtml()
-            : renderHtml(url.searchParams.get('connection') || 'personal', url.searchParams.get('allowance') || 'reported');
+            : renderHtml(url.searchParams.get('connection') || 'personal');
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
         res.end(html);
     } catch (error) {

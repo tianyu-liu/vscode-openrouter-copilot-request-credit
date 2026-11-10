@@ -1,155 +1,100 @@
-# Multi-provider endpoint update plan
+# Named OpenRouter connections update plan
 
 Status: in progress for **0.5.0**. Current development build: **0.5.0-test.3**.
+Checkpoint: **2026-11-10**, ready for independent probing and reassessment; release acceptance is incomplete.
+The filename is retained from the earlier multi-provider design; the supported product scope is
+OpenRouter access through exactly two visible modes: **Direct OpenRouter** and **OpenRouter proxy**.
 
-Implemented: recoverable connection migration, multiple OpenRouter connections, generic streaming
-Chat Completions endpoints, connection-scoped model IDs/accounting, the regrouped panel,
-explicit gateway allowance lanes, and conservative gateway discovery. The existing package/vendor
-identifiers are retained. The isolated grouping prototype remains available as
-`npm run test:groups`; see [native grouping verification](agent/native-model-groups.md).
+## Current design
 
-A normal isolated host also exercised the production panel, native groups, key rotation, per-connection
-template saves, rename, restart persistence, and generic inference through `vscode.lm`, with fake keys
-and stubbed fetch responses. Subsequent read-only checks verified real management access and gateway
-HTTPS health, discovery, and both allowance lanes. The gateway adapter now implements
-[the located contract](agent/gateway-allowance.md), including independent unknown/stale lane states.
-Bounded live provider checks passed for gateway tools/continuation, a direct same-model control,
-allowance refresh, and connection-isolated accounting; see [verification status](agent/verification.md).
-The packaged test.3 VSIX also passed installed activation in an isolated profile with fake credentials.
+Use named connections, each appearing as a separate Copilot model group. A connection's permanent ID
+is independent of its name and owns its credential, request template, model preferences, session
+identity, spend, and refresh state. Panel selection controls editing/status display; the model selected
+in Copilot determines routing. Keep the existing package/vendor identifiers.
 
-Use **named connections, each appearing as a separate Copilot model group**. Users can configure several
-OpenRouter keys, custom OpenAI-compatible endpoints, or both—for example, “Personal OpenRouter,”
-“Work OpenRouter,” “Local Server,” and “Lab Gateway.”
-
-The handoff’s Cheap/Default/gateway setup becomes one supported configuration. Connection names, budgets,
-and model restrictions stay user- or server-defined.
-
-## 1. Verify native VS Code grouping first
-
-Verify configured provider groups against the installed VS Code client's API and runtime behavior.
-Start with a small prototype proving add, rename, remove, reload, and duplicate model IDs on that client;
-do not infer support from a release number.
-
-Keep the existing extension vendor ID and package identifiers. Give every connection a permanent internal
-ID independent of its name. Verify how renaming affects VS Code’s saved model selection; preserve
-extension-owned preferences by connection ID.
-
-Prototype findings: configured groups work on the checked installed runtime. Native model identifiers
-include the group name, so rename retires previously acquired model handles even when the provider model
-ID stays constant. Native model-settings updates can select an existing same-vendor settings entry by
-provider model ID before resolving its group. Expose connection-scoped model IDs and retain the upstream
-ID separately. A normal isolated host verified preference durability across restart/rename, and its
-management UI rendered separate groups and completed a native rename. Do not promise preservation of
-native saved selection or pins across rename; verify those surfaces and the remaining menu actions in
-an isolated UI before completing the grouping gate.
-
-## 2. Introduce a connection registry and safe migration
-
-Each connection owns its:
-
-- Name, endpoint type, normalized API base URL, and enabled state.
-- SecretStorage credential.
-- Request template, presets, discovery caches, and model preferences.
-- Allowance state and spend attribution.
-
-Migrate the existing key, template, context choices, and history into one default OpenRouter connection.
-Migration must be repeatable and recoverable after interruption. Never assign the old key to Cheap or
-duplicate it across connections.
-
-This replaces singleton assumptions in [storage.ts](../src/storage.ts) and
-[provider.ts](../src/provider.ts).
-
-## 3. Separate endpoint behavior through adapters
-
-| Connection type | Discovery and inference | Additional features |
+| Mode | Discovery and inference | Additional features |
 | --- | --- | --- |
-| Direct OpenRouter | OpenRouter catalog and streaming Chat Completions | Presets, routing, session identity, key/credit APIs |
-| OpenAI-compatible | `/models` and streaming `/chat/completions` | Endpoint-supported features; manual model configuration where needed |
-| Gateway profile from the handoff | Filtered catalog and streaming Chat Completions | Separate allowance lanes through origin-relative `/lab/allowance` |
+| Direct OpenRouter | Fixed OpenRouter API URL, catalog and streaming Chat Completions | Optional account-availability filter, account credits, presets, routing, session/reasoning/cache fields |
+| OpenRouter proxy | Configurable API base URL, authoritative server catalog and streaming Chat Completions | OpenRouter request fields; local token/returned-cost tracking |
 
-Shared code handles transport, streaming, cancellation, tools, and images. Adapters control reasoning
-fields, usage requests, session fields, caching behavior, presets, and allowance APIs.
+A proxy manages OpenRouter access rather than providing a general-purpose endpoint mode. Its catalog
+is authoritative, including an empty list. Discovery errors never fall back to an unrestricted
+catalog or manual model definitions. It never calls direct OpenRouter credit or preset APIs.
+Missing model metadata uses conservative limits/capabilities and unknown pricing.
 
-Start with **Chat Completions compatibility**. Responses-only endpoints and additional authentication
-protocols can follow.
+Proxy usage consists of locally tracked token counts and returned costs. Missing cost remains
+unavailable. No custom proxy allowance/balance API or setup is supported. Direct OpenRouter credit and
+preset APIs remain direct-only. Old custom allowance flags are ignored and removed from registry data.
 
-## 4. Make model identity and requests connection-aware
+## Connection lifecycle and editor
 
-Identify models internally by connection ID plus upstream model ID. Identical models on different
-connections remain independently selectable; requests send the original upstream ID.
+- Shared **Settings → Group management** offers only the two supported modes, with one form and
+  **Save connection** action for name, type, URL, enabled state, and key.
+- Direct mode fixes/disables the OpenRouter URL. Proxy mode restores its custom URL draft when toggled.
+- A saved key appears only as a grey masked password-field placeholder. Blank input retains it;
+  **Clear key** is a separate immediate action. A neutral keyless state and keyless saves are valid.
+- All non-direct modes reject trimmed case-insensitive `sk-or-` credentials at form/save/network
+  boundaries. Use the proxy's own token or no key. A changed endpoint requires clearing or explicitly
+  replacing an existing key; metadata and credentials commit together.
+- Nonsecret editor drafts survive Clear key refreshes only while saved metadata matches. Raw credentials
+  never enter persisted webview drafts. Cancel discards editor drafts.
+- Connection tabs own usage, session spend, request JSON, and supported direct account controls.
+  Shared Settings holds output reserve, refresh frequency, and text sanitization.
 
-Capture the connection, endpoint, credential, template, and model configuration at operation start.
-Panel changes must not reroute an in-flight operation. Version caches so an old refresh cannot overwrite
-newer configuration.
+Existing `openai-compatible` records are migration compatibility only. They keep their previous runtime
+behavior until explicitly saved as an OpenRouter proxy. The editor still presents two choices and
+explains the pending conversion. Saving as proxy retains the permanent ID, allowed credential, and
+scoped state while removing manual model definitions. Do not silently reinterpret old requests on load
+or present generic providers/manual models as a third supported product mode.
 
-Preserve the existing OpenRouter request behavior. Generic endpoints receive only their supported
-automatic additions; users retain the paste-apply JSON workflow.
+## Implemented foundations
 
-Retry within the selected connection. Never silently switch credentials, origins, or budgets.
+Recoverable migration copies the existing key, template, context choices, and history into one default
+OpenRouter connection. It is repeatable after interruption and never duplicates a key into another
+connection. Registry mutations and isolated SecretStorage references are revisioned; staging slots and
+post-commit cleanup are recoverable.
 
-## 5. Handle incomplete custom-endpoint metadata honestly
+Model IDs encode connection ID plus upstream model ID; requests send the original upstream ID.
+Duplicate models remain independently selectable. Connection-scoped IDs avoid shared-ID ambiguity;
+native settings-menu writes still need runtime verification. Each operation
+captures endpoint, credential, template, and model configuration. Retries keep that captured connection;
+old refreshes cannot overwrite newer configuration. There is no silent credential/origin/budget switch.
+TLS verification stays enabled and authenticated redirects are refused.
 
-Standard OpenAI model listings often omit context limits, pricing, tools, vision, and reasoning support.
+Named groups and the regrouped/localized panel are integrated. Fixtures in a normal isolated client
+exercised key rotation, template saves, rename/restart persistence, and duplicate model routing. Earlier
+compatible-endpoint fixture inference is historical compatibility evidence, not a generic-provider
+product promise. Bounded live provider checks exercised proxy tools/continuation, a direct same-model
+control and isolated accounting in the earlier implementation. A packaged test.3 VSIX also passed installed
+activation using fake credentials. See [verification status](agent/verification.md) for evidence and limits.
 
-Add manual model IDs and compact metadata overrides, with clearly marked conservative defaults where
-necessary. Preserve OpenRouter metadata when gateways provide it.
+The current source passes strict compilation and **562 integration tests** on VS Code 1.145.2
+(2026-11-10). Packaging also succeeds and excludes removed allowance modules and development fixtures.
+Latest-candidate installed activation and native UI acceptance are still pending. Use the
+[next harness handoff](agent/next-harness-handoff.md) to probe this checkpoint before choosing more work.
 
-Update [modelInfo.ts](../src/modelInfo.ts) so missing prices display as unknown and incomplete models do
-not inherit the current assumed 1M context window or tool support.
+## Remaining release gates
 
-## 6. Generalize allowance and session accounting
+The main design risk is native group lifecycle integration. Runtime support must be checked on the
+actual installed client rather than inferred from a release number. Native group names form part of
+VS Code's internal model identifiers, so rename retires old handles. Permanent connection IDs preserve
+extension-owned preferences, but saved native selection/pins must not be promised to survive rename.
 
-Keep local chat identity separate from endpoint-specific wire fields. Include the connection in
-accounting routes and scope parent-attribution state to prevent cross-connection contamination.
+Finish native Add/Delete confirmation in a normal isolated profile, saved chat selection/pins after
+rename/reload, and native settings edits with the same upstream model on two connections. The prototype
+and prior UI observations are recorded in [native grouping verification](agent/native-model-groups.md).
 
-- Direct OpenRouter: account for effective/inherited budgets.
-- Gateway: show each allowance separately, including stale, partial, and unknown states.
-- Generic endpoint: show reported token usage and cost where available; otherwise mark cost unavailable.
+Direct OpenRouter credit behavior is retained per connection. Its effective inherited account-budget
+presentation remains pending. Proxies display local usage and returned costs only.
 
-Never add daily and weekly allowances together, or treat direct and gateway access to the same upstream
-keys as extra budget.
+The regression suite already covers migration/rotation/deletion failures, duplicate model IDs, stale
+refreshes/handles, captured retries, missing metadata, credential syntax rejection, legacy compatibility,
+explicit conversion, and connection-isolated accounting. Separate extension-harness checks cover zero
+proxy balance/preset calls. Repeat relevant checks when code changes, rather than treating them all as
+unstarted work.
 
-Refactor the global refresh state in [extension.ts](../src/extension.ts) and extend the pure accounting
-logic in [logic.ts](../src/logic.ts).
-
-## 7. Extend the existing management panel
-
-The panel now has **Settings** and one tab per named connection.
-
-- **Settings → Keys:** connection list, Add/Edit/Enable/Disable/Delete, API type/base URL, name, and key.
-- **Settings → shared settings:** output reserve, usage refresh frequency, and text sanitization.
-- **Connection tab:** key usage, session spend, local budget, model availability, presets/request JSON,
-  and manual model metadata for compatible endpoints.
-
-The selected connection controls its credentials, allowance display, and request configuration. Panel
-selection affects editing; the model selected in Copilot determines routing.
-
-Keep the current paste-apply editor. Hide unsupported preset/credit controls, label spend by connection,
-and make the status bar identify which connection it displays. Update localization, preview fixtures,
-and documentation.
-
-## 8. Validate in staged milestones
-
-Implement in this order:
-
-1. Grouping prototype — implemented; saved picker selection/pins and full native menu checks remain.
-2. Registry and migration — implemented with failure-injection coverage.
-3. Multiple OpenRouter connections — implemented and exercised in the real client using fixtures.
-4. Generic endpoint adapter — implemented for streaming Chat Completions and manual metadata.
-5. Gateway allowance support — implemented with [contract validation](agent/gateway-allowance.md),
-   per-connection refresh isolation, separate effective interval budgets, and no catalog fallback.
-6. UI completion — shared/per-connection regrouping implemented, localized, and browser/client checked.
-
-Direct OpenRouter credit behavior is retained per connection. Its effective inherited account budget
-presentation remains pending. Gateway lanes are implemented and never summed into a combined limit.
-
-Regression coverage should include migration failures, duplicate model IDs, concurrent requests,
-credential rotation, stale refreshes, deletion, missing metadata, and connection-isolated accounting.
-Gateway discovery must fail closed.
-
-Run compile, integration tests, and packaging. Then verify native groups and packaged activation in an
-isolated client profile. With authorized credentials, test streaming, tools, allowance displays, and
-connection isolation against real endpoints. Preserve TLS verification and prevent authenticated
-cross-origin redirects.
-
-The main design risk is native group lifecycle integration. Resolve that before the broader refactor.
+Next, verify the packaged candidate and native lifecycle interactions in a normal isolated profile.
+Probe production wiring, persistence, error recovery, and credential/request isolation through actual
+UI actions and controlled server responses. Reassess the remaining design and release work from that
+evidence. Scoped live tests require authorized credentials. Keep fixture versus live and installed-package
+versus copied-module evidence distinct.
