@@ -19,14 +19,14 @@ const BASE_INFO: KeyInfo = {
     is_free_tier: false,
 };
 
-function render(overrides: Partial<PanelRenderOptions> = {}): string {
+function render(overrides: Partial<PanelRenderOptions> = {}, allowProxyConnections = false): string {
     return renderPanelHtml({
         limit: 10,
         resetPeriod: "daily",
         includeByok: true,
         refreshIntervalMinutes: 5,
         ...overrides,
-    });
+    }, allowProxyConnections);
 }
 
 function sessionFixture(over: Partial<SessionCost> = {}): SessionCost {
@@ -63,14 +63,13 @@ function sessionFixture(over: Partial<SessionCost> = {}): SessionCost {
 suite("renderSessionCosts", () => {
     test("empty state explains that no spend has been recorded", () => {
         const html = renderSessionCosts(undefined);
-        assert.ok(html.includes("No OpenRouter spend recorded yet"), html);
+        assert.ok(html.includes("Session spend appears here after a request reports a cost."), html);
         assert.ok(!html.includes("<details"), "no collapsible rows when there is nothing to show");
     });
 
     test("the footer says up to 10 sessions are kept, and that they persist", () => {
         const html = renderSessionCosts([sessionFixture()]);
-        assert.ok(html.includes("up to the 10 most recent"), html);
-        assert.ok(html.includes("kept across window reloads"), html);
+        assert.ok(html.includes("Up to 10 recent chats are stored locally and shown newest first."), html);
     });
 
     test("one collapsible row per session, with the newest expanded", () => {
@@ -206,7 +205,7 @@ suite("renderSessionCosts", () => {
     test("a chat-only list is unchanged: no unattributed entry or note", () => {
         const html = renderSessionCosts([sessionFixture(), sessionFixture({ sessionId: "copilot-chat:b", paid: 0.002 })]);
         assert.ok(!html.includes("Unattributed"), "no bucket row for harness-owned spend");
-        assert.ok(!html.includes("carried no chat identifier"), "and no bucket note in the footer");
+        assert.ok(!html.includes("This spend came from requests without a Copilot chat identifier."), "and no bucket note in the footer");
     });
 
     test("spend with no chat id renders as a labelled Unattributed entry", () => {
@@ -217,8 +216,7 @@ suite("renderSessionCosts", () => {
         assert.strictEqual((html.match(/<details/g) ?? []).length, 2, "one row per chat plus the bucket");
         assert.ok(html.includes("Unattributed (no chat id)"), "the bucket is labelled");
         assert.ok(!html.includes("OpenRouter session <code>unattributed"), "the bucket is not described as an OpenRouter session");
-        assert.ok(html.includes("Spend that reached OpenRouter with no Copilot chat identifier"), "the bucket explains itself");
-        assert.ok(html.includes("no <code>session_id</code> is sent for it"), "the bucket notes no session id is sent");
+        assert.ok(html.includes("This spend came from requests without a Copilot chat identifier."), "the bucket explains itself");
     });
 
     test("the bucket is expanded when it is the only entry", () => {
@@ -241,15 +239,15 @@ suite("renderSessionCosts", () => {
 
     test("the empty state mentions the unattributed bucket", () => {
         const html = renderSessionCosts([]);
-        assert.ok(html.includes("No OpenRouter spend recorded yet"), html);
-        assert.ok(html.includes("<strong>Unattributed</strong>"), "so a byok agent-host session is not a mystery");
+        assert.ok(html.includes("Session spend appears here after a request reports a cost."), html);
+        assert.ok(html.includes("Requests without a Copilot chat identifier appear under Unattributed."));
     });
 
     test("a zero-spend bucket is omitted like any other session", () => {
         const html = renderSessionCosts([sessionFixture({ sessionId: UNATTRIBUTED_SESSION_ID, paid: 0, upstream: 0, openRouter: 0 })]);
         assert.ok(!html.includes("<details"), "nothing was spent, so no entry is rendered");
         assert.ok(!html.includes("Unattributed (no chat id)"), "not even a labelled one");
-        assert.ok(html.includes("No OpenRouter spend recorded yet"), "the list falls back to the empty state");
+        assert.ok(html.includes("Session spend appears here after a request reports a cost."), "the list falls back to the empty state");
     });
 });
 
@@ -284,7 +282,7 @@ suite("renderPanelHtml", () => {
     test("keeps the key inside the connection form with a single save action", () => {
         const html = render({ maskedKey: "sk-or-v1-12…456" });
         const form = html.match(/<form id="connectionForm"[\s\S]*?<\/form>/)![0];
-        for (const id of ['connectionName', 'connectionKind', 'connectionUrl', 'key', 'connectionEnabled', 'saveConnection']) {
+        for (const id of ['connectionName', 'key', 'connectionEnabled', 'saveConnection']) {
             assert.ok(form.includes(`id="${id}"`), `${id} belongs to the group editor`);
         }
         assert.ok(!html.includes('id="saveKey"'));
@@ -334,7 +332,7 @@ suite("renderPanelHtml", () => {
         assert.match(html, /id="includeByok"\s+disabled/, "the checkbox is read-only");
         assert.ok(!html.includes('id="includeByok" checked'), "the key's include_byok_in_limit=false is shown honestly");
         assert.ok(html.includes("Include BYOK usage (set on the key)"));
-        assert.ok(html.includes("The key has its own server-side limit; these local controls apply only when it has none."));
+        assert.ok(html.includes("OpenRouter enforces this key’s spending limit."));
         const included: KeyInfo = { ...autoInfo, include_byok_in_limit: true };
         assert.ok(render({ info: included }).includes('id="includeByok" checked '), "the key's true flag renders checked");
     });
@@ -377,9 +375,9 @@ suite("renderPanelHtml", () => {
 
     test("shows a neutral keyless state when there is no info", () => {
         const html = render();
-        assert.ok(html.includes("No usage information yet."));
+        assert.ok(html.includes("Save an API key in Settings to see credit usage."));
         assert.ok(html.includes('<span class="muted">No key saved</span>'));
-        assert.ok(html.includes('You can save without one.'));
+        assert.ok(html.includes('You can save the connection before adding an OpenRouter API key.'));
         assert.ok(!html.includes('No API key set'));
     });
 
@@ -405,9 +403,9 @@ suite("renderPanelHtml", () => {
         assert.ok(html.includes('id="outputReserveMinTokens" min="0.5" step="0.5" aria-label="Lower bound on the output reserve in K" value="16.384"'));
         assert.ok(html.includes('id="outputReserveMaxTokens" min="0.5" step="0.5" aria-label="Upper bound on the output reserve in K" value="262.144"'));
         assert.ok(html.includes('input[type=number]::-webkit-inner-spin-button'), "number inputs hide the step buttons");
-        assert.ok(html.includes('for="outputReservePercent">Target:</label>'), "ratio field is labelled Target");
-        assert.ok(html.includes('for="outputReserveMinTokens">Lower limit:</label>'));
-        assert.ok(html.includes('for="outputReserveMaxTokens">Upper limit:</label>'));
+        assert.ok(html.includes('for="outputReservePercent">Target</label>'), "ratio field is labelled Target");
+        assert.ok(html.includes('for="outputReserveMinTokens">Lower limit</label>'));
+        assert.ok(html.includes('for="outputReserveMaxTokens">Upper limit</label>'));
         assert.ok(html.includes('title="Refresh usage data every 1 to 1440 minutes"'));
         assert.ok(html.includes('aria-label="Spending limit reset period"'));
     });
@@ -416,7 +414,7 @@ suite("renderPanelHtml", () => {
         const template = { temperature: 0.2, provider: { quantizations: ["fp8"] } };
         const html = render({ template });
         assert.ok(html.includes(">Custom request</div>"), "custom request section present");
-        assert.ok(html.includes('id="saveTemplate">Save request</button>'), "Save request button present");
+        assert.ok(html.includes('id="saveTemplate" class="primary" type="button">Save request</button>'), "Save request button present");
         assert.ok(!html.includes('id="clearTemplate"'), "Clear button removed");
         const prefill = html.match(/templateEl\.value = (.*);/);
         assert.ok(prefill, "template textarea is populated via script");
@@ -457,52 +455,39 @@ suite("renderPanelHtml", () => {
         assert.ok(settings.includes("SecretStorage"), "key storage note stays with key controls");
         assert.ok(settings.includes('id="outputReservePercent"'), "reserve controls live in Settings");
         assert.ok(settings.includes('class="fieldgroup"'), "reserve fields are grouped");
-        assert.strictEqual(settings.match(/<span class="sep">\.<\/span>/g)?.length, 2);
-        assert.ok(request.includes("BYOK routes:</strong> When OpenRouter reports zero"));
+        assert.ok(!settings.includes('class="sep"'), "spacing separates the reserve controls");
+        assert.ok(request.includes("When OpenRouter reports zero for a BYOK request"));
         assert.ok(request.includes("Responses stream automatically"));
-        assert.ok(request.includes("No routing is added automatically"));
+        assert.ok(request.includes("A pasted <code>provider</code> object is sent as entered."));
         assert.ok(html.includes('aria-label="OpenRouter API key"'), "key input has an accessible name");
         assert.ok(html.includes('aria-label="Custom request JSON"'), "request editor has an accessible name");
         assert.ok(!html.includes("id=\"fn-"), "numbered internal footnote anchors are removed");
         assert.ok(!html.includes('id="panel-context"'), "the Context tab is retired");
     });
 
-    test("renders every note in the unified bold-term list format", () => {
-        const html = render({
-            sessions: [
-                sessionFixture(),
-                sessionFixture({ sessionId: UNATTRIBUTED_SESSION_ID, paid: 0.002 }),
-            ],
-        });
-        for (const term of [
-            "Storage",
-            "Hide unavailable models",
-            "Session list",
-            "BYOK routes",
-            "Unattributed",
-            "Output reserve",
-            "Prompt sanitization",
-            "Preset selection",
-            "Picker presets",
-            "Streaming",
-            "Live conversation",
-            "Thinking effort",
-            "Provider routing",
-            "Anthropic caching",
-        ]) {
-            assert.ok(html.includes(`<li><strong>${term}:</strong>`), `${term} note is a list item`);
-        }
-        assert.ok(!html.includes('<p class="helptext"><strong>'), "no note renders as a standalone paragraph");
+    test("uses paragraphs for guidance and applies button styles by action", () => {
+        const html = render({ maskedKey: "sk..." });
+        const buttons = [...html.matchAll(/<button id="([^"]+)" class="([^"]+)"/g)];
+        assert.deepStrictEqual(buttons.filter(match => match[2] === "primary").map(match => match[1]), [
+            "saveConnection", "saveTemplate",
+        ]);
+        assert.deepStrictEqual(buttons.filter(match => match[2] === "secondary").map(match => match[1]), [
+            "addConnection", "clearKey", "cancelConnection", "deleteConnection", "resetOutputReserve", "refresh",
+        ]);
+        assert.ok(html.includes('<p class="helptext">VS Code stores your API key in SecretStorage.</p>'));
+        assert.ok(html.includes('<p class="helptext">Refresh to load credit usage.</p>'));
+        assert.ok(!html.includes('<ul class="helptext">'));
+        assert.ok(!html.includes('class="helptext connection-url"'), "the direct tab does not repeat its fixed URL");
     });
 
     test("request guidance states cache behavior and avoids blanket verbatim passthrough", () => {
         const html = render();
         assert.ok(
-            html.includes("Anthropic-family models (<code>anthropic/*</code>, including <code>~anthropic/*</code>) get a top-level, 5-minute <code>cache_control</code>"),
+            html.includes("Models with IDs starting with <code>anthropic/</code> or <code>~anthropic/</code> get a top-level 5-minute <code>cache_control</code>"),
             "anthropic auto cache_control footnote present"
         );
         assert.ok(
-            html.includes("No routing is added automatically. A pasted <code>provider</code> object passes through unchanged."),
+            html.includes("A pasted <code>provider</code> object is sent as entered."),
             "provider routing passthrough is clear"
         );
         assert.ok(
@@ -680,6 +665,21 @@ suite("handlePanelMessage", () => {
         const ok = spyDeps();
         await handlePanelMessage({ type: "saveIncludeByok", value: false }, ok.deps);
         assert.deepStrictEqual(ok.updates, [["creditIncludeByok", false]]);
+    });
+
+    test("status bar settings accept boolean visibility and either display mode", async () => {
+        const state = spyDeps();
+        await handlePanelMessage({ type: "saveShowBudgetInStatusBar", connectionId: "a", value: "false" }, state.deps);
+        await handlePanelMessage({ type: "saveStatusBarBudgetDisplay", value: ["usage"] }, state.deps);
+        await handlePanelMessage({ type: "saveStatusBarBudgetDisplay", value: "bogus" }, state.deps);
+        assert.strictEqual(state.errors.length, 3);
+        assert.strictEqual(state.updates.length, 0);
+        await handlePanelMessage({ type: "saveShowBudgetInStatusBar", connectionId: "a", value: false }, state.deps);
+        await handlePanelMessage({ type: "saveStatusBarBudgetDisplay", value: "usage" }, state.deps);
+        await handlePanelMessage({ type: "saveStatusBarBudgetDisplay", value: "remaining" }, state.deps);
+        assert.deepStrictEqual(state.updates, [
+            ["showBudgetInStatusBar", false], ["statusBarBudgetDisplay", "usage"], ["statusBarBudgetDisplay", "remaining"],
+        ]);
     });
 
     test("saveRefreshInterval enforces the 1-1440 range", async () => {
@@ -987,10 +987,10 @@ suite("renderPanelHtml presets section", () => {
 
     test("preset guidance explains replacement and picker precedence", () => {
         const html = render();
-        assert.ok(html.includes('<strong>Preset selection:</strong> Selecting a preset replaces the saved request with <code>{"preset": "&lt;slug&gt;"}</code>'));
-        assert.ok(html.includes('Selecting "No preset loaded" clears it.'));
+        assert.ok(html.includes('<p class="helptext">Selecting a preset replaces the saved request.'));
+        assert.ok(html.includes('The “No preset loaded” option clears it.'));
         assert.ok(html.includes("<code>@preset/&lt;slug&gt;</code>"), "picker entry form documented");
-        assert.ok(html.includes("takes precedence over a different template preset"), "picker preset precedence documented");
+        assert.ok(html.includes("overriding the saved request’s preset"), "picker preset precedence documented");
     });
 });
 
@@ -1004,7 +1004,7 @@ function connectionFixture(id: string, kind: ConnectionDefinition['kind'] = 'ope
 }
 
 /** Run the actual webview script with a small DOM seam; no extension host messages leave this harness. */
-function webviewHarness(options: Partial<PanelRenderOptions>, savedState: unknown = {}) {
+function webviewHarness(options: Partial<PanelRenderOptions>, savedState: unknown = {}, allowProxyConnections = false) {
     class Element {
         value = '';
         type = '';
@@ -1032,7 +1032,7 @@ function webviewHarness(options: Partial<PanelRenderOptions>, savedState: unknow
         reportValidity() { return this.validationMessage === ''; }
         fire(type: string, event = {}) { for (const listener of this.listeners[type] ?? []) listener(event); }
     }
-    const html = render(options);
+    const html = render(options, allowProxyConnections);
     const elements = new Map<string, Element>();
     const decode = (text: string) => text.replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
     for (const match of html.matchAll(/<\w+\b([^>]*?\sid="([^"]+)"[^>]*)>/g)) {
@@ -1087,6 +1087,77 @@ function webviewHarness(options: Partial<PanelRenderOptions>, savedState: unknow
 
 suite('connection panel', () => {
     const connections = [connectionFixture('a'), connectionFixture('b')];
+
+    test('status bar display is shared and budget visibility belongs to the selected connection', () => {
+        const rows = [connections[0], {
+            ...connections[1], settings: { ...connections[1].settings, showBudgetInStatusBar: false },
+        }];
+        const first = webviewHarness({ connections: rows, selectedConnectionId: 'a' });
+        assert.strictEqual(first.element('statusBarBudgetDisplay').value, 'remaining');
+        assert.strictEqual(first.element('showBudgetInStatusBar').checked, true);
+        first.element('showBudgetInStatusBar').checked = false;
+        first.element('showBudgetInStatusBar').fire('change');
+        first.element('statusBarBudgetDisplay').value = 'usage';
+        first.element('statusBarBudgetDisplay').fire('change');
+        assert.deepStrictEqual(first.messages, [
+            { type: 'saveShowBudgetInStatusBar', connectionId: 'a', value: false },
+            { type: 'saveStatusBarBudgetDisplay', value: 'usage' },
+        ]);
+        const second = webviewHarness({
+            connections: rows, selectedConnectionId: 'b', settings: { statusBarBudgetDisplay: 'usage' },
+        });
+        assert.strictEqual(second.element('statusBarBudgetDisplay').value, 'usage');
+        assert.strictEqual(second.element('showBudgetInStatusBar').checked, false);
+        assert.ok(!render({ connections: [connectionFixture('proxy', 'gateway')] }, true).includes('id="showBudgetInStatusBar"'));
+    });
+
+    test('stable panel hides saved proxies and excludes their scoped data from a direct connection', () => {
+        for (const kind of ['gateway', 'openai-compatible'] as const) {
+            const proxy = { ...connectionFixture('proxy', kind), name: 'OpenRouter: RC', baseUrl: 'https://hidden.example/v1' };
+            const options = {
+                connections: [proxy, ...connections], selectedConnectionId: proxy.id,
+                maskedKey: 'hidden-masked-key', template: { hiddenTemplate: true },
+                errorMessage: 'hidden refresh error', sessions: [sessionFixture({ title: 'hidden session' })],
+                presets: [{ name: 'hidden preset', slug: 'hidden-preset' }],
+            };
+            const html = render(options);
+            for (const hidden of [
+                'id="connectionKind"', 'id="connectionUrl"', 'OpenRouter proxy', 'data-connection-id="proxy"',
+                proxy.baseUrl, 'hidden-masked-key', 'hiddenTemplate', 'hidden refresh error', 'hidden session', 'hidden preset',
+            ]) {
+                assert.ok(!html.includes(hidden), `stable panel excludes ${hidden}`);
+            }
+            const view = webviewHarness(options, { activeTab: 'tab-connection-proxy' });
+            assert.strictEqual(view.element('connectionSelect').value, 'a');
+            assert.strictEqual(view.element('template').value, '');
+            assert.strictEqual(view.element('panel-settings').hidden, false);
+            view.element('addConnection').fire('click');
+            assert.strictEqual(view.element('connectionName').value, 'OpenRouter: RC1');
+            const onlyProxy = webviewHarness({ ...options, connections: [proxy] });
+            onlyProxy.element('connectionForm').fire('submit', { preventDefault() {} });
+            assert.deepStrictEqual(onlyProxy.messages.at(-1), { type: 'addConnection', value: {
+                name: 'OpenRouter: RC1', kind: 'openrouter', baseUrl: 'https://openrouter.ai/api/v1', enabled: true,
+            } });
+        }
+    });
+
+    test('each direct editor sends its own key and connection ID', () => {
+        const first = webviewHarness({ connections, selectedConnectionId: 'a', maskedKey: 'first-mask' });
+        first.element('key').value = 'first-key';
+        first.element('connectionForm').fire('submit', { preventDefault() {} });
+        const second = webviewHarness({ connections, selectedConnectionId: 'b', maskedKey: 'second-mask' }, first.state);
+        assert.strictEqual(second.element('key').placeholder, 'second-mask');
+        assert.strictEqual(second.element('key').value, '');
+        second.element('key').value = 'second-key';
+        second.element('connectionForm').fire('submit', { preventDefault() {} });
+        assert.deepStrictEqual([first.messages.at(-1), second.messages.at(-1)], ['a', 'b'].map((id, index) => ({
+            type: 'updateConnection', connectionId: id, value: {
+                name: id.toUpperCase(), kind: 'openrouter', baseUrl: 'https://openrouter.ai/api/v1', enabled: true,
+                apiKey: ['first-key', 'second-key'][index],
+            },
+        })));
+    });
+
     test('per-connection messages retain their rendered origin after selecting another tab', () => {
         const view = webviewHarness({ connections, selectedConnectionId: 'a' });
         view.element('tab-connection-b').fire('click');
@@ -1096,6 +1167,33 @@ suite('connection panel', () => {
         assert.deepStrictEqual(view.messages[1], { type: 'saveTemplate', value: '', connectionId: 'a' });
         assert.strictEqual(view.messages[2].type, 'saveOutputReservePercent');
         assert.ok(!('connectionId' in view.messages[2]), 'shared setting does not carry a connection scope');
+    });
+
+    test('resetting output reserve discards all reserve drafts and removes the shared overrides', async () => {
+        const settings = { outputReservePercent: 25, outputReserveMinTokens: 64000, outputReserveMaxTokens: 512000 };
+        const view = webviewHarness({ connections, settings });
+        const fields = [
+            ['outputReservePercent', '30'],
+            ['outputReserveMinTokens', '80'],
+            ['outputReserveMaxTokens', '600'],
+        ];
+        for (const [id, value] of fields) {
+            view.element(id).value = value;
+            view.element(id).fire('input');
+        }
+        view.element('template').value = '{"temperature":0.5}';
+        view.element('template').fire('input');
+        view.element('resetOutputReserve').fire('click');
+        assert.deepStrictEqual(view.messages, [{ type: 'resetOutputReserve' }]);
+
+        const s = spyDeps();
+        await handlePanelMessage(view.messages[0], s.deps);
+        assert.deepStrictEqual(s.updates, fields.map(([id]) => [id, undefined]));
+        const reopened = webviewHarness({ connections, settings }, view.state);
+        assert.deepStrictEqual(fields.map(([id]) => reopened.element(id).value), ['25', '64', '512']);
+        const reset = webviewHarness({ connections }, view.state);
+        assert.deepStrictEqual(fields.map(([id]) => reset.element(id).value), ['12.5', '16.384', '262.144']);
+        assert.strictEqual(reset.element('template').value, '{"temperature":0.5}');
     });
 
     test('request drafts remain separate through connection switches and refreshes', () => {
@@ -1175,7 +1273,7 @@ suite('connection panel', () => {
 
     test('proxy forms reject OpenRouter key syntax but permit proxy tokens and no key', () => {
         for (const kind of ['gateway', 'openai-compatible'] as const) {
-            const view = webviewHarness({ connections: [connectionFixture('proxy', kind)], selectedConnectionId: 'proxy' });
+            const view = webviewHarness({ connections: [connectionFixture('proxy', kind)], selectedConnectionId: 'proxy' }, {}, true);
             for (const value of ['sk-or-v1-pretend', '  SK-OR-V1-PRETEND  ', 'sk-or-']) {
                 view.element('key').value = value;
                 view.element('key').fire('input');
@@ -1194,7 +1292,7 @@ suite('connection panel', () => {
     });
 
     test('switching to proxy rejects a retained OpenRouter key while Clear key remains available', () => {
-        const view = webviewHarness({ connections, selectedConnectionId: 'a', maskedKey: 'sk-or-v1-12…456' });
+        const view = webviewHarness({ connections, selectedConnectionId: 'a', maskedKey: 'sk-or-v1-12…456' }, {}, true);
         assert.strictEqual(view.element('key').validationMessage, '');
         view.element('connectionKind').value = 'gateway';
         view.element('connectionKind').fire('change');
@@ -1204,15 +1302,20 @@ suite('connection panel', () => {
         assert.strictEqual(view.messages.length, 0);
         view.element('clearKey').fire('click');
         assert.deepStrictEqual(view.messages.at(-1), { type: 'clearKey', connectionId: 'a' });
-        const refreshed = webviewHarness({ connections, selectedConnectionId: 'a' }, view.state);
+        const refreshed = webviewHarness({ connections, selectedConnectionId: 'a' }, view.state, true);
         assert.strictEqual(refreshed.element('connectionKind').value, 'gateway');
         assert.strictEqual(refreshed.element('key').validationMessage, '');
         refreshed.element('connectionForm').fire('submit', { preventDefault() {} });
         assert.strictEqual(refreshed.messages.at(-1)!.type, 'updateConnection');
+        const stable = webviewHarness({ connections, selectedConnectionId: 'a' }, view.state);
+        stable.element('connectionForm').fire('submit', { preventDefault() {} });
+        assert.deepStrictEqual(stable.messages.at(-1), { type: 'updateConnection', connectionId: 'a', value: {
+            name: 'A', kind: 'openrouter', baseUrl: 'https://openrouter.ai/api/v1', enabled: true,
+        } });
     });
 
     test('clearing an invalid key by switching tabs restores native validity for a keyless proxy', () => {
-        const view = webviewHarness({ connections: [connectionFixture('proxy', 'gateway')], selectedConnectionId: 'proxy' });
+        const view = webviewHarness({ connections: [connectionFixture('proxy', 'gateway')], selectedConnectionId: 'proxy' }, {}, true);
         view.element('key').value = 'sk-or-v1-pretend';
         view.element('key').fire('input');
         assert.strictEqual(view.element('key').reportValidity(), false);
@@ -1263,7 +1366,7 @@ suite('connection panel', () => {
     });
 
     test('Clear key preserves nonsecret connection edits across its refresh and Cancel discards them', () => {
-        const view = webviewHarness({ connections, selectedConnectionId: 'a', maskedKey: 'masked…key' });
+        const view = webviewHarness({ connections, selectedConnectionId: 'a', maskedKey: 'masked…key' }, {}, true);
         view.element('connectionName').value = 'Pending rename';
         view.element('connectionKind').value = 'gateway';
         view.element('connectionKind').fire('change');
@@ -1273,7 +1376,7 @@ suite('connection panel', () => {
         view.element('clearKey').fire('click');
         assert.ok(!JSON.stringify(view.state).includes('never-persist-this-key'));
         const refreshedConnections = connections.map(connection => ({ ...connection, revision: connection.revision + 1 }));
-        const refreshed = webviewHarness({ connections: refreshedConnections, selectedConnectionId: 'a' }, view.state);
+        const refreshed = webviewHarness({ connections: refreshedConnections, selectedConnectionId: 'a' }, view.state, true);
         assert.strictEqual(refreshed.element('connectionName').value, 'Pending rename');
         assert.strictEqual(refreshed.element('connectionKind').value, 'gateway');
         assert.strictEqual(refreshed.element('connectionUrl').value, 'https://pending.example/v1');
@@ -1284,16 +1387,16 @@ suite('connection panel', () => {
             name: 'Pending rename', kind: 'gateway', baseUrl: 'https://pending.example/v1', enabled: false,
         } });
         refreshed.element('cancelConnection').fire('click');
-        const cancelled = webviewHarness({ connections, selectedConnectionId: 'a' }, refreshed.state);
+        const cancelled = webviewHarness({ connections, selectedConnectionId: 'a' }, refreshed.state, true);
         assert.strictEqual(cancelled.element('connectionName').value, 'A');
         assert.strictEqual(cancelled.element('connectionKind').value, 'openrouter');
         const saved = webviewHarness({ connections: [{ ...connections[0], name: 'Saved' }, connections[1]],
-            selectedConnectionId: 'a' }, view.state);
+            selectedConnectionId: 'a' }, view.state, true);
         assert.strictEqual(saved.element('connectionName').value, 'Saved', 'stale draft cannot overwrite saved metadata');
     });
 
     test('API type is editable and OpenRouter fixes the URL while custom endpoint drafts survive toggling', () => {
-        const view = webviewHarness({ connections, selectedConnectionId: 'a', maskedKey: 'masked…key' });
+        const view = webviewHarness({ connections, selectedConnectionId: 'a', maskedKey: 'masked…key' }, {}, true);
         assert.strictEqual(view.element('connectionKind').disabled, false);
         assert.strictEqual(view.element('connectionUrl').disabled, true);
         assert.strictEqual(view.element('connectionUrl').value, 'https://openrouter.ai/api/v1');
@@ -1322,7 +1425,7 @@ suite('connection panel', () => {
 
     test('existing custom connections can switch API type and the form allows keyless saves for every type', () => {
         const local = { ...connectionFixture('local', 'openai-compatible'), models: [{ id: 'manual-model' }] };
-        const view = webviewHarness({ connections: [local], selectedConnectionId: 'local' });
+        const view = webviewHarness({ connections: [local], selectedConnectionId: 'local' }, {}, true);
         assert.strictEqual(view.element('connectionUrl').disabled, false);
         view.element('connectionKind').value = 'gateway';
         view.element('connectionKind').fire('change');
@@ -1360,12 +1463,12 @@ suite('connection panel', () => {
 
     test('new group mode choices are exactly direct OpenRouter and OpenRouter proxy', () => {
         for (const connections of [[], [connectionFixture('a')], [connectionFixture('proxy', 'gateway')]]) {
-            const html = render({ connections });
+            const html = render({ connections }, true);
             const modes = html.match(/<select id="connectionKind">([\s\S]*?)<\/select>/)![1];
             assert.strictEqual((modes.match(/<option /g) ?? []).length, 2);
             assert.ok(modes.includes('Direct OpenRouter') && modes.includes('OpenRouter proxy'));
             assert.ok(!modes.includes('openai-compatible'));
-            const view = webviewHarness({ connections });
+            const view = webviewHarness({ connections }, {}, true);
             view.element('addConnection').fire('click');
             view.element('connectionKind').value = 'gateway';
             view.element('connectionKind').fire('change');
@@ -1375,7 +1478,7 @@ suite('connection panel', () => {
 
     test('proxy panels omit server allowance controls even for old saved flags', () => {
         const proxy = { ...connectionFixture('proxy', 'gateway'), proxyAllowance: true };
-        const html = render({ connections: [proxy], sessions: [sessionFixture()] });
+        const html = render({ connections: [proxy], sessions: [sessionFixture()] }, true);
         for (const id of ['proxyAllowance', 'proxyOptions', 'manualModels', 'saveManualModels', 'presetSelect', 'limit', 'refresh']) {
             assert.ok(!html.includes(`id="${id}"`));
         }
@@ -1401,8 +1504,9 @@ suite('connection panel', () => {
     });
 
     test('escapes connection metadata and renders only one detail editor', () => {
-        const hostile = { ...connectionFixture('a'), name: '</script><img src=x>', baseUrl: 'https://example.com/" onmouseover="bad' };
-        const html = render({ connections: [hostile, connectionFixture('b')], selectedConnectionId: 'a' });
+        const hostile = { ...connectionFixture('a', 'gateway'), name: '</script><img src=x>',
+            baseUrl: 'https://example.com/" onmouseover="bad' };
+        const html = render({ connections: [hostile, connectionFixture('b')], selectedConnectionId: 'a' }, true);
         assert.ok(!html.includes('</script><img'));
         assert.ok(html.includes('&lt;/script&gt;&lt;img src=x&gt;'));
         assert.ok(html.includes('https://example.com/&quot; onmouseover=&quot;bad'));
@@ -1410,7 +1514,7 @@ suite('connection panel', () => {
     });
 
     test('legacy compatible records expose only two modes and keep behavior until explicit proxy conversion', () => {
-        const html = render({ connections: [connectionFixture('local', 'openai-compatible')], selectedConnectionId: 'local' });
+        const html = render({ connections: [connectionFixture('local', 'openai-compatible')], selectedConnectionId: 'local' }, true);
         assert.ok(!html.includes('id="manualModels"') && !html.includes('id="saveManualModels"'));
         assert.ok(html.includes('keeps its previous behavior until you save it as an OpenRouter proxy'));
         assert.ok(html.includes('Direct OpenRouter credit and preset APIs are not called through a proxy'));
@@ -1422,7 +1526,7 @@ suite('connection panel', () => {
         assert.ok(modes.includes('Direct OpenRouter') && modes.includes('OpenRouter proxy'));
         assert.ok(!modes.includes('openai-compatible'));
         const view = webviewHarness({ connections: [connectionFixture('local', 'openai-compatible')],
-            selectedConnectionId: 'local' });
+            selectedConnectionId: 'local' }, {}, true);
         assert.strictEqual(view.messages.length, 0);
         assert.strictEqual(view.element('connectionKind').value, 'gateway');
         view.element('connectionForm').fire('submit', { preventDefault() {} });
@@ -1434,9 +1538,26 @@ suite('connection panel', () => {
         const added: unknown[] = [];
         state.deps.addConnection = async input => { added.push(input); };
         await handlePanelMessage({ type: 'addConnection', value: { name: ' Gateway ', kind: 'gateway',
-            baseUrl: 'https://gateway.example/v1' } }, state.deps);
+            baseUrl: 'https://gateway.example/v1' } }, state.deps, true);
         assert.deepStrictEqual(added, [{ name: 'Gateway', kind: 'gateway', baseUrl: 'https://gateway.example/v1' }]);
         assert.deepStrictEqual(state.errors, []);
+    });
+
+    test('stable panel rejects crafted non-direct and custom-endpoint changes', async () => {
+        const state = spyDeps();
+        const actions: unknown[] = [];
+        state.deps.addConnection = async input => { actions.push(input); };
+        state.deps.updateConnection = async (id, patch) => { actions.push([id, patch]); };
+        for (const type of ['addConnection', 'updateConnection']) {
+            for (const kind of ['gateway', 'openai-compatible', 'openrouter']) {
+                await handlePanelMessage({ type, connectionId: 'a', value: {
+                    name: 'Rejected', kind, baseUrl: 'https://other.example/v1', apiKey: 'fixture-key',
+                } }, state.deps);
+            }
+        }
+        await handlePanelMessage({ type: 'saveManualModels', connectionId: 'a', value: '[{"id":"custom"}]' }, state.deps);
+        assert.deepStrictEqual(actions, []);
+        assert.strictEqual(state.errors.length, 6);
     });
 
     test('generic session history shows calls and tokens when cost is missing or zero', () => {
@@ -1464,9 +1585,9 @@ suite('connection panel', () => {
         state.deps.deleteConnection = async id => { actions.push(['delete', id]); };
         state.deps.selectConnection = async id => { actions.push(['select', id]); };
         await handlePanelMessage({ type: 'addConnection', value: { name: ' Local ', kind: 'gateway',
-            baseUrl: 'http://localhost:1234/v1' } }, state.deps);
+            baseUrl: 'http://localhost:1234/v1' } }, state.deps, true);
         await handlePanelMessage({ type: 'setConnectionEnabled', connectionId: 'a', value: false }, state.deps);
-        await handlePanelMessage({ type: 'saveManualModels', connectionId: 'b', value: '[{"id":"m","contextLength":32768,"toolCalling":true}]' }, state.deps);
+        await handlePanelMessage({ type: 'saveManualModels', connectionId: 'b', value: '[{"id":"m","contextLength":32768,"toolCalling":true}]' }, state.deps, true);
         await handlePanelMessage({ type: 'deleteConnection', connectionId: 'a' }, state.deps);
         await handlePanelMessage({ type: 'selectConnection', connectionId: 'b' }, state.deps);
         assert.deepStrictEqual(actions, [
@@ -1476,9 +1597,9 @@ suite('connection panel', () => {
             ['delete', 'a'], ['select', 'b'],
         ]);
         for (const value of ['{}', '[{"id":"m"},{"id":"m"}]', '[{"id":"m","contextLength":-1}]', '[{"id":"m","toolCalling":"yes"}]']) {
-            await handlePanelMessage({ type: 'saveManualModels', connectionId: 'b', value }, state.deps);
+            await handlePanelMessage({ type: 'saveManualModels', connectionId: 'b', value }, state.deps, true);
         }
-        await handlePanelMessage({ type: 'addConnection', value: { name: 'bad', kind: 'gateway', baseUrl: 'https://user:pass@example.com/v1' } }, state.deps);
+        await handlePanelMessage({ type: 'addConnection', value: { name: 'bad', kind: 'gateway', baseUrl: 'https://user:pass@example.com/v1' } }, state.deps, true);
         assert.strictEqual(actions.length, 5, 'invalid input never reaches persistence');
         assert.strictEqual(state.errors.length, 5);
     });
@@ -1510,9 +1631,9 @@ suite('connection panel', () => {
         const saved: unknown[] = [];
         state.deps.addConnection = async input => { saved.push(input); };
         const input = { name: 'Proxy', kind: 'gateway', baseUrl: 'https://proxy.example/v1' };
-        await handlePanelMessage({ type: 'addConnection', value: { ...input, proxyAllowance: true } }, state.deps);
+        await handlePanelMessage({ type: 'addConnection', value: { ...input, proxyAllowance: true } }, state.deps, true);
         assert.deepStrictEqual(saved, [input]);
-        await handlePanelMessage({ type: 'addConnection', value: { ...input, kind: 'openai-compatible' } }, state.deps);
+        await handlePanelMessage({ type: 'addConnection', value: { ...input, kind: 'openai-compatible' } }, state.deps, true);
         assert.strictEqual(saved.length, 1);
         assert.strictEqual(state.errors.length, 1);
     });

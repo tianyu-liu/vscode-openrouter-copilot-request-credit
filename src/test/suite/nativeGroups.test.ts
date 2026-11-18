@@ -1,4 +1,6 @@
 import * as assert from 'assert';
+import { connectionModelId } from '../../connectionProvider';
+import { DEFAULT_CONNECTION_NAME, LEGACY_CONNECTION_ID } from '../../connections';
 import { NativeGroupDocument, NativeGroupEdit, NativeGroupHost, NativeGroupManager } from '../../nativeGroups';
 
 const vendor = 'test-vendor';
@@ -127,5 +129,53 @@ suite('Native connection group synchronization', () => {
         assert.strictEqual(await manager.ensureDefault({ id: 'a', name: 'Personal' }), 'exists');
         host.addGroup = async () => { throw new Error('Unsupported command'); };
         await assert.rejects(manager.ensureDefault({ id: 'a', name: 'Personal' }), /Unsupported command/);
+    });
+
+    test('explicit migration adopts the original group and preserves all existing JSONC', async () => {
+        const modelId = 'provider/model';
+        const modelSettings = '{/* keep value formatting */ "context": 65536}';
+        const initial = '[\r\n  {\r\n    // Keep the original model settings\r\n' +
+            `    "vendor": "${vendor}", "name": "${DEFAULT_CONNECTION_NAME}",\r\n` +
+            `    "settings": {"${modelId}": ${modelSettings}},\r\n  },\r\n` +
+            `  {"vendor": "other", "name": "${DEFAULT_CONNECTION_NAME}"},\r\n]\r\n`;
+        const { manager, document } = fixture(initial);
+        const connection = { id: LEGACY_CONNECTION_ID, name: DEFAULT_CONNECTION_NAME };
+        await assert.rejects(manager.update(connection), /already exists/);
+        await manager.reconcileDefault(connection);
+        const scopedId = connectionModelId(LEGACY_CONNECTION_ID, modelId);
+        assert.strictEqual(document.text, initial
+            .replace('  {\r\n', `  {\r\n    "connectionId": "${LEGACY_CONNECTION_ID}",\r\n`)
+            .replace('"settings": {', `"settings": {"${scopedId}": ${modelSettings},`));
+        await manager.reconcileDefault(connection);
+        assert.strictEqual(document.saves, 1);
+    });
+
+    test('explicit migration preserves previously configured scoped model settings', async () => {
+        const modelId = 'provider/model';
+        const scopedId = connectionModelId(LEGACY_CONNECTION_ID, modelId);
+        const settings = { [modelId]: { context: 65536 }, [scopedId]: { context: 32768 } };
+        const group = { vendor, name: DEFAULT_CONNECTION_NAME, settings };
+        const { manager, document } = fixture(JSON.stringify([group]));
+        await manager.reconcileDefault({ id: LEGACY_CONNECTION_ID, name: DEFAULT_CONNECTION_NAME });
+        assert.deepStrictEqual(JSON.parse(document.text), [{ ...group, connectionId: LEGACY_CONNECTION_ID }]);
+    });
+
+    test('explicit migration leaves ambiguous, already assigned, and nondefault groups untouched', async () => {
+        const name = DEFAULT_CONNECTION_NAME;
+        const group = () => ({ vendor, name });
+        const connection = { id: LEGACY_CONNECTION_ID, name };
+        for (const [target, groups] of [
+            [connection, [group(), group()]],
+            [connection, [{ ...group(), connectionId: 'proxy' }]],
+            [connection, [{ ...group(), connectionId: null }]],
+            [connection, [group(), { ...group(), name: 'Other', connectionId: LEGACY_CONNECTION_ID }]],
+            [{ id: 'new', name }, [group()]],
+        ] as const) {
+            const initial = JSON.stringify(groups);
+            const { manager, document } = fixture(initial);
+            await assert.rejects(manager.reconcileDefault(target), /already exists/);
+            assert.strictEqual(document.text, initial);
+            assert.strictEqual(document.saves, 0);
+        }
     });
 });

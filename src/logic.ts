@@ -433,15 +433,15 @@ export type ViewMode = "unlimited" | "manual" | "auto";
 const MODE_TEXT: Record<ViewMode, { short: string; long: string }> = {
     unlimited: {
         short: "No limit",
-        long: "No limit — this key shows no limit; showing your account-wide balance.",
+        long: "Showing the OpenRouter account balance.",
     },
     manual: {
         short: "Local-set limit",
-        long: "Local-set limit — this key shows no limit; the limit is set locally to help track usage.",
+        long: "This spending limit is set locally.",
     },
     auto: {
         short: "Key limit",
-        long: "Key limit — the cap comes from the API key itself.",
+        long: "OpenRouter enforces this key’s spending limit.",
     },
 };
 
@@ -617,12 +617,15 @@ export function buildDetail(
  *     <period> remaining: $<remaining>
  *     Resets: <reset date>
  */
+export type StatusBarBudgetDisplay = 'remaining' | 'usage';
+
 export function buildStatus(
     info: KeyInfo,
     limit: number,
     resetPeriod: ResetPeriod = "daily",
     includeByok = true,
-    accountCredits?: AccountCredits
+    accountCredits?: AccountCredits,
+    display?: StatusBarBudgetDisplay
 ): StatusView {
     const view = coreView(info, limit, resetPeriod, includeByok, accountCredits);
     const periodLabel = view.mode === "unlimited" ? t("All-time") : resetPeriodLabel(view.effectivePeriod);
@@ -632,6 +635,7 @@ export function buildStatus(
             : view.mode === "auto"
                 ? usedThisPeriod(info, view.effectivePeriod, view.includeByok)
                 : toNum(accountCredits?.total_usage);
+    const keyUsage = view.mode === 'unlimited' ? usedThisPeriod(info, 'never', view.includeByok) : usage;
     const resetLine =
         view.mode === "manual"
             ? view.resetDate
@@ -639,10 +643,7 @@ export function buildStatus(
                 ? describeReset(info.limit_reset)
                 : t("No reset");
 
-    // Status bar: keep the $ on the remaining figure, omit it on the
-    // denominator (general format, auto rounding). Only the manual guardrail
-    // prefixes $(error); the other modes rely on the error background.
-    const text =
+    const balance =
         view.mode === "unlimited"
             ? formatUsdOrNa(view.remainingNum)
             : view.mode === "manual"
@@ -650,13 +651,15 @@ export function buildStatus(
                 : `${formatUsdOrNa(view.remainingNum)}/${formatCompact(view.limitNum)}`;
 
     return {
-        text,
+        text: display === 'usage' ? formatUsdOrNa(keyUsage)
+            : display === 'remaining' ? formatUsdOrNa(view.remainingNum) : balance,
         tooltip: [
-            t("**OpenRouter key credits**"),
+            ...(display ? [] : [t("**OpenRouter key credits**")]),
             `*${t(MODE_TEXT[view.mode].short)}*`,
             t("{0} limit: {1}", periodLabel, formatUsd(view.limitNum)),
             t("{0} usage: {1}", periodLabel, formatUsd(usage)),
             t("{0} remaining: {1}", periodLabel, formatUsdOrNa(view.remainingNum)),
+            ...(display && view.mode === 'unlimited' ? [t('This key’s all-time usage: {0}', formatUsdOrNa(keyUsage))] : []),
             t("Resets: {0}", resetLine),
             ...(view.mode === "auto" && info.is_free_tier ? [t("Free tier: yes")] : []),
             // Hard breaks (two trailing spaces) — the status-bar hover markdown

@@ -77,6 +77,10 @@ const THEME_SHIM = `
         --vscode-button-background: #0078d4;
         --vscode-button-foreground: #ffffff;
         --vscode-button-hoverBackground: #0066b4;
+        --vscode-button-secondaryBackground: #e5e5e5;
+        --vscode-button-secondaryForeground: #333333;
+        --vscode-button-secondaryHoverBackground: #d8d8d8;
+        --vscode-toolbar-hoverBackground: #eeeeee;
         --vscode-errorForeground: #c42b1c;
         --vscode-charts-green: #16825d;
         --vscode-editor-selectionBackground: rgba(135, 206, 250, 0.25);

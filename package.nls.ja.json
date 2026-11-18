@@ -1,6 +1,6 @@
 {
   "displayName": "Copilot 用 OpenRouter：カスタムリクエストとクレジット確認",
-  "description": "Copilot Chat に OpenRouter プロバイダーを追加し、1 つのコントロールパネルを提供します。OpenRouter Request Builder のリクエストボディを貼り付けると、以後のすべてのチャットリクエストにその設定が適用されます。ステータスバーではキーのクレジット使用量を確認できます。",
+  "description": "複数の OpenRouter API キーを名前付き接続として Copilot Chat で使用し、接続ごとにカスタムリクエストとクレジットを管理できます。",
   "command.manage.title": "OpenRouter: プロバイダーを管理",
   "command.pasteTemplate.title": "OpenRouter: カスタムリクエストを貼り付け",
   "command.clearTemplate.title": "OpenRouter: カスタムリクエストをクリア",
@@ -9,6 +9,9 @@
   "config.creditResetPeriod.description": "ローカルの支出上限をリセットする周期を選択します（毎日、毎週、毎月、またはリセットなし）。ワークスペースでの設定は無視されます。",
   "config.creditIncludeByok.description": "表示される使用量とローカルの支出上限の計算に、自分の API キー（BYOK）の使用量を含めます。ワークスペースでの設定は無視されます。",
   "config.creditRefreshIntervalMinutes.description": "使用量とクレジット情報を更新する間隔を分単位で設定します（1〜1440）。ワークスペースでの設定は無視されます。",
+  "config.statusBarBudgetDisplay.description": "ステータスバーに表示する各キー予算の金額を選択します。",
+  "config.statusBarBudgetDisplay.remaining": "残額",
+  "config.statusBarBudgetDisplay.usage": "予算期間内の使用額",
   "config.sanitizeBase64Content.description": "送信前に、リクエスト本文のテキスト（メッセージ、推論、ツール呼び出しの引数）から長い base64 風の文字列を削除します。画像添付は変更しません。ワークスペースでの設定は無視されます。",
   "config.hideUnavailableModels.description": "アカウントで利用可能なモデルを照会し、このキーでは使えないモデルをモデルピッカーに表示しません。照会に失敗した場合はカタログ全体を表示します。ワークスペースでの設定は無視されます。",
   "config.outputReservePercent.description": "コンテキストウィンドウに対する出力予約の目標割合（%）。OpenRouter が公表する最大補完上限が仮の値である場合、または公表されていない場合に、返信用の予算を確保します。100 万トークンのウィンドウでは 12.5% で約 131K を確保します。下限と上限のトークン数で制約されます。ワークスペースでの設定は無視されます。",

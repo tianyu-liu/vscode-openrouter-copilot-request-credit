@@ -1,9 +1,9 @@
 # Native model group prototype
 
 This records the original `0.5.0-test.1` grouping prototype and its runtime findings. The prototype
-remains development-only; `0.5.0-test.2` now integrates named connections in production through
-`connections.ts`, `connectionProvider.ts`, and `nativeGroups.ts`. See [architecture](architecture.md)
-for the current implementation and [the update plan](../multi-provider-plan.md) for remaining work.
+runner uses a standalone fixture. Version 0.5.0 implements named direct OpenRouter groups in production
+through `connections.ts`, `connectionProvider.ts`, and `nativeGroups.ts`. See
+[architecture](architecture.md) and [release verification](verification.md).
 
 ## Run it
 

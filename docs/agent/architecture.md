@@ -15,8 +15,8 @@ and [font generator](../../scripts/build-status-icons.py).
   per-connection credit state and stale-refresh checks, shared settings/timer, status bar, and commands.
   `openrouterCopilot.manage` and `openrouterCopilot.pasteTemplate` open the panel;
   `openrouterCopilot.clearTemplate` clears the selected connection's request. The status bar opens the
-  panel through runtime-only `openrouterCopilot.show`. Its connection name follows the panel's selected
-  editor connection, independently of Copilot's selected model. Theme changes update the icon without
+  panel through runtime-only `openrouterCopilot.show`. It lists enabled and opted-in direct key budgets
+  in registry order, with the connection names in the tooltip. Theme changes update the icon without
   another account fetch. Credit refresh is single-flight per connection; a superseding refresh aborts
   that connection's older run. Session spend updates are event-driven through connection-tagged `onTurnCost`.
 - [connections.ts](../../src/connections.ts) — `ConnectionRegistry` stores named definitions in
@@ -42,20 +42,18 @@ and [font generator](../../scripts/build-status-icons.py).
   credentials untouched. Renaming can retire native model selections/pins, so the UI asks users to
   select the model again.
 - [panel.ts](../../src/panel.ts) — one webview with **Settings** and one tab per named connection.
-  Settings offers exactly **Direct OpenRouter** and **OpenRouter proxy**, and manages connection names,
-  endpoints, enabled state, deletion, and credentials,
+  Settings manages direct OpenRouter connection names, enabled state, deletion, and credentials,
   with one **Save connection** action for the group form. Blank key inputs retain the existing secret;
   **Clear key** is a separate immediate action. Saved masks appear as grey placeholders, never field
-  values; raw keys never enter webview draft state. Keyless saves are allowed for every API type.
+  values, and raw keys stay outside webview draft state. Keyless saves are allowed.
   Nonsecret connection edits survive key-clear refreshes when saved metadata is unchanged; Cancel or
   a changed saved definition discards those drafts.
-  Settings also holds the shared refresh interval, prompt safeguard, and output reserve. A named direct-OpenRouter tab
-  shows key credit details/budget, its availability filter, session spend, presets, and custom request
-  JSON. A proxy tab shows local token usage, returned costs, session spend, and custom request JSON;
-  direct credit/preset controls and manual model additions are unavailable. Output reserve uses a target percentage and
+  Settings also holds the shared refresh interval, status-bar budget display mode, prompt safeguard, and output reserve.
+  A named OpenRouter tab shows key credit details, the status-bar visibility option, the model availability filter,
+  session spend, presets, and custom request JSON. Output reserve uses a target percentage and
   lower/upper limits in decimal K (1 K = 1000 tokens). Per-model context-size choices remain in the
   model picker. Drafts and asynchronous panel messages are scoped by connection ID; stale renders are
-  discarded. Selecting a panel tab changes editing and status display, while Copilot's model group
+  discarded. Selecting a panel tab changes the connection being edited. Copilot's model group
   controls inference routing. `renderPanelHtml`, `handlePanelMessage`, and injected `PanelDeps` remain
   testable without a live webview. `readConfig` reads/validates application/global settings only.
 
@@ -105,17 +103,10 @@ They have controls in **Settings**. The four former global connection settings (
 `creditResetPeriod`, `creditIncludeByok`, `hideUnavailableModels`) are deprecated migration inputs;
 after migration the panel edits their equivalents in the selected connection definition.
 
-Request templates live in connection state and remain paste-apply JSON. Internal `openrouter` means
-Direct OpenRouter; `gateway` means OpenRouter proxy. Proxies use the server's authoritative catalog,
-including empty catalogs, and never supplement or replace it with manual models. Proxy usage is
-tracked locally from returned token/cost data. No custom proxy balance or allowance API is called; old
-custom allowance flags are ignored and stripped from registry definitions.
-
-Older `openai-compatible` records remain readable with their previous runtime behavior until the user
-explicitly saves them as a proxy. The UI offers only the two supported modes and explains that saving
-converts the old connection. Conversion retains permanent ID, credentials, and scoped state, subject
-to endpoint/credential validation, but removes manual model definitions. Legacy manual metadata and
-fallback code exist only for compatibility, not as a third supported product mode.
+Request templates live in connection state and remain paste-apply JSON. The released extension exposes
+only `openrouter` connections. The registry retains `gateway` and `openai-compatible` records and their
+credentials, history, and obsolete fields. Production panel mutations, credit refreshes, native discovery,
+and model requests accept direct connection IDs only. Internal tests still exercise the proxy transport.
 
 Test seams remain in their modules: `refresh`, `doRefresh`, `getStatusText`, `createPanelDeps`,
 `stopRefreshTimerForTesting`, and `readConfig` cover refresh/panel compatibility; fake Memento and

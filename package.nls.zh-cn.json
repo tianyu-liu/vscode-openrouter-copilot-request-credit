@@ -1,6 +1,6 @@
 {
   "displayName": "适用于 Copilot 的 OpenRouter：自定义请求与额度检查",
-  "description": "在 Copilot Chat 中注册 OpenRouter 提供程序，并提供统一控制面板：粘贴 OpenRouter Request Builder 的请求体后，所有聊天请求都会应用其中的设置；状态栏会显示密钥额度的使用情况。",
+  "description": "在 Copilot Chat 中使用多个 OpenRouter API 密钥，通过命名连接分别管理自定义请求和额度。",
   "command.manage.title": "OpenRouter：管理提供程序",
   "command.pasteTemplate.title": "OpenRouter：粘贴自定义请求",
   "command.clearTemplate.title": "OpenRouter：清除自定义请求",
@@ -9,6 +9,9 @@
   "config.creditResetPeriod.description": "选择本地支出上限何时重置：每天、每周、每月或从不。工作区覆盖设置将被忽略。",
   "config.creditIncludeByok.description": "在显示的用量与本地支出上限的计算中计入自带密钥（BYOK）用量。工作区覆盖设置将被忽略。",
   "config.creditRefreshIntervalMinutes.description": "设置用量和额度数据的刷新间隔，以分钟为单位（1-1440）。工作区覆盖设置将被忽略。",
+  "config.statusBarBudgetDisplay.description": "选择状态栏中每个已显示密钥预算的金额类型。",
+  "config.statusBarBudgetDisplay.remaining": "剩余额度",
+  "config.statusBarBudgetDisplay.usage": "预算周期内的用量",
   "config.sanitizeBase64Content.description": "发送前从请求文本（消息、推理、工具调用参数）中移除类似 base64 的长字符串。图片附件不受影响。工作区覆盖设置将被忽略。",
   "config.hideUnavailableModels.description": "查询账户可用的模型，并在模型选择器中隐藏此密钥无法使用的模型。查询失败时回退到完整目录。工作区覆盖设置将被忽略。",
   "config.outputReservePercent.description": "输出预留目标占上下文窗口的百分比。当 OpenRouter 公布的最大补全上限为占位值或缺失时，会按此比例从窗口中为回复预留预算。在 100 万 token 的窗口上，12.5% 会预留约 131K。预留量受 token 下限与上限约束。工作区覆盖设置将被忽略。",

@@ -14,15 +14,11 @@ an operation already sending requests. Retries retain the same captured endpoint
 - The template applies to that connection's requests until cleared/replaced. With an empty template,
   no `provider` object is added; direct OpenRouter uses its normal routing.
 - A template `provider` object is sent **verbatim**: no default is merged in and none is added, so routing comes entirely from the pasted `provider`. No separate setting exists (the former P7 floor and its merge are gone).
-- On direct OpenRouter and proxies, `reasoning.effort`/`reasoning.enabled` come from the picker's Thinking Effort selector and are spread into the template's `reasoning` object — they overwrite only `effort`/`enabled`; other keys like `max_tokens`/`exclude` survive.
+- The picker's Thinking Effort selector sets `reasoning.effort` or `reasoning.enabled` in the
+  template's `reasoning` object. Other keys such as `max_tokens` and `exclude` survive.
 - Validate the pasted JSON before saving: bad input is rejected with a clear error, never partially applied.
 
 ## Reasoning passthrough (P1)
-
-The OpenRouter-specific echo/cache behavior below applies to both supported modes: Direct OpenRouter
-and OpenRouter proxy. Older `openai-compatible` records retain their previous behavior until explicitly
-saved as a proxy: thinking traces are echoed, but synthetic empty `reasoning_content` and automatic
-OpenRouter reasoning/cache configuration are omitted. This is migration compatibility only.
 
 DeepSeek V4 has thinking mode **on by default**, so every reply carries `reasoning_content`
 (OpenRouter treats it as an alias of `reasoning`). The echo rule is conditional: when a
@@ -67,49 +63,35 @@ the last) **no `session_id` is sent at all**, so no orphan OpenRouter session is
 - No default `provider` object is ever added; a template `provider` passes through verbatim
   in every case, so routing is decided by the pasted `provider`, never by a built-in default
   (the former P7 floor is gone).
-- Direct OpenRouter and proxy reasoning effort/enabled from the picker, merged over the template's `reasoning`; a picker
-  effort of `none` is sent as `reasoning.enabled: false`.
-- On direct OpenRouter and proxies, Anthropic-family models (`anthropic/*`, `~anthropic/*`) get a top-level `cache_control`
-  (5-min ephemeral, advancing) unless the template sets its own `cache_control` (P6).
-- Direct OpenRouter attribution headers `HTTP-Referer`/`X-Title` are hardcoded and sent only on
-  `/chat/completions`, not `/models`. Proxy and legacy compatible requests receive neither header.
-- Direct OpenRouter is fixed to `https://openrouter.ai/api/v1`. Proxies and legacy compatible connections use validated
-  API base URLs; HTTPS is required except for loopback HTTP, and redirect following is disabled.
+- A picker effort of `none` is sent as `reasoning.enabled: false`.
+- Anthropic-family models (`anthropic/*`, `~anthropic/*`) get a top-level `cache_control`
+  (5-min ephemeral, advancing) unless the template specifies `cache_control` (P6).
+- The fixed `HTTP-Referer` and `X-Title` attribution headers are sent on `/chat/completions`.
+- The release sends requests only to `https://openrouter.ai/api/v1` and refuses redirects.
 - Keys live in isolated per-connection SecretStorage slots, never settings.json.
-- OpenRouter key syntax (`sk-or-...`, case-insensitive after trimming) is prohibited for every non-direct
-  connection. Saves, retained-key type changes, and outgoing discovery/inference calls enforce
-  the same rule. Proxy-specific tokens and no-key connections are allowed. Syntax checks do not verify
-  a token's authenticity.
 - A template applies until cleared/replaced for that connection. Choosing a different connection's
   model in Copilot uses that connection's template and credential.
-- Direct OpenRouter and proxies retain OpenRouter usage handling (P5). Older compatible adapters
-  may require explicit `"stream_options": {"include_usage": true}` and add no such field automatically.
 - A valid reported usage chunk is forwarded to Copilot as a `usage` data part on a completed turn (P10), which
   is what puts *used / max tokens* in the context-usage ring. The **Copilot response footer is not
   a supported cost surface** for an extension-contributed provider (see [the P10 correction](provider.md)), and
   cost is deliberately kept out of the chat transcript too — it is reported in the panel's
   **Session spend** section instead (P12), where the figure is OpenRouter's `cost`, or the upstream
-  cost on a BYOK route where OpenRouter charges nothing. Proxy and legacy compatible connections also retain token-only
-  history; absent server cost is marked unavailable, and missing catalog pricing is unknown.
+  cost on a BYOK route where OpenRouter reports no charge and supplies the upstream cost.
+- HTTP and streamed errors use mapped messages. User-facing errors omit raw upstream bodies and messages.
+  The optional generation ID is restricted to the expected OpenRouter format.
 
-OpenRouter proxies use their authoritative server catalog, with no manual additions or unrestricted
-fallback. Usage consists of locally tracked token counts and returned costs; missing cost remains
-unavailable. No custom proxy allowance/balance API is called or configured, and direct OpenRouter
-credit/preset endpoints remain direct-only. Old custom allowance flags have no runtime effect.
+## Retained adapters
+
+The 0.5.0 panel and router keep saved `gateway` and `openai-compatible` connections inactive
+while retaining the records, keys, and scoped data. Production rejects these IDs before creating
+a child provider, so no catalog discovery, counting through a stale handle, or inference can run
+for them. See [Provider internals](provider.md) for the test-only adapter contracts.
 
 ## Canonical request templates
-
-The routing/cache examples below apply to direct OpenRouter and proxies subject to server support;
-account presets remain direct-only. Legacy compatible records keep their old passthrough semantics
-until explicitly saved as a proxy, which removes manual model definitions without changing connection
-identity or history. No proxy or legacy adapter calls direct credit/preset APIs.
 
 - Default: the empty template `{}` (paste nothing) — no default `provider` is added,
   so OpenRouter's own routing applies; any pin (`order`, `only`, a `quantizations` floor, …)
   is just a pasted `provider` object.
-- Published example: the empty template `{}` — every feature is enforced or provided by the
-  extension/OpenRouter itself; state the always-on behaviors (the P8 list) next to it so
-  readers do not paste `stream`/`session_id`/`usage`.
 - Power-user variants: `{ "provider": { "order": ["deepinfra"], "allow_fallbacks": false } }`
   (hard pin), or a `response_format` json_schema from the Request Builder, or an Anthropic
   cache TTL extension: `{ "cache_control": { "type": "ephemeral", "ttl": "1h" } }`.

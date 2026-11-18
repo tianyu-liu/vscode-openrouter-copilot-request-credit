@@ -107,6 +107,25 @@ import {
 } from "../../logic";
 
 suite("logic.buildStatus", () => {
+    test("status bar amounts show the key balance or usage for its budget period", () => {
+        const info: KeyInfo = {
+            limit: 10, limit_remaining: 7.65, limit_reset: "monthly",
+            usage: 4, usage_daily: 1, usage_weekly: 2, usage_monthly: 2.35, is_free_tier: false,
+        };
+        assert.strictEqual(buildStatus(info, 0, "daily", true, undefined, "remaining").text, "$7.65");
+        assert.strictEqual(buildStatus(info, 0, "daily", true, undefined, "usage").text, "$2.35");
+    });
+
+    test("an unlimited key shows its own spend in Usage mode", () => {
+        const info: KeyInfo = {
+            limit: null, limit_remaining: null, limit_reset: null,
+            usage: 2.35, usage_daily: 1, usage_weekly: 2, usage_monthly: 2.35, is_free_tier: false,
+        };
+        const account = { total_credits: 50, total_usage: 20 };
+        assert.strictEqual(buildStatus(info, 0, "daily", true, account, "remaining").text, "$30.00");
+        assert.strictEqual(buildStatus(info, 0, "daily", true, account, "usage").text, "$2.35");
+    });
+
     test("key has a configured limit -> shows remaining from limit_remaining", () => {
         const info: KeyInfo = {
             limit: 10,
@@ -567,7 +586,7 @@ suite("logic.buildDetail", () => {
         const detail = buildDetail(info, 10);
         assert.strictEqual(detail.mode, "auto");
         assert.strictEqual(detail.resetDate, "Rolling 7-day window");
-        assert.strictEqual(detail.modeText, "Key limit — the cap comes from the API key itself.");
+        assert.strictEqual(detail.modeText, "OpenRouter enforces this key’s spending limit.");
     });
 
     test("limitNum keeps the numeric limit for the auto-mode input", () => {

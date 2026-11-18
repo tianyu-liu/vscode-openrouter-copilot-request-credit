@@ -1004,25 +1004,29 @@ suite("resolveCostSession", () => {
 
 suite("error mapping", () => {
     test("401/402/429/other produce friendly messages", () => {
-        assert.match(mapResponseError(401, "{}").message, /invalid or expired/);
-        assert.match(mapResponseError(402, "{}").message, /credits/);
-        assert.match(mapResponseError(429, "{}").message, /rate limited/);
-        assert.match(mapResponseError(503, "boom").message, /503/);
-        assert.match(mapResponseError(503, "boom").message, /boom/);
+        assert.match(mapResponseError(401).message, /invalid or expired/);
+        assert.match(mapResponseError(402).message, /credits/);
+        assert.match(mapResponseError(429).message, /rate limited/);
+        assert.strictEqual(mapResponseError(503).message, "OpenRouter request failed (503).");
+        assert.strictEqual(mapResponseError(0).message, "OpenRouter request failed.");
     });
 
-    test("generation id is appended when present", () => {
-        assert.match(mapResponseError(500, "x", "gen-42").message, /gen-42/);
+    test("only a generation ID with the expected format is appended", () => {
+        const valid = "gen-1700000000-testExample";
+        assert.match(mapResponseError(500, valid).message, /gen-1700000000-testExample/);
+        assert.strictEqual(mapResponseError(500, "gen-1700000000-unvalidated value").message,
+            mapResponseError(500).message);
     });
 
-    test("streamed errors include message, code and provider", () => {
+    test("streamed errors omit arbitrary response fields and preserve safe classifications", () => {
         const err = mapStreamedError({
-            error: { message: "Field required", code: "server_error", metadata: { provider_name: "deepinfra" } },
-        });
-        assert.ok(err);
-        assert.match(err!.message, /Field required/);
-        assert.match(err!.message, /server_error/);
-        assert.match(err!.message, /deepinfra/);
+            error: { message: "synthetic message", code: "auth_echoed_value", metadata: { provider_name: "synthetic label" } },
+        }, "unvalidated header") as vscode.LanguageModelError;
+        assert.strictEqual(err.message, "OpenRouter stream error.");
+        assert.strictEqual(err.code, "NoPermissions");
+        const blocked = mapStreamedError({ error: { code: "429" } }) as vscode.LanguageModelError;
+        assert.strictEqual(blocked.code, "Blocked");
+        assert.match(blocked.message, /rate limited/);
     });
 
     test("non-error payloads return undefined", () => {
@@ -1855,7 +1859,7 @@ suite("provideLanguageModelChatResponse (stubbed stream)", () => {
         }
     });
 
-    test("a streamed error event rejects with a mapped error instead of an empty reply", async () => {
+    test("a streamed error event rejects without echoing upstream error fields", async () => {
         const body = sseBody([
             { choices: [{ delta: { content: "partial" } }] },
             {
@@ -1870,10 +1874,7 @@ suite("provideLanguageModelChatResponse (stubbed stream)", () => {
         const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
         await assert.rejects(
             provider.provideLanguageModelChatResponse(model, [], options, progress as never, token as never),
-            (err: Error) =>
-                err.message.includes("tools.13.custom.input_schema") &&
-                err.message.includes("server_error") &&
-                err.message.includes("deepinfra")
+            (err: Error) => err.message === "OpenRouter stream error."
         );
     });
 
@@ -1900,15 +1901,25 @@ suite("provideLanguageModelChatResponse (stubbed stream)", () => {
         );
     });
 
-    test("gives up after three retries on a persistent 503 and maps the error", async () => {
+    test("gives up after three retries on a persistent 503 without echoing the error body or unvalidated ID", async () => {
         for (let i = 0; i < 10; i++) {
-            nextResponses.push(() => new Response("down", { status: 503 }));
+            nextResponses.push(() => new Response("synthetic upstream body", {
+                status: 503, headers: { "x-generation-id": "synthetic upstream header" },
+            }));
         }
         const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
         await assert.rejects(
             provider.provideLanguageModelChatResponse(model, [], options, progress as never, token as never),
-            (err: Error) => err.message.includes("503")
+            (err: Error) => err.message === "OpenRouter request failed (503)."
         );
+        assert.strictEqual(fetchCalls.length, 4, "initial + three retries");
+    });
+
+    test("a transport failure is rethrown without request details", async () => {
+        for (let i = 0; i < 4; i++) {
+            nextResponses.push(() => { throw new Error("transport echoed a synthetic credential"); });
+        }
+        await assert.rejects(run(), (err: Error) => err.message === "OpenRouter request failed.");
         assert.strictEqual(fetchCalls.length, 4, "initial + three retries");
     });
 
@@ -2225,7 +2236,7 @@ suite("provideLanguageModelChatResponse (stubbed stream)", () => {
         const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
         await assert.rejects(
             provider.provideLanguageModelChatResponse(model, [], opts as never, progress as never, token as never),
-            (err: Error) => err.message.includes("provider exploded")
+            (err: Error) => err.message === "OpenRouter stream error."
         );
         assert.strictEqual(usageParts().length, 1, "the completed usage chunk is still reported");
         const session = getSessionCost("copilot-chat:conv-error");
@@ -2272,7 +2283,7 @@ suite("provideLanguageModelChatResponse (stubbed stream)", () => {
         );
         await assert.rejects(
             run(),
-            (err: Error) => /blocked insecure redirect to http:\/\/insecure\.example\/chat/.test(err.message)
+            (err: Error) => err.message === "OpenRouter: blocked insecure redirect."
         );
         assert.strictEqual(fetchCalls.length, 1, "an insecure redirect is not retried");
     });
@@ -2524,7 +2535,7 @@ suite("provideLanguageModelChatResponse (stubbed stream)", () => {
         assert.ok(
             String((sentBody(2).messages as Array<{ content: string }>)[0].content).includes("[base64 content removed:")
         );
-        assert.ok(!guardOn.cancelled(), "the 403 body is retained for error mapping when no retry happens");
+        assert.ok(guardOn.cancelled(), "the final 403 body is discarded without showing its contents");
     });
 });
 
@@ -3165,7 +3176,7 @@ suite("preset model entries (catalog + presets)", () => {
             async () => {
                 await assert.rejects(
                     provider.provideLanguageModelChatInformation({ silent: true } as never, token as never),
-                    (err: Error) => /blocked insecure redirect to http:\/\/insecure\.example\/models/.test(err.message)
+                    (err: Error) => err.message === "OpenRouter: blocked insecure redirect."
                 );
             }
         );

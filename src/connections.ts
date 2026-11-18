@@ -9,6 +9,7 @@ export interface ConnectionSettings {
     creditResetPeriod: 'daily' | 'weekly' | 'monthly' | 'never';
     creditIncludeByok: boolean;
     hideUnavailableModels: boolean;
+    showBudgetInStatusBar?: boolean;
 }
 export interface ManualModel {
     id: string;
@@ -46,6 +47,7 @@ export const DEFAULT_CONNECTION_SETTINGS: Readonly<ConnectionSettings> = Object.
     creditResetPeriod: 'daily',
     creditIncludeByok: true,
     hideUnavailableModels: true,
+    showBudgetInStatusBar: true,
 });
 
 const REGISTRY_KEY = 'connectionRegistry.v1';
@@ -102,7 +104,8 @@ function settings(input?: Partial<ConnectionSettings>): ConnectionSettings {
     if (!['daily', 'weekly', 'monthly', 'never'].includes(result.creditResetPeriod)) {
         throw new Error('Invalid credit reset period.');
     }
-    if (typeof result.creditIncludeByok !== 'boolean' || typeof result.hideUnavailableModels !== 'boolean') {
+    if (typeof result.creditIncludeByok !== 'boolean' || typeof result.hideUnavailableModels !== 'boolean'
+        || typeof result.showBudgetInStatusBar !== 'boolean') {
         throw new Error('Connection settings must use boolean values.');
     }
     return result;
@@ -249,13 +252,6 @@ export class ConnectionRegistry implements vscode.Disposable {
                     throw new Error('Invalid saved connection cleanup data.');
                 }
                 this.data = clone(saved);
-                this.data.connections = this.data.connections.map(item => {
-                    const { proxyAllowance, ...connection } = item as ConnectionDefinition & { proxyAllowance?: unknown };
-                    return connection;
-                });
-                if (saved.connections.some(item => Object.hasOwn(item, 'proxyAllowance'))) {
-                    await this.persist(this.data);
-                }
             } else {
                 const primary = await this.strictSecret(KEY_SECRET);
                 const credential = primary ?? await this.strictSecret(LEGACY_SECRET);
@@ -279,6 +275,15 @@ export class ConnectionRegistry implements vscode.Disposable {
     list(): ConnectionDefinition[] { return clone(this.require().connections); }
     get(id: string): ConnectionDefinition | undefined {
         return clone(this.require().connections.find(item => item.id === id));
+    }
+
+    listOpenRouter(): ConnectionDefinition[] {
+        return this.list().filter(connection => connection.kind === 'openrouter');
+    }
+
+    getOpenRouter(id: string): ConnectionDefinition | undefined {
+        const connection = this.get(id);
+        return connection?.kind === 'openrouter' ? connection : undefined;
     }
 
     private uniqueName(next: ConnectionDefinition): void {
@@ -352,6 +357,19 @@ export class ConnectionRegistry implements vscode.Disposable {
             this.uniqueName(next);
             await this.saveDefinition(next, apiKey);
             return clone(next);
+        });
+    }
+
+    setBudgetVisibility(id: string, showBudgetInStatusBar: boolean): Promise<void> {
+        return this.enqueue(async () => {
+            const current = this.require(id);
+            const connection = current.connections.find(item => item.id === id)!;
+            if (connection.kind !== 'openrouter') throw new Error('Connection is unavailable.');
+            if ((connection.settings.showBudgetInStatusBar !== false) === showBudgetInStatusBar) return;
+            const updated = { ...connection, settings: { ...connection.settings, showBudgetInStatusBar } };
+            // This display preference does not change the connection's routing revision.
+            await this.persist({ ...current,
+                connections: current.connections.map(item => item.id === id ? updated : item) });
         });
     }
 

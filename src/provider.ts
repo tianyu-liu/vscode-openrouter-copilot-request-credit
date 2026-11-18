@@ -847,13 +847,28 @@ function reportUsagePart(progress: vscode.Progress<ResponsePart>, usage: unknown
     }
 }
 
+let requestDumpDirectory: string | undefined;
+
+export function setRequestDumpDirectory(directory: string | undefined): void {
+    requestDumpDirectory = directory;
+}
+
 function dumpRequestBody(body: unknown): void {
-    if (process.env.OPENROUTER_RC_DEBUG !== '1') return;
+    if (!requestDumpDirectory || process.env.OPENROUTER_RC_DEBUG !== '1') return;
     try {
-        const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
-        const dir = path.join(root, 'tmp');
-        fs.mkdirSync(dir, { recursive: true });
-        fs.appendFileSync(path.join(dir, 'openrouter-requests.jsonl'), `${JSON.stringify(body)}\n`);
+        fs.mkdirSync(requestDumpDirectory, { recursive: true, mode: 0o700 });
+        const file = path.join(requestDumpDirectory, 'openrouter-requests.jsonl');
+        const existing = fs.lstatSync(file, { throwIfNoEntry: false });
+        if (existing && (!existing.isFile() || existing.nlink !== 1)) return;
+        const { O_WRONLY, O_APPEND, O_CREAT, O_NOFOLLOW } = fs.constants;
+        const fd = fs.openSync(file, O_WRONLY | O_APPEND | O_CREAT | (O_NOFOLLOW ?? 0), 0o600);
+        try {
+            const stat = fs.fstatSync(fd);
+            if (!stat.isFile() || stat.nlink !== 1 || (process.platform !== 'win32' && (stat.mode & 0o077))) return;
+            fs.appendFileSync(fd, `${JSON.stringify(body)}\n`);
+        } finally {
+            fs.closeSync(fd);
+        }
     } catch {
         return;
     }
@@ -881,7 +896,7 @@ export function retryBaseDelayMs(attempt: number): number {
 function assertSecureResponse(response: Response): void {
     const finalUrl = typeof response.url === 'string' ? response.url : '';
     if (finalUrl !== '' && !/^https:/i.test(finalUrl)) {
-        throw new Error(t('OpenRouter: blocked insecure redirect to {0}.', finalUrl));
+        throw new Error(t('OpenRouter: blocked insecure redirect.'));
     }
 }
 
@@ -927,32 +942,24 @@ async function fetchWithRetry(
             throw new vscode.CancellationError();
         }
         let response: Response | undefined;
-        let thrown: unknown;
         try {
             response = await fetch(url, { ...init, redirect: 'error' });
-        } catch (err) {
-            thrown = err;
+        } catch {
+            if (token.isCancellationRequested) {
+                throw new vscode.CancellationError();
+            }
+            if (init.signal?.aborted || attempt >= MAX_RETRIES) {
+                throw new Error(t('OpenRouter request failed.'));
+            }
         }
         if (response !== undefined) {
             if (/^https:/i.test(url)) {
                 assertSecureResponse(response);
             }
-        }
-        if (thrown !== undefined) {
-            if (token.isCancellationRequested) {
-                throw new vscode.CancellationError();
+            if (!isRetryable(response.status) || attempt >= MAX_RETRIES) {
+                return response;
             }
-            if (init.signal?.aborted && !token.isCancellationRequested) {
-                throw thrown;
-            }
-            if (attempt >= MAX_RETRIES) {
-                throw thrown;
-            }
-        } else if (response !== undefined && (!isRetryable(response.status) || attempt >= MAX_RETRIES)) {
-            return response;
-        }
-        if (response !== undefined) {
-            await response.body?.cancel();
+            await discardBody(response);
         }
         if (token.isCancellationRequested) {
             throw new vscode.CancellationError();
@@ -962,16 +969,32 @@ async function fetchWithRetry(
     }
 }
 
+async function discardBody(response: Response): Promise<void> {
+    try {
+        await response.body?.cancel();
+    } catch {
+        // Discarding an error response must not expose its transport error.
+    }
+}
+
 async function throwIfNotOk(response: Response): Promise<void> {
     if (response.ok) {
         return;
     }
-    const text = await response.text();
-    throw mapResponseError(response.status, text, response.headers.get('x-generation-id') ?? undefined);
+    await discardBody(response);
+    throw mapResponseError(response.status, response.headers.get('x-generation-id') ?? undefined);
 }
 
-export function mapResponseError(status: number, body: string, generationId?: string): Error {
-    const snippet = body.trim().slice(0, 200);
+function generationSuffix(generationId?: string): string {
+    return generationId && /^gen-\d{10}-[A-Za-z0-9]{1,64}$/.test(generationId)
+        ? t(' [generation {0}]', generationId) : '';
+}
+
+function isHttpErrorStatus(status: unknown): status is number {
+    return typeof status === 'number' && Number.isInteger(status) && status >= 400 && status < 600;
+}
+
+export function mapResponseError(status: number, generationId?: string): Error {
     let message: string;
     if (status === 401) {
         message = t('OpenRouter rejected your API key (401): it is invalid or expired. Paste a fresh key in the OpenRouter panel.');
@@ -979,12 +1002,12 @@ export function mapResponseError(status: number, body: string, generationId?: st
         message = t('OpenRouter: not enough credits (402). Check your balance in the status bar or the usage dashboard.');
     } else if (status === 429) {
         message = t('OpenRouter: rate limited (429) after retries. Try again in a moment.');
+    } else if (isHttpErrorStatus(status)) {
+        message = t('OpenRouter request failed ({0}).', status);
     } else {
-        message = t('OpenRouter request failed ({0}): {1}', status, snippet || t('no error body'));
+        message = t('OpenRouter request failed.');
     }
-    if (generationId) {
-        message += t(' [generation {0}]', generationId);
-    }
+    message += generationSuffix(generationId);
     if (status === 401) {
         return vscode.LanguageModelError.NoPermissions(message);
     }
@@ -999,27 +1022,13 @@ export function mapStreamedError(json: unknown, generationId?: string): Error | 
     if (typeof raw !== 'object' || raw === null) {
         return undefined;
     }
-    const e = raw as { message?: unknown; code?: unknown; metadata?: { provider_name?: unknown } };
-    const message =
-        typeof e.message === 'string' && e.message.trim() !== ''
-            ? e.message.trim().slice(0, 200)
-            : t('unknown stream error');
-    const code = typeof e.code === 'string' || typeof e.code === 'number' ? String(e.code) : undefined;
-    const providerName =
-        typeof e.metadata === 'object' && e.metadata !== null && typeof e.metadata.provider_name === 'string'
-            ? e.metadata.provider_name
-            : undefined;
-    let text = t('OpenRouter stream error: {0}', message);
-    if (code) {
-        text += t(' (code: {0})', code);
+    const { code } = raw as { code?: unknown };
+    const status = typeof code === 'string' && /^[45]\d\d$/.test(code) ? Number(code) : code;
+    if (isHttpErrorStatus(status)) {
+        return mapResponseError(status, generationId);
     }
-    if (providerName) {
-        text += t(' [provider: {0}]', providerName);
-    }
-    if (generationId) {
-        text += t(' [generation {0}]', generationId);
-    }
-    const codeText = (code ?? '').toLowerCase();
+    const text = t('OpenRouter stream error.') + generationSuffix(generationId);
+    const codeText = typeof code === 'string' ? code.toLowerCase() : '';
     if (codeText.includes('auth') || codeText.includes('permission') || codeText.includes('key')) {
         return vscode.LanguageModelError.NoPermissions(text);
     }
@@ -1854,7 +1863,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             if (response.status === 403 && sanitizedRemoved === 0 && (await isGuardrailBlock(response))) {
                 const cleaned = sanitizeRequestBody(body);
                 if (cleaned.removed > 0) {
-                    await response.body?.cancel();
+                    await discardBody(response);
                     trackedProgress.report(new vscode.LanguageModelTextPart(t(GUARDRAIL_RETRY_NOTICE)));
                     response = await fetchWithRetry(
                         `${this.baseUrl}/chat/completions`,
@@ -1891,6 +1900,8 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
                 try {
                     const result = await reader.read();
                     return { done: result.done, value: result.value };
+                } catch {
+                    throw new Error(t('OpenRouter stream error.') + generationSuffix(generationId));
                 } finally {
                     if (stallTimer !== undefined) {
                         clearTimeout(stallTimer);
@@ -2083,7 +2094,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
     }
 
     async getPresets(): Promise<PresetSummary[] | undefined> {
-        if (!this.isDirectOpenRouter) { return []; }
+        if (!this.isDirectOpenRouter || this.runtime.isCurrent?.() === false) { return []; }
         if (this.cachedPresets) {
             return this.cachedPresets;
         }
@@ -2126,6 +2137,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
     }
 
     private async fetchPresets(key: string, token: vscode.CancellationToken): Promise<PresetSummary[] | undefined> {
+        if (this.runtime.isCurrent?.() === false) return undefined;
         const generation = this.cacheGeneration;
         const bounded = boundedFetchSignal(token);
         try {
@@ -2165,7 +2177,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
     }
 
     async getPresetConfig(slug: string): Promise<Record<string, unknown> | undefined> {
-        if (!this.isDirectOpenRouter) { return undefined; }
+        if (!this.isDirectOpenRouter || this.runtime.isCurrent?.() === false) { return undefined; }
         const cached = this.presetConfigs.get(slug);
         if (cached) {
             return cached;
@@ -2196,6 +2208,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         token: vscode.CancellationToken,
         generation: number
     ): Promise<Record<string, unknown> | undefined> {
+        if (this.runtime.isCurrent?.() === false) return undefined;
         const bounded = boundedFetchSignal(token);
         try {
             const response = await fetchWithRetry(

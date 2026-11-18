@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import { connectionModelId, decodeModelId } from './connectionProvider';
+import { DEFAULT_CONNECTION_NAME, LEGACY_CONNECTION_ID } from './connections';
 
 const DEFAULT_VENDOR = 'openrouter-copilot-request-credit';
 const CONFIGURATION_COMMAND = 'workbench.action.openLanguageModelsJson';
@@ -157,6 +159,12 @@ function applyTextEdits(text: string, edits: readonly NativeGroupEdit[]): string
     return text;
 }
 
+function prependProperties(source: JsoncDocument, object: JsonNode, properties: string[]): NativeGroupEdit {
+    const start = object.start + 1;
+    const whitespace = /^[\t ]*(?:\r?\n[\t ]*)?/.exec(source.text.slice(start))![0];
+    return { start, end: start, text: properties.map(property => `${whitespace}${property},`).join('') };
+}
+
 /** Native rename/remove have no public command. Explicit panel actions edit only the active client profile. */
 export class NativeGroupManager {
     private pending: Promise<unknown> = Promise.resolve();
@@ -166,6 +174,14 @@ export class NativeGroupManager {
     add(connection: NativeGroupConnection): Promise<void> { return this.update(connection); }
 
     update(connection: NativeGroupConnection): Promise<void> {
+        return this.sync(connection, false);
+    }
+
+    reconcileDefault(connection: NativeGroupConnection): Promise<void> {
+        return this.sync(connection, connection.id === LEGACY_CONNECTION_ID && connection.name === DEFAULT_CONNECTION_NAME);
+    }
+
+    private sync(connection: NativeGroupConnection, adoptLegacy: boolean): Promise<void> {
         return this.enqueue(async () => {
             const document = await this.openCleanDocument();
             const source = new JsoncDocument(document.getText());
@@ -175,10 +191,32 @@ export class NativeGroupManager {
                 return group?.vendor === this.vendor && group.connectionId === connection.id;
             });
             if (own.length > 1) { throw new Error('Several native groups use this connection ID; fix Language Models JSON.'); }
-            if (items.some(item => {
+            const conflicts = items.filter(item => {
                 const group = groupValue(item);
                 return group?.vendor === this.vendor && group.name === connection.name && item !== own[0];
-            })) { throw new Error(`A native model group named “${connection.name}” already exists.`); }
+            });
+            if (conflicts.length > 0) {
+                const legacy = conflicts[0];
+                if (!adoptLegacy || own.length || conflicts.length !== 1 || legacy.properties!.has('connectionId')) {
+                    throw new Error(`A native model group named “${connection.name}” already exists.`);
+                }
+                const edits = [prependProperties(source, legacy, [`"connectionId": ${JSON.stringify(connection.id)}`])];
+                const settings = legacy.properties!.get('settings');
+                if (settings?.properties) {
+                    const aliases: string[] = [];
+                    // The new native group resolves model preferences by the connection-scoped model ID.
+                    for (const [modelId, value] of settings.properties) {
+                        const scope = decodeModelId(modelId);
+                        if (scope && connectionModelId(...scope) === modelId) continue;
+                        const scopedId = connectionModelId(connection.id, modelId);
+                        if (settings.properties.has(scopedId)) continue;
+                        aliases.push(`${JSON.stringify(scopedId)}: ${source.text.slice(value.start, value.end)}`);
+                    }
+                    if (aliases.length) edits.push(prependProperties(source, settings, aliases));
+                }
+                await this.saveEdits(document, edits);
+                return;
+            }
             const name = own[0]?.properties?.get('name');
             if (own[0] && !name) { throw new Error('The native connection group has no name; fix Language Models JSON.'); }
             if (name?.value === connection.name) { return; }

@@ -684,69 +684,42 @@ suite('connection registry', () => {
         registry.dispose();
     });
 
-    test('loading obsolete allowance flags removes only that field and preserves every connection and scoped value', async () => {
-        for (const obsolete of [true, false, 'old-value', null]) {
-            const data = fixture();
-            const initial = new ConnectionRegistry(data.state, data.secrets);
-            await initial.initialize();
-            for (const kind of ['gateway', 'openai-compatible'] as const) {
-                await initial.add({ name: kind, kind, baseUrl: 'https://proxy.test/v1' }, `${kind}-token`);
-            }
-            for (const connection of initial.list()) {
-                await initial.stateFor(connection.id).update('sessionCosts', { chat: 2 });
-                await initial.stateFor(connection.id).update('requestTemplate', { temperature: 0.3 });
-                await initial.stateFor(connection.id).update('contextCaps', { model: 16384 });
-            }
-            const before = initial.list();
-            const beforeKeys = [...data.credentials];
-            initial.dispose();
-            const saved = data.values.get(REGISTRY) as { connections: Array<{ proxyAllowance?: unknown }> };
-            for (const connection of saved.connections) connection.proxyAllowance = obsolete;
-            const registry = new ConnectionRegistry(data.state, data.secrets);
-            let changes = 0;
-            registry.onDidChange(() => changes++);
-            await registry.initialize();
-            assert.deepStrictEqual(registry.list(), before);
-            assert.deepStrictEqual([...data.credentials], beforeKeys);
-            assert.strictEqual(changes, 0);
-            for (const connection of registry.list()) {
-                assert.strictEqual(Object.hasOwn(connection, 'proxyAllowance'), false);
-                assert.deepStrictEqual(registry.stateFor(connection.id).get('sessionCosts'), { chat: 2 });
-                assert.deepStrictEqual(registry.stateFor(connection.id).get('requestTemplate'), { temperature: 0.3 });
-                assert.deepStrictEqual(registry.stateFor(connection.id).get('contextCaps'), { model: 16384 });
-            }
-            const normalized = data.values.get(REGISTRY) as { connections: object[] };
-            assert.ok(normalized.connections.every(connection => !Object.hasOwn(connection, 'proxyAllowance')));
-            registry.dispose();
-            const reopened = new ConnectionRegistry(data.state, data.secrets);
-            await reopened.initialize();
-            assert.deepStrictEqual(reopened.list(), before);
-            assert.deepStrictEqual([...data.credentials], beforeKeys);
-            reopened.dispose();
-        }
-    });
-
-    test('a failed obsolete-field cleanup can retry without changing saved identity, keys or history', async () => {
+    test('loading and editing direct connections preserves dormant proxy records and scoped data', async () => {
         const data = fixture();
         const initial = new ConnectionRegistry(data.state, data.secrets);
         await initial.initialize();
-        const proxy = await initial.add({ name: 'Proxy', kind: 'gateway', baseUrl: 'https://proxy.test/v1' }, 'proxy-token');
-        await initial.stateFor(proxy.id).update('sessionCosts', { chat: 3 });
+        const proxies = [];
+        for (const kind of ['gateway', 'openai-compatible'] as const) {
+            const connection = await initial.add({ name: kind, kind, baseUrl: 'https://proxy.test/v1' }, `${kind}-token`);
+            await initial.stateFor(connection.id).update('sessionCosts', { chat: 2 });
+            await initial.stateFor(connection.id).update('requestTemplate', { temperature: 0.3 });
+            await initial.stateFor(connection.id).update('contextCaps', { model: 16384 });
+            proxies.push(connection);
+        }
         initial.dispose();
-        const saved = data.values.get(REGISTRY) as { connections: Array<{ proxyAllowance?: boolean }> };
-        for (const connection of saved.connections) connection.proxyAllowance = true;
+
+        const saved = data.values.get(REGISTRY) as { connections: Array<{ id: string; proxyAllowance?: unknown }> };
+        for (const record of saved.connections.filter(item => item.id !== LEGACY_CONNECTION_ID)) {
+            record.proxyAllowance = { obsolete: true };
+        }
         const before = copy([...data.values]);
         const beforeKeys = [...data.credentials];
-        data.failure.at = data.calls.length + 2;
+        const beforeProxyRecords = copy(saved.connections.filter(item => item.id !== LEGACY_CONNECTION_ID));
+
         const registry = new ConnectionRegistry(data.state, data.secrets);
-        await assert.rejects(registry.initialize(), /Injected failure/);
-        assert.deepStrictEqual([...data.values], before);
-        assert.deepStrictEqual([...data.credentials], beforeKeys);
-        data.failure.at = -1;
         await registry.initialize();
-        assert.deepStrictEqual(registry.get(proxy.id), proxy);
-        assert.strictEqual(await registry.readKey(proxy.id), 'proxy-token');
-        assert.deepStrictEqual(registry.stateFor(proxy.id).get('sessionCosts'), { chat: 3 });
+        assert.deepStrictEqual([...data.values], before);
+        assert.deepStrictEqual(registry.listOpenRouter().map(connection => connection.id), [LEGACY_CONNECTION_ID]);
+        await registry.update(LEGACY_CONNECTION_ID, { name: 'Personal' });
+        for (const proxy of proxies) {
+            assert.strictEqual(registry.getOpenRouter(proxy.id), undefined);
+            assert.deepStrictEqual(registry.stateFor(proxy.id).get('sessionCosts'), { chat: 2 });
+            assert.deepStrictEqual(registry.stateFor(proxy.id).get('requestTemplate'), { temperature: 0.3 });
+            assert.deepStrictEqual(registry.stateFor(proxy.id).get('contextCaps'), { model: 16384 });
+        }
+        const after = data.values.get(REGISTRY) as typeof saved;
+        assert.deepStrictEqual(after.connections.filter(item => item.id !== LEGACY_CONNECTION_ID), beforeProxyRecords);
+        assert.deepStrictEqual([...data.credentials], beforeKeys);
         registry.dispose();
     });
 });

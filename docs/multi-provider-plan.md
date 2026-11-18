@@ -1,11 +1,11 @@
-# Named OpenRouter connections update plan
+# Historical named connections plan
 
-Status: in progress for **0.5.0**. Current development build: **0.5.0-test.3**.
-Checkpoint: **2026-11-10**, ready for independent probing and reassessment; release acceptance is incomplete.
-The filename is retained from the earlier multi-provider design; the supported product scope is
-OpenRouter access through exactly two visible modes: **Direct OpenRouter** and **OpenRouter proxy**.
+This document records the two-mode design at the **2026-11-10** development checkpoint
+(`0.5.0-test.3`). The 0.5.0 release supports named direct OpenRouter connections.
+Saved proxy records are preserved and inactive. See the [README](../README.md) for usage and
+[verification status](agent/verification.md) for the release evidence.
 
-## Current design
+## Development design at that checkpoint
 
 Use named connections, each appearing as a separate Copilot model group. A connection's permanent ID
 is independent of its name and owns its credential, request template, model preferences, session

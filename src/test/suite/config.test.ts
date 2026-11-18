@@ -17,6 +17,7 @@ function fakeCfg(
         creditRefreshIntervalMinutes: 5,
         sanitizeBase64Content: true,
         hideUnavailableModels: true,
+        statusBarBudgetDisplay: "remaining",
         outputReservePercent: 12.5,
         outputReserveMinTokens: 16384,
         outputReserveMaxTokens: 262144,
@@ -45,6 +46,7 @@ suite("readConfig", () => {
             refreshIntervalMinutes: 5,
             sanitizeBase64Content: true,
             hideUnavailableModels: true,
+            statusBarBudgetDisplay: "remaining",
             outputReservePercent: 12.5,
             outputReserveMinTokens: 16384,
             outputReserveMaxTokens: 262144,
@@ -78,6 +80,12 @@ suite("readConfig", () => {
         );
         assert.strictEqual(readConfig(fakeCfg({ hideUnavailableModels: false })).hideUnavailableModels, false);
         assert.strictEqual(readConfig(fakeCfg({ hideUnavailableModels: true })).hideUnavailableModels, true);
+    });
+
+    test("status bar display accepts usage and defaults to remaining for invalid and workspace-only values", () => {
+        assert.strictEqual(readConfig(fakeCfg({ statusBarBudgetDisplay: "usage" })).statusBarBudgetDisplay, "usage");
+        assert.strictEqual(readConfig(fakeCfg({ statusBarBudgetDisplay: "bogus" })).statusBarBudgetDisplay, "remaining");
+        assert.strictEqual(readConfig(fakeCfg({}, { statusBarBudgetDisplay: "usage" })).statusBarBudgetDisplay, "remaining");
     });
 
     test("refreshIntervalMinutes: clamps to 1-1440 and falls back to 5", () => {

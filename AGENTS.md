@@ -10,9 +10,8 @@
 ## What this is
 
 A small **VS Code extension** that registers the **"OpenRouter: RC"** provider vendor in
-**Copilot Chat**, with a native model group for each named connection. The two supported modes are
-**Direct OpenRouter** and **OpenRouter proxy**: direct access or a proxy managing OpenRouter access.
-The package/vendor identifiers stay unchanged; connection names and permanent internal IDs are separate.
+**Copilot Chat**, with a native model group for each named direct OpenRouter connection.
+The package/vendor identifiers stay unchanged. Connection names and permanent internal IDs are separate.
 
 Direct OpenRouter requests bypass Copilot's CAPI proxy so the extension can send OpenRouter's
 `provider` routing object, `session_id`, and other request-body options. Credit tracking from the retired
@@ -22,23 +21,15 @@ OpenRouter connection.
 **Core flow (paste-apply):** add a connection and an optional credential in **Settings**, then use the named connection
 tab to paste request JSON, inspect usage, and configure its request. For OpenRouter, build the JSON at
 the [OpenRouter Request Builder](https://openrouter.ai/request-builder). Shared Settings holds the
-refresh interval, prompt safeguard, and output reserve. The selected panel connection controls editing
-and the status bar; the model selected in Copilot determines request routing.
+refresh interval, status-bar budget display mode, prompt safeguard, and output reserve. Each connection
+controls whether its budget appears beside the OpenRouter status-bar icon. Copilot's selected model group
+controls request routing.
 
-The shared transport supports tools, image input, SSE streaming, cancellation, and thinking traces.
-Both supported modes send OpenRouter session, reasoning, and cache fields. Only direct connections
-expose OpenRouter account credits and presets. Proxies use their authoritative server catalog, with
-no manual model additions or unrestricted fallback. Proxy usage consists only of local token and
-returned-cost tracking; no custom proxy balance, budget, or allowance API is called.
-All non-direct connections reject OpenRouter key syntax (`/^sk-or-/i` after trimming) during form/save
-validation and before network use; use a proxy token or no key. See [Request pipeline](docs/agent/request-pipeline.md).
-
-**Model choice is intentionally open:** direct connections expose the full OpenRouter catalog with an
-optional account-availability filter; proxies expose the server's permitted models. The extension
-adds no model allowlist. Internal `gateway` identifies the proxy adapter. Older `openai-compatible`
-records remain a migration detail: they retain their prior runtime behavior until explicitly saved
-as a proxy, preserving ID, credentials, and state while removing manual models. They are not a third
-supported mode.
+The transport supports tools, image input, SSE streaming, cancellation, and thinking traces. Direct
+connections expose the full OpenRouter catalog with an optional account-availability filter. Saved
+`gateway` and `openai-compatible` records, credentials, and scoped data are preserved. The release panel and
+router keep those connections inactive. Proxy transport remains covered by internal tests. See
+[Request pipeline](docs/agent/request-pipeline.md).
 
 ## Repo naming and origin
 
@@ -46,11 +37,10 @@ supported mode.
   name may stay different from the extension id. Display names:
   **"OpenRouter for Copilot with Custom Request & Credit Check"** (extension) and
   **"OpenRouter: RC"** (model picker).
-- Machine identifiers (renamed in the pre-pilot pass, no users yet): package name /
+- Machine identifiers: package name /
   provider vendor id `openrouter-copilot-request-credit`, command ids
-  `openrouterCopilot.*`, config namespace `openrouterCopilot.*` (the four credit
-  settings folded in as `openrouterCopilot.credit*`; nine `openrouterCopilot.*`
-  settings retained). Four former global connection settings are now deprecated migration inputs;
+  `openrouterCopilot.*`, config namespace `openrouterCopilot.*`. Four former global connection settings
+  are now deprecated migration inputs;
   the panel edits their per-connection equivalents. Migration moves the old `openrouterApiKey` into
   an isolated SecretStorage slot.
 - This repository originated inside a private skill repository and later
@@ -93,24 +83,17 @@ picker tooltip and detail line. The server re-reads `out/*.js` on every request 
 port with `PANEL_PREVIEW_PORT` or an argument, and edit `buildFixtures()` / `buildModelFixtures()`
 in the script to change the sample data.
 
-**Request-dump debug hook.** Setting `OPENROUTER_RC_DEBUG=1` makes `dumpRequestBody` append every
-outgoing `/chat/completions` body as one JSONL line to `<workspaceFolder ?? cwd>/tmp/openrouter-requests.jsonl`
-(the write is inside a swallowing `try/catch`, so a bad path never fails a turn). It runs on the real
-request path, immediately before each POST and after the base64 safeguard pass, so the recorded body is
-what goes on the wire; a guardrail retry attempt is dumped as its own line. The file holds verbatim
-prompt and tool content — `tmp/` is gitignored, never commit it, and it works under `npm test` too
-(cwd fallback), which is how the request-shape claims in this file can be re-verified on the wire rather
-than by reading code.
+**Request-dump debug hook.** The **Run Extension (dev host, request dump)** launch configuration sets
+`OPENROUTER_RC_DEBUG=1`. The Extension Development Host writes `openrouter-requests.jsonl` under that
+extension host's VS Code extension log directory (`context.logUri`). Installed builds ignore the flag.
+The log contains the serialized `/chat/completions` body, including prompt text, tool content, and
+images supplied to the model. Keep it private. Each body is recorded before transmission and after
+prompt sanitization. A guardrail retry with a new body gets its own entry.
 
-Two things to know before concluding anything from a missing dump line: the variable is **window
-scoped**, so a dev host started from a launch config that does not set it writes **nothing at all**
-(ask which launch config/window the run used before suspecting the extension), and a line is written
-**before** the POST, so a failed request still leaves one. When no dump is available, the same facts
-can be read from the extension's persisted ledger — `globalStorage/state.vscdb`, `ItemTable`, key =
-this extension's id, one JSON object holding `connectionRegistry.v1` and per-connection state under
-`connections.<id>.*` (`sessionCosts`, `parentSession`, `requestTemplate`, `contextCaps`). The registry
-contains credential slot references, never raw keys. VS Code holds a lock on that database, so copy
-the file first and open the copy read-only (Node's built-in `node:sqlite` `DatabaseSync` is enough).
+For settings and attribution evidence, the extension's VS Code global state contains
+`connectionRegistry.v1` and scoped keys under `connections.<id>.*`. These include `sessionCosts`,
+`parentSession`, `requestTemplate`, and `contextCaps`. The registry holds credential slot references.
+Read a copy of the state database with a read-only SQLite connection to avoid the active VS Code lock.
 
 ## Architecture
 

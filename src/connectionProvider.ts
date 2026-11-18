@@ -12,7 +12,7 @@ interface ProviderEntry {
 export function connectionModelId(connectionId: string, upstreamModelId: string): string {
     return `rc:${Buffer.from(JSON.stringify([connectionId, upstreamModelId])).toString('base64url')}`;
 }
-function decodeModelId(id: string): [string, string] | undefined {
+export function decodeModelId(id: string): [string, string] | undefined {
     try {
         if (!id.startsWith('rc:')) { return undefined; }
         const value: unknown = JSON.parse(Buffer.from(id.slice(3), 'base64url').toString());
@@ -34,11 +34,11 @@ export class ConnectionChatProvider implements vscode.LanguageModelChatProvider,
     readonly onDidChangeLanguageModelChatInformation = this.changes.event;
     readonly onTurnCost = this.costs.event;
 
-    constructor(private readonly registry: ConnectionRegistry) {
+    constructor(private readonly registry: ConnectionRegistry, private readonly allowProxyConnections = false) {
         this.subscriptions = [
             registry.onDidChange(() => {
                 for (const [id, entry] of this.entries) {
-                    const current = registry.get(id);
+                    const current = this.getConnection(id);
                     if (!current || current.revision !== entry.revision) {
                         entry.provider.resetCatalogCache();
                         if (!current) {
@@ -50,13 +50,17 @@ export class ConnectionChatProvider implements vscode.LanguageModelChatProvider,
                 }
                 this.changes.fire();
             }),
-            onTurnCost(cost => { if (cost.connectionId && registry.get(cost.connectionId)) { this.costs.fire(cost); } }),
+            onTurnCost(cost => { if (cost.connectionId && this.getConnection(cost.connectionId)) { this.costs.fire(cost); } }),
         ];
+    }
+
+    private getConnection(id: string): ConnectionDefinition | undefined {
+        return this.allowProxyConnections ? this.registry.get(id) : this.registry.getOpenRouter(id);
     }
 
     getProvider(connectionId: string): OpenRouterChatProvider | undefined {
         if (this.disposed) { return undefined; }
-        const connection = this.registry.get(connectionId);
+        const connection = this.getConnection(connectionId);
         if (!connection) { return undefined; }
         let entry = this.entries.get(connectionId);
         if (entry?.revision === connection.revision) { return entry.provider; }
@@ -68,8 +72,10 @@ export class ConnectionChatProvider implements vscode.LanguageModelChatProvider,
                 hideUnavailableModels: connection.settings.hideUnavailableModels,
                 manualModels: connection.models, accounting: previous,
                 readKey: () => this.registry.readKey(connectionId),
-                isCurrent: () => !this.disposed && this.registry.get(connectionId)?.revision === connection.revision
-                    && this.registry.get(connectionId)?.enabled === true,
+                isCurrent: () => {
+                    const current = this.getConnection(connectionId);
+                    return !this.disposed && current?.revision === connection.revision && current.enabled;
+                },
             }
         );
         const subscription = provider.onDidChangeLanguageModelChatInformation(() => {
@@ -90,12 +96,12 @@ export class ConnectionChatProvider implements vscode.LanguageModelChatProvider,
     ): Promise<vscode.LanguageModelChatInformation[]> {
         const id = (options as { configuration?: { connectionId?: unknown } }).configuration?.connectionId;
         if (typeof id !== 'string') { return []; }
-        const connection = this.registry.get(id);
+        const connection = this.getConnection(id);
         if (!connection?.enabled || this.disposed) { return []; }
         const provider = this.getProvider(id);
         if (!provider) { return []; }
         const models = await provider.provideLanguageModelChatInformation(options, token);
-        const current = this.registry.get(id);
+        const current = this.getConnection(id);
         if (this.disposed || !current?.enabled || current.revision !== connection.revision) { return []; }
         return models.map(model => ({
             ...model, id: connectionModelId(id, model.id), version: modelVersion(model.id, connection.revision),
@@ -107,7 +113,7 @@ export class ConnectionChatProvider implements vscode.LanguageModelChatProvider,
         provider: OpenRouterChatProvider; upstream: vscode.LanguageModelChatInformation; connection: ConnectionDefinition;
     } {
         const identity = decodeModelId(model.id);
-        const connection = identity ? this.registry.get(identity[0]) : undefined;
+        const connection = identity ? this.getConnection(identity[0]) : undefined;
         if (this.disposed || !identity || !connection?.enabled
             || model.version !== modelVersion(identity[1], connection.revision)) {
             throw vscode.LanguageModelError.NotFound('This connection changed or is unavailable. Select its model again.');

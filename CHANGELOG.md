@@ -1,31 +1,20 @@
 # Changelog
 
-## Unreleased
+## 0.5.0
 
-- Combine connection details, enabled state, and API key management in one group editor with a single
-  **Save connection** action. Show saved keys as masked field hints, retain them on blank input, keep
-  a separate **Clear key** action, and allow keyless saves. API type remains editable; OpenRouter fixes
-  and disables its base URL.
-- Reject OpenRouter key syntax on non-direct connections during saves and before authenticated network
-  requests, including retained keys and legacy saved credentials. Proxy tokens and keyless saves remain allowed.
-- Add named direct OpenRouter and OpenRouter proxy connections with isolated credentials, request settings,
-  model identities, and session accounting; migrate the existing setup into one default connection.
-- Regroup the panel into shared **Settings** and connection-name tabs. Settings manages connections,
-  output reserve, refresh frequency, and text sanitization; each connection tab owns usage and requests.
-- Offer exactly two connection modes: **Direct OpenRouter** and **OpenRouter proxy**. Proxies retain
-  OpenRouter request fields and use the server catalog without manual additions or unrestricted fallback.
-  Preserve older compatible connections until explicitly converted; retain unknown pricing and token-only usage.
-- Block request redirects and stale connection selection; preserve captured request settings across retries.
-- Remove custom proxy allowance APIs and configuration. Proxy usage uses locally tracked token counts
-  and returned costs only; direct credit/preset APIs remain direct-only.
-- Use conservative limits and capabilities for incomplete proxy metadata, and wrap session summaries
-  on narrow panels.
-- Use `0.5.0-test.3` for this development build.
-- Replace the status bar's `OR` label with the official OpenRouter glyph, using Ink for light themes
-  and Cloud for dark themes, including high-contrast variants and live theme changes.
-- Remove the exact VS Code API-types pin, allow newer clients through an open-ended compatibility
-  range, and make the multi-provider plan's grouping check depend on runtime capabilities.
-- Include OpenRouter asset provenance and usage terms in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+- Add named OpenRouter connections with separate keys, request settings, model groups, and spend history.
+  Choose a model group in Copilot Chat to select the key.
+- Import the existing key, request settings, context choices, and spend history into **OpenRouter: RC**.
+  Open **OpenRouter: Manage provider** after updating to set up or adopt the model group in your VS Code profile.
+- Manage connections in **Settings**. Use each connection's tab for request JSON, presets, credit usage,
+  and session spend. **Output reserve** includes a **Reset to defaults** action.
+- Use consistent button styles and shorter help text throughout the panel.
+- Show budget amounts beside the OpenRouter icon in the status bar, with names in the tooltip. Choose which
+  connections appear and select **Remaining** (default) or **Usage** in shared settings.
+- Send requests directly to the fixed OpenRouter API and block redirects and stale connection selections.
+  Saved proxy test connections are kept inactive.
+- Limit opt-in request-body logs to the Extension Development Host's log directory.
+- Keep raw upstream response text out of error messages and skip preset lookups for disabled connections.
 
 ## 0.4.1
 

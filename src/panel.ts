@@ -24,110 +24,28 @@ import {
     ResetPeriod,
     resetPeriodLabel,
     AccountCredits,
+    type StatusBarBudgetDisplay,
 } from './logic';
 import {
-    ASSUMED_CONTEXT_TOKENS,
     DEFAULT_OUTPUT_RESERVE_MAX_TOKENS,
     DEFAULT_OUTPUT_RESERVE_MIN_TOKENS,
     DEFAULT_OUTPUT_RESERVE_PERCENT,
-    effectiveOutputReserve,
     normalizeOutputReservePolicy,
     OUTPUT_RESERVE_PERCENT_MAX,
     OUTPUT_RESERVE_PERCENT_MIN,
-    type ModelCatalogEntry,
 } from './modelInfo';
 
 const MAX_REFRESH_INTERVAL_MINUTES = 1440;
 const RESET_PERIODS: readonly ResetPeriod[] = ['daily', 'weekly', 'monthly', 'never'];
 
-const DEFAULT_RESERVE_K = Math.round(
-    effectiveOutputReserve({ context_length: ASSUMED_CONTEXT_TOKENS } as ModelCatalogEntry) / 1000
-);
-
-const PANEL_NOTES = {
-    storage: { term: 'Storage', text: 'Your API key is kept in VS Code SecretStorage.' },
-    byokRoutes: {
-        term: 'BYOK routes',
-        text: 'When OpenRouter reports zero, the session total uses the upstream provider\u2019s reported cost.',
-    },
-    unattributed: {
-        term: 'Unattributed',
-        text: 'Spend that reached OpenRouter with no Copilot chat identifier. An agent-host or SDK session talks to this provider through a client-BYOK bridge that carries no chat id, so nothing here is charged to an unrelated chat and no <code>session_id</code> is sent for it.',
-    },
-    sessionList: {
-        term: 'Session list',
-        text: 'One entry per Copilot chat session (<code>session_id</code>), newest first, up to the {0} most recent. Named from the chat title when VS Code has one, otherwise the id; times are local. Stored locally and kept across window reloads.',
-    },
-    hideUnavailable: {
-        term: 'Hide unavailable models',
-        text: 'Intersects the catalog with the models available to this key (provider preferences, privacy settings, guardrails) and hides the rest from the model picker. Falls back to the full catalog when the query fails.',
-    },
-    promptSanitization: {
-        term: 'Prompt sanitization',
-        text: 'Removes long base64-like runs from request text (messages, reasoning, tool arguments) to avoid encoded-prompt guardrails. Image attachments are not changed.',
-    },
-    streaming: { term: 'Streaming', text: 'Responses stream automatically; no <code>stream</code> field is needed.' },
-    liveConversation: {
-        term: 'Live conversation',
-        text: 'Copilot supplies the conversation, model, and tools; pasted <code>messages</code>, <code>prompt</code>, and <code>model</code> fields are ignored.',
-    },
-    thinkingEffort: {
-        term: 'Thinking effort',
-        text: 'The model picker controls <code>reasoning.effort</code> and <code>reasoning.enabled</code>; other reasoning options are preserved.',
-    },
-    providerRouting: {
-        term: 'Provider routing',
-        text: 'No routing is added automatically. A pasted <code>provider</code> object passes through unchanged.',
-    },
-    anthropicCaching: {
-        term: 'Anthropic caching',
-        text: 'Anthropic-family models (<code>anthropic/*</code>, including <code>~anthropic/*</code>) get a top-level, 5-minute <code>cache_control</code> breakpoint unless the template sets one.',
-    },
-    presetSelection: {
-        term: 'Preset selection',
-        text: 'Selecting a preset replaces the saved request with <code>{"preset": "&lt;slug&gt;"}</code>. Selecting "No preset loaded" clears it. The resolved configuration appears below as <code>//</code> comments; copy fields into the JSON to override the preset.',
-    },
-    pickerPresets: {
-        term: 'Picker presets',
-        text: '<code>@preset/&lt;slug&gt;</code> applies only while that picker entry is selected; it takes precedence over a different template preset.',
-    },
-    outputReserve: {
-        term: 'Output reserve',
-        text: 'The reply budget held back from the window for the picker\u2019s context budget. With the default {0}%, ~{1}K on a 1M-token window, bounded by the lower and upper limits so tiny windows stay sane and huge ones are capped. Limits are entered in K (1 K = 1000 tokens). A real published cap is reserved as-is unless the upper limit is smaller; it is never inflated to the lower limit. The per-model Context size menu still sets the prompt budget itself.',
-    },
-    autoLimit: {
-        term: 'Server-side limit',
-        text: 'The key has its own server-side limit; these local controls apply only when it has none. Include BYOK usage shows the key\u2019s authoritative <code>include_byok_in_limit</code> setting read-only.',
-    },
-} as const;
-
-type PanelNoteId = keyof typeof PANEL_NOTES;
-
-/** Positional arguments (`{0}`, `{1}`, …) for the notes that carry dynamic values. */
-const PANEL_NOTE_ARGS: Partial<Record<PanelNoteId, Array<string | number>>> = {
-    sessionList: [MAX_TRACKED_SESSIONS],
-    outputReserve: [DEFAULT_OUTPUT_RESERVE_PERCENT, DEFAULT_RESERVE_K],
-};
-
-function renderNoteList(ids: PanelNoteId[]): string {
-    const items = ids.map((id) => {
-        const { term, text } = PANEL_NOTES[id];
-        return `<li><strong>${t(term)}:</strong> ${t(text, ...(PANEL_NOTE_ARGS[id] ?? []))}</li>`;
-    });
-    return `<ul class="helptext">${items.join('')}</ul>`;
-}
-
-function renderNote(id: PanelNoteId): string {
-    return renderNoteList([id]);
-}
-
-function emptyState(text: string): string {
-    return `<p class="helptext empty">${text}</p>`;
+function helpText(text: string): string {
+    return `<p class="helptext">${text}</p>`;
 }
 
 export interface PanelSettings {
     sanitizeBase64Content: boolean;
     hideUnavailableModels: boolean;
+    statusBarBudgetDisplay: StatusBarBudgetDisplay;
     outputReservePercent: number;
     outputReserveMinTokens: number;
     outputReserveMaxTokens: number;
@@ -153,6 +71,7 @@ export interface ConfigSnapshot {
     refreshIntervalMinutes: number;
     sanitizeBase64Content: boolean;
     hideUnavailableModels: boolean;
+    statusBarBudgetDisplay: StatusBarBudgetDisplay;
     outputReservePercent: number;
     outputReserveMinTokens: number;
     outputReserveMaxTokens: number;
@@ -175,6 +94,8 @@ export function readConfig(cfg: vscode.WorkspaceConfiguration = getConfig()): Co
     const sanitizeBase64Content = typeof rawSanitize === 'boolean' ? rawSanitize : true;
     const rawHide = globalSetting<boolean>(cfg, 'hideUnavailableModels', true);
     const hideUnavailableModels = typeof rawHide === 'boolean' ? rawHide : true;
+    const statusBarBudgetDisplay = globalSetting<string>(cfg, 'statusBarBudgetDisplay', 'remaining') === 'usage'
+        ? 'usage' : 'remaining';
     const reserve = normalizeOutputReservePolicy(
         globalSetting<number>(cfg, 'outputReservePercent', DEFAULT_OUTPUT_RESERVE_PERCENT),
         globalSetting<number>(cfg, 'outputReserveMinTokens', DEFAULT_OUTPUT_RESERVE_MIN_TOKENS),
@@ -187,6 +108,7 @@ export function readConfig(cfg: vscode.WorkspaceConfiguration = getConfig()): Co
         refreshIntervalMinutes,
         sanitizeBase64Content,
         hideUnavailableModels,
+        statusBarBudgetDisplay,
         outputReservePercent: reserve.percent,
         outputReserveMinTokens: reserve.minTokens,
         outputReserveMaxTokens: reserve.maxTokens,
@@ -218,12 +140,12 @@ export function renderSessionCosts(sessions: SessionCost[] | undefined, generic 
     const chats = withSpend.filter(s => s.sessionId !== UNATTRIBUTED_SESSION_ID);
     const unattributed = withSpend.find(s => s.sessionId === UNATTRIBUTED_SESSION_ID);
     if (chats.length === 0 && unattributed === undefined) {
-        if (generic) return emptyState(t('No session usage recorded yet. Calls and token counts appear when the server reports usage.'));
-        return emptyState(t('No OpenRouter spend recorded yet. Totals appear here once a turn reports a cost. Spend that carried no chat identifier is collected under the <strong>Unattributed</strong> entry.'));
+        if (generic) return helpText(t('No session usage recorded yet. Calls and token counts appear when the server reports usage.'));
+        return helpText(t('Session spend appears here after a request reports a cost. Requests without a Copilot chat identifier appear under Unattributed.'));
     }
     const rows = chats.map((session, index) => renderSessionDetails(session, index === 0, generic)).join('');
     const unattributedHtml = unattributed ? renderSessionDetails(unattributed, chats.length === 0, generic) : '';
-    return `${rows}${unattributedHtml}${renderNote('sessionList')}`;
+    return `${rows}${unattributedHtml}${helpText(t('Up to {0} recent chats are stored locally and shown newest first.', MAX_TRACKED_SESSIONS))}`;
 }
 
 /** One collapsible spend entry; the unattributed bucket explains itself. */
@@ -265,8 +187,8 @@ function renderSessionDetails(session: SessionCost, open: boolean, generic = fal
                                 <tbody>${routeRows}</tbody>
                             </table>
                             ${session.sessionId === UNATTRIBUTED_SESSION_ID
-                                ? generic ? emptyState(t('Usage without a Copilot chat identifier is kept here, separate from named chats.')) : renderNote('unattributed')
-                                : `<p class="muted">${t(generic ? 'Session <code>{0}</code>' : 'OpenRouter session <code>{0}</code>', esc(session.sessionId))}</p>`}
+                                ? helpText(t('This spend came from requests without a Copilot chat identifier.'))
+                                : helpText(t(generic ? 'Session <code>{0}</code>' : 'OpenRouter session <code>{0}</code>', esc(session.sessionId)))}
                         </div>
                     </details>`;
 }
@@ -290,13 +212,24 @@ export interface PanelRenderOptions {
     settings?: Partial<PanelSettings>;
 }
 
-export function renderPanelHtml(options: PanelRenderOptions): string {
+export function renderPanelHtml(options: PanelRenderOptions, allowProxyConnections = false): string {
+    const { refreshIntervalMinutes = 5, settings = {} } = options;
+    const savedConnections: ConnectionDefinition[] = options.connections ?? [{
+        id: 'default', name: DEFAULT_CONNECTION_NAME, kind: 'openrouter', baseUrl: OPENROUTER_BASE_URL,
+        enabled: true, revision: 1,
+        settings: { creditLimit: options.limit ?? 0, creditResetPeriod: options.resetPeriod ?? 'daily',
+            creditIncludeByok: options.includeByok ?? true, hideUnavailableModels: settings.hideUnavailableModels ?? true },
+    }];
+    const connections = allowProxyConnections ? savedConnections : savedConnections.filter(item => item.kind === 'openrouter');
+    const selected = options.selectedConnectionId === undefined
+        ? savedConnections[0] : savedConnections.find(item => item.id === options.selectedConnectionId);
+    const connection = selected && connections.includes(selected) ? selected : connections[0];
+    const details = selected && selected === connection ? options : undefined;
     const {
         info,
-        limit = 0,
-        resetPeriod = 'daily',
-        includeByok = true,
-        refreshIntervalMinutes = 5,
+        limit = connection?.settings.creditLimit ?? 0,
+        resetPeriod = connection?.settings.creditResetPeriod ?? 'daily',
+        includeByok = connection?.settings.creditIncludeByok ?? true,
         fetchedAt,
         maskedKey,
         accountCredits,
@@ -305,17 +238,9 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
         presets,
         presetConfig,
         sessions,
-        settings = {},
-    } = options;
-    const connections = options.connections ?? [{
-        id: 'default', name: DEFAULT_CONNECTION_NAME, kind: 'openrouter', baseUrl: 'https://openrouter.ai/api/v1',
-        enabled: true, revision: 1,
-        settings: { creditLimit: limit, creditResetPeriod: resetPeriod, creditIncludeByok: includeByok,
-            hideUnavailableModels: settings.hideUnavailableModels ?? true },
-    }];
-    const connection = connections.find(item => item.id === options.selectedConnectionId) ?? connections[0];
+    } = details ?? {};
     const connectionId = connection?.id ?? '';
-    const newConnectionName = nextConnectionName(connections);
+    const newConnectionName = nextConnectionName(savedConnections);
     const isOpenRouter = !connection || connection.kind === 'openrouter';
     const isLegacyCompatible = connection?.kind === 'openai-compatible';
     const jsonForScript = (value: unknown): string => JSON.stringify(value).replace(/</g, '\\u003c');
@@ -348,11 +273,9 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
         ? `<div class="remainingline${detail.background === 'error' ? ' exhausted' : ''}"><span class="label">${t('Remaining')}</span><span class="limitvalue">${esc(detail.remaining)} / ${esc(detail.limitValue)}</span><span class="muted">${esc(resetText)}</span></div>`
         : '';
     const freeTierLine = detail
-        ? `<p class="freetier">${t('Free tier: {0}', detail.freeTier)}</p>`
+        ? helpText(t('Free tier: {0}', detail.freeTier))
         : '';
-    const modeLine = detail
-        ? `<div class="modeline">${esc(detail.modeText)}</div>`
-        : '';
+    const modeLine = detail ? helpText(esc(detail.modeText)) : '';
     const errorBanner = errorMessage
         ? `<div class="errbanner">${esc(errorMessage)}</div>`
         : '';
@@ -373,12 +296,11 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
                    ${RESET_PERIODS.map((p) => `<option value="${p}" ${periodSelection === p ? 'selected' : ''}>${resetPeriodLabel(p)}</option>`).join('')}
                </select>
                 <label class="optlabel"><input type="checkbox" id="includeByok" ${includeByokShown ? 'checked' : ''}${autoMode ? ' disabled' : ''} title="${autoMode ? t('Set on the API key; local controls apply only when the key has none') : t('Count bring-your-own-key usage in the remaining balance')}" /> ${t('Include BYOK usage')}${autoMode ? t(' (set on the key)') : ''}</label>
-           </div>
-           ${autoMode ? renderNote('autoLimit') : ''}`;
+           </div>`;
     const sessionCostHtml = renderSessionCosts(sessions, !isOpenRouter);
     const updatedLine = `<div class="keyline updatedline">
             ${fetchedAt ? `<span class="muted">${t('Updated {0}', esc(formatReset(fetchedAt, true)))}</span>` : ''}
-            <button id="refresh">${t('Refresh')}</button>
+            <button id="refresh" class="secondary" type="button">${t('Refresh')}</button>
         </div>`;
     const templateValue = template ? JSON.stringify(template, null, 2) : '';
     const selectedPreset = templatePresetSlug(template) ?? '';
@@ -406,12 +328,14 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
             .join('')}
         </select>`;
     const presetsHint = presets === undefined
-        ? emptyState(t('Presets could not be loaded for this key.'))
+        ? helpText(t('Presets could not be loaded for this key.'))
         : presets.length === 0
-            ? emptyState(t('No presets found for this key.'))
+            ? helpText(t('No presets found for this key.'))
             : '';
     const sanitizeBase64Content = settings.sanitizeBase64Content ?? true;
-    const hideUnavailableModels = settings.hideUnavailableModels ?? true;
+    const hideUnavailableModels = details?.settings?.hideUnavailableModels ?? connection?.settings.hideUnavailableModels ?? true;
+    const showBudgetInStatusBar = connection?.settings.showBudgetInStatusBar !== false;
+    const statusBarBudgetDisplay = settings.statusBarBudgetDisplay ?? 'remaining';
     const outputReservePercent = settings.outputReservePercent ?? DEFAULT_OUTPUT_RESERVE_PERCENT;
     const outputReserveMinTokens = settings.outputReserveMinTokens ?? DEFAULT_OUTPUT_RESERVE_MIN_TOKENS;
     const outputReserveMaxTokens = settings.outputReserveMaxTokens ?? DEFAULT_OUTPUT_RESERVE_MAX_TOKENS;
@@ -428,11 +352,11 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
     .group-management [hidden] { display: none !important; }
     .connection-url { overflow-wrap: anywhere; }
     .table-scroll { overflow-x: auto; }
-    @media (max-width: 480px) { body { padding: 12px; } input[type=password], input[type=text] { max-width: 100%; } .keyline { align-items: stretch; } .sessionbody { padding-left: 0; overflow-x: auto; } }
     body { font-family: var(--vscode-font-family); padding: 16px 20px; color: var(--vscode-foreground); }
     .section { margin-bottom: 22px; }
     .tabs { display: flex; overflow-x: auto; gap: 2px; border-bottom: 1px solid var(--vscode-panel-border, rgba(0,0,0,0.15)); margin: 0 0 16px; }
     .tab { color: var(--vscode-descriptionForeground, #888); background: transparent; border-bottom: 2px solid transparent; }
+    .tab:hover { background: var(--vscode-toolbar-hoverBackground, transparent); }
     .tab[aria-selected="true"] { color: var(--vscode-foreground); border-bottom-color: var(--vscode-focusBorder); }
     .tab:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -2px; }
     .tab-panel[hidden] { display: none; }
@@ -446,15 +370,12 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
     .connection-form .form-wide { grid-column: 1 / -1; }
     .connection-form .form-field > input, .connection-form .form-field > select { width: 100%; }
     .connection-form .keyline { margin-bottom: 0; }
+    .connection-form .form-field .helptext { margin: 0; }
     .connection-form .credential-summary { overflow-wrap: anywhere; }
     .connection-actions { border-top: 1px solid var(--vscode-panel-border); padding-top: 14px; }
-    button.secondary { background: var(--vscode-button-secondaryBackground, #e5e5e5);
-                       color: var(--vscode-button-secondaryForeground, #333); }
-    button.secondary:hover { background: var(--vscode-button-secondaryHoverBackground, #d8d8d8); }
     .connection-actions #deleteConnection { margin-left: auto; }
     .fieldgroup { display: inline-flex; align-items: center; gap: 8px; }
     .fieldgroup .muted { font-style: normal; }
-    .sep { color: var(--vscode-descriptionForeground, #888); }
     textarea {
         background: var(--vscode-input-background); color: var(--vscode-input-foreground);
         border: 1px solid var(--vscode-input-border, transparent); padding: 8px;
@@ -483,9 +404,14 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
         opacity: .7; cursor: not-allowed; }
     .optlabel { color: var(--vscode-descriptionForeground, #888); display: inline-flex; align-items: center; gap: 6px; }
     #refreshInterval { width: 56px; }
-    button { background: var(--vscode-button-background); color: var(--vscode-button-foreground);
-             border: none; padding: 5px 12px; cursor: pointer; white-space: nowrap; font: inherit; }
-    button:hover { background: var(--vscode-button-hoverBackground); }
+    button { border: 1px solid var(--vscode-button-border, transparent);
+             padding: 4px 11px; cursor: pointer; white-space: nowrap; font: inherit; }
+    button.primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+    button.primary:enabled:hover { background: var(--vscode-button-hoverBackground); }
+    button.secondary { background: var(--vscode-button-secondaryBackground, #e5e5e5);
+                       color: var(--vscode-button-secondaryForeground, #333); }
+    button.secondary:enabled:hover { background: var(--vscode-button-secondaryHoverBackground, #d8d8d8); }
+    button:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 2px; }
     button:disabled { opacity: .7; cursor: not-allowed; }
     .ok { color: var(--vscode-charts-green, #89d185); }
     .warn { color: var(--vscode-errorForeground, #f14c4c); }
@@ -516,13 +442,8 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
     .rows td.hl { background: var(--vscode-editor-selectionBackground, rgba(135, 206, 250, 0.25)); font-weight: 700; }
     .remainingline { display: flex; align-items: baseline; gap: 12px; margin-top: 10px; }
     .remainingline.exhausted .limitvalue { color: var(--vscode-errorForeground, #f14c4c); }
-    .freetier { font-style: italic; color: var(--vscode-descriptionForeground, #888); margin: 6px 0 0; }
-    .modeline { font-style: italic; color: var(--vscode-descriptionForeground, #888); margin: 0 0 10px; }
-    .muted { color: var(--vscode-descriptionForeground, #888); font-style: italic; }
+    .muted { color: var(--vscode-descriptionForeground, #888); }
     .helptext { font-size: 12px; line-height: 1.45; color: var(--vscode-descriptionForeground, #888); margin: 6px 0 0; }
-    .helptext.empty { font-style: italic; }
-    ul.helptext { padding-left: 18px; }
-    ul.helptext li { margin: 2px 0; }
     .sessioncost { font-family: var(--vscode-editor-font-family, monospace); font-weight: 600; }
     details.session { border: 1px solid var(--vscode-panel-border, rgba(0,0,0,0.1));
                       border-radius: 4px; margin: 6px 0; padding: 2px 8px; }
@@ -542,6 +463,8 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
     table.routes td.num { text-align: right; }
     @media (max-width: 480px) {
         body { padding: 12px; }
+        input[type=password], input[type=text] { max-width: 100%; }
+        .keyline { align-items: stretch; }
         .connection-form { grid-template-columns: minmax(0, 1fr); }
         .connection-toolbar { align-items: stretch; }
         .connection-toolbar .optlabel { flex-basis: 100%; }
@@ -564,42 +487,49 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
     <section class="tab-panel" id="panel-settings" role="tabpanel" aria-labelledby="tab-settings" tabindex="0">
     <div class="section group-management">
         <div class="section-title">${t('Group management')}</div>
-        <p class="helptext">${t('Manage named connections here. Choose a model from its connection group in Copilot to route a request.')}</p>
+        <p class="helptext">${t('In Copilot, choose a model from the connection you want to use.')}</p>
         <div class="keyline connection-toolbar">
             <label class="optlabel" for="connectionSelect">${t('Connection')}</label>
             <select id="connectionSelect">${connections.map(item => `<option value="${esc(item.id)}"${item.id === connectionId ? ' selected' : ''}>${esc(item.name)}${item.enabled ? '' : ` (${t('Disabled')})`}</option>`).join('')}</select>
-            <button id="addConnection">${t('Add connection')}</button>
+            <button id="addConnection" class="secondary" type="button">${t('Add connection')}</button>
         </div>
         <form id="connectionForm" class="connection-form">
-            <label class="form-field">${t('Connection name')}<input id="connectionName" type="text" required value="${esc(connection?.name ?? newConnectionName)}" placeholder="${t('For example: Personal, Work, Local')}" /></label>
-            <label class="form-field">${t('Connection mode')}<select id="connectionKind"><option value="openrouter"${isOpenRouter ? ' selected' : ''}>${t('Direct OpenRouter')}</option><option value="gateway"${!isOpenRouter ? ' selected' : ''}>${t('OpenRouter proxy')}</option></select></label>
+            <label class="form-field${allowProxyConnections ? '' : ' form-wide'}">${t('Connection name')}<input id="connectionName" type="text" required value="${esc(connection?.name ?? newConnectionName)}" /></label>
+            ${allowProxyConnections ? `<label class="form-field">${t('Connection mode')}<select id="connectionKind"><option value="openrouter"${isOpenRouter ? ' selected' : ''}>${t('Direct OpenRouter')}</option><option value="gateway"${!isOpenRouter ? ' selected' : ''}>${t('OpenRouter proxy')}</option></select></label>
             <p class="helptext form-wide" id="connectionTypeHint"></p>
             ${isLegacyCompatible ? `<p class="helptext form-wide" id="legacyConnectionHint">${t('This older connection keeps its previous behavior until you save it as an OpenRouter proxy.')}</p>` : ''}
-            <label class="form-field form-wide">${t('Base URL')}<input id="connectionUrl" type="text" required value="${esc(connection?.baseUrl ?? OPENROUTER_BASE_URL)}"${isOpenRouter ? ' disabled' : ''} placeholder="http://localhost:1234/v1" /></label>
+            <label class="form-field form-wide">${t('Base URL')}<input id="connectionUrl" type="text" required value="${esc(connection?.baseUrl ?? OPENROUTER_BASE_URL)}"${isOpenRouter ? ' disabled' : ''} placeholder="http://localhost:1234/v1" /></label>` : ''}
             <div class="form-field form-wide">
                 <label for="key">${t('API key')}</label>
                 <input type="password" id="key" autocomplete="off" aria-label="${isOpenRouter ? t('OpenRouter API key') : t('Proxy token')}" placeholder="${maskedKey ? esc(maskedKey) : isOpenRouter ? t('OpenRouter API key (sk-or-v1-...)') : t('Proxy token (optional)')}" />
                 <div id="savedKeyState" class="keyline credential-summary">
                     ${keyState}${maskedKey ? `<button id="clearKey" class="secondary" type="button">${t('Clear key')}</button>` : ''}
                 </div>
-                <p class="helptext" id="keyHelp">${t(maskedKey ? 'Enter a new key to replace the saved key. Leave blank to keep it.' : 'Add a key if this endpoint requires authentication. You can save without one.')}</p>
-                ${maskedKey ? `<p class="helptext" id="endpointKeyHelp" hidden>${t('To change the base URL, enter a replacement key or clear the saved key first.')}</p>` : ''}
-                ${renderNote('storage')}
+                <p class="helptext" id="keyHelp">${t(maskedKey ? 'Enter a new key to replace the saved key. Leave blank to keep it.' : 'You can save the connection before adding an OpenRouter API key.')}</p>
+                ${maskedKey && allowProxyConnections ? `<p class="helptext" id="endpointKeyHelp" hidden>${t('To change the base URL, enter a replacement key or clear the saved key first.')}</p>` : ''}
+                ${helpText(t('VS Code stores your API key in SecretStorage.'))}
             </div>
             <div class="form-wide">
                 <label class="optlabel"><input type="checkbox" id="connectionEnabled"${connection?.enabled !== false ? ' checked' : ''} /> ${t('Enable connection')}</label>
-                <p class="helptext">${t('Disable to hide its models in Copilot. Saved keys, settings, and history are kept.')}</p>
+                <p class="helptext">${t('Disabling this connection hides its models in Copilot and keeps its key, settings, and history.')}</p>
             </div>
             <div class="keyline connection-actions form-wide">
-                <button id="saveConnection" type="submit">${t('Save connection')}</button>
+                <button id="saveConnection" class="primary" type="submit">${t('Save connection')}</button>
                 <button id="cancelConnection" class="secondary" type="button"${connection ? '' : ' hidden'}>${t('Cancel')}</button>
                 ${connection ? `<button id="deleteConnection" class="secondary" type="button">${t('Delete connection')}</button>` : ''}
-                <span id="newConnectionHint" class="helptext" hidden>${t('Enter the new connection details, then save.')}</span>
+                <span id="newConnectionHint" class="helptext" hidden>${t('New connection')}</span>
             </div>
         </form>
     </div>
     <div class="section">
         <div class="section-title">${t('Shared settings')}</div>
+        <div class="keyline">
+            <label class="optlabel" for="statusBarBudgetDisplay">${t('Status bar shows')}</label>
+            <select id="statusBarBudgetDisplay">
+                <option value="remaining"${statusBarBudgetDisplay === 'remaining' ? ' selected' : ''}>${t('Remaining')}</option>
+                <option value="usage"${statusBarBudgetDisplay === 'usage' ? ' selected' : ''}>${t('Usage')}</option>
+            </select>
+        </div>
         <div class="keyline">
             <label class="optlabel" for="refreshInterval">${t('Usage refresh interval (minutes)')}</label>
             <input type="number" id="refreshInterval" min="1" max="${MAX_REFRESH_INTERVAL_MINUTES}" step="1" aria-label="${t('Usage refresh interval in minutes')}" title="${t('Refresh usage data every 1 to {0} minutes', MAX_REFRESH_INTERVAL_MINUTES)}" value="${esc(String(refreshIntervalMinutes))}" />
@@ -609,46 +539,47 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
         <div class="section-title">${t('Output reserve')}</div>
         <div class="keyline">
             <span class="fieldgroup">
-                <label class="optlabel" for="outputReservePercent">${t('Target:')}</label>
+                <label class="optlabel" for="outputReservePercent">${t('Target')}</label>
                 <input type="number" id="outputReservePercent" min="${OUTPUT_RESERVE_PERCENT_MIN}" max="${OUTPUT_RESERVE_PERCENT_MAX}" step="0.5" aria-label="${t('Output reserve as percent of window')}" value="${esc(String(outputReservePercent))}" />
                 <span class="muted">%</span>
             </span>
-            <span class="sep">.</span>
             <span class="fieldgroup">
-                <label class="optlabel" for="outputReserveMinTokens">${t('Lower limit:')}</label>
+                <label class="optlabel" for="outputReserveMinTokens">${t('Lower limit')}</label>
                 <input type="number" id="outputReserveMinTokens" min="0.5" step="0.5" aria-label="${t('Lower bound on the output reserve in K')}" value="${esc(ktok(outputReserveMinTokens))}" />
                 <span class="muted">K</span>
             </span>
-            <span class="sep">.</span>
             <span class="fieldgroup">
-                <label class="optlabel" for="outputReserveMaxTokens">${t('Upper limit:')}</label>
+                <label class="optlabel" for="outputReserveMaxTokens">${t('Upper limit')}</label>
                 <input type="number" id="outputReserveMaxTokens" min="0.5" step="0.5" aria-label="${t('Upper bound on the output reserve in K')}" value="${esc(ktok(outputReserveMaxTokens))}" />
                 <span class="muted">K</span>
             </span>
+            <button id="resetOutputReserve" class="secondary" type="button">${t('Reset to defaults')}</button>
         </div>
-        ${renderNote('outputReserve')}
+        ${helpText(t('The reserve sets aside room for the reply. When the model has no reliable output cap, the target is a percentage of its context window, bounded by the lower and upper limits. A reliable cap is bounded only by the upper limit. 1 K equals 1,000 tokens.'))}
     </div>
     <div class="section">
         <div class="section-title">${t('Prompt safeguard')}</div>
         <label class="optlabel"><input type="checkbox" id="sanitizeBase64" ${sanitizeBase64Content ? 'checked' : ''} /> ${t('Remove long base64-like text from prompts')}</label>
-        ${renderNote('promptSanitization')}
+        ${helpText(t('Applies to messages, reasoning, and tool arguments. Images are preserved.'))}
     </div>
     </section>
     <section class="tab-panel" id="panel-connection" role="tabpanel" aria-labelledby="tab-connection-${esc(encodeURIComponent(connectionId))}" tabindex="0" hidden>
-    ${connection ? `<p class="helptext connection-url">${esc(connection.name)} · ${esc(connection.baseUrl)}</p>${connection.enabled ? '' : `<p class="warn">${t('This connection is disabled. Enable it in Settings to show its models in Copilot.')}</p>`}` : emptyState(t('Add a connection in Settings to get started.'))}
+    ${connection && !isOpenRouter ? `<p class="helptext connection-url">${esc(connection.baseUrl)}</p>` : ''}
+    ${connection?.enabled === false ? `<p class="warn">${t('This connection is disabled. Enable it in Settings to show its models in Copilot.')}</p>` : ''}
     ${isOpenRouter ? `    <div class="section">
         <div class="section-title">${t('Credit usage')}</div>
-        ${detail ? `${modeLine}<div class="table-scroll">${usageTable}</div>${freeTierLine}${remainingLine}` : emptyState(t('No usage information yet. Save an API key to load account details.'))}
+        ${detail ? `${modeLine}<div class="table-scroll">${usageTable}</div>${freeTierLine}${remainingLine}` : helpText(t(maskedKey ? 'Refresh to load credit usage.' : 'Save an API key in Settings to see credit usage.'))}
         ${limitLine}
+        ${connection ? `<div class="keyline"><label class="optlabel"><input type="checkbox" id="showBudgetInStatusBar"${showBudgetInStatusBar ? ' checked' : ''} /> ${t('Show this budget in the status bar')}</label></div>` : ''}
         ${updatedLine}
     </div>
     <div class="section">
         <div class="section-title">${t('Model availability')}</div>
         <label class="optlabel"><input type="checkbox" id="hideUnavailableModels" ${hideUnavailableModels ? 'checked' : ''} /> ${t('Hide models this key cannot use')}</label>
-        ${renderNote('hideUnavailable')}
+        ${helpText(t('If OpenRouter can’t check this key’s access, the model picker shows the full catalog.'))}
     </div>
 ` : `<div class="section"><div class="section-title">${t('Usage')}</div>
-        ${emptyState(t('Session usage and reported cost are tracked locally. Direct OpenRouter credit and preset APIs are not called through a proxy.'))}
+        ${helpText(t('Session usage and reported cost are tracked locally. Direct OpenRouter credit and preset APIs are not called through a proxy.'))}
     </div>
     <div class="section"><div class="section-title">${t('Model availability')}</div>
         <p class="helptext">${t('The proxy supplies the available models. If discovery fails, no models are offered until it succeeds.')}</p>
@@ -656,7 +587,7 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
     <div class="section">
         <div class="section-title">${t('Session spend')}</div>
         ${sessionCostHtml}
-        ${isOpenRouter ? renderNote('byokRoutes') : ''}
+        ${isOpenRouter ? helpText(t('When OpenRouter reports zero for a BYOK request, the total uses the upstream provider’s reported cost.')) : ''}
     </div>
     ${isOpenRouter ? `<div class="section">
         <div class="section-title">${t('Presets')}</div>
@@ -665,16 +596,20 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
             ${presetSelectHtml}
         </div>
         ${presetsHint}
-        ${renderNoteList(['presetSelection', 'pickerPresets'])}
+        ${helpText(t('Selecting a preset replaces the saved request. The “No preset loaded” option clears it. Copy fields from the comments into the request JSON to override the preset.'))}
+        ${helpText(t('Selecting an <code>@preset/&lt;slug&gt;</code> model in the picker uses that preset for the model, overriding the saved request’s preset.'))}
     </div>` : ''}
 
     <div class="section">
         <div class="section-title">${t('Custom request')}</div>
         <textarea id="template" aria-label="${t('Custom request JSON')}" rows="10" placeholder="${t('Paste a request body from the OpenRouter Request Builder.')}"></textarea>
         <div class="keyline">
-            <button id="saveTemplate">${t('Save request')}</button>
+            <button id="saveTemplate" class="primary" type="button">${t('Save request')}</button>
         </div>
-        ${renderNoteList(isLegacyCompatible ? ['streaming', 'liveConversation'] : ['streaming', 'liveConversation', 'thinkingEffort', 'providerRouting', 'anthropicCaching'])}
+        ${helpText(t('Copilot supplies the model, conversation, and tools. Responses stream automatically. Pasted <code>model</code>, <code>messages</code>, and <code>prompt</code> fields are ignored.'))}
+        ${isLegacyCompatible ? '' : `
+        ${helpText(t('Set thinking effort in the model picker. Other <code>reasoning</code> options are kept. A pasted <code>provider</code> object is sent as entered.'))}
+        ${helpText(t('Models with IDs starting with <code>anthropic/</code> or <code>~anthropic/</code> get a top-level 5-minute <code>cache_control</code> breakpoint unless you set one in the request.'))}`}
     </div>
     </section>
 
@@ -769,13 +704,14 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
             persistStateSoon();
         });
         const keyEl = document.getElementById('key');
-        const looksLikeOpenRouterKey = ${isOpenRouterApiKey.toString()};
+        const looksLikeOpenRouterKey = ${allowProxyConnections ? isOpenRouterApiKey.toString() : '() => false'};
         const validateConnectionKey = () => {
-            const kind = document.getElementById('connectionKind').value;
+            if (!connectionKind) return true;
+            const kind = connectionKind.value;
             const value = keyEl.value.trim() || (!creatingConnection ? ${jsonForScript(maskedKey ?? '')} : '');
             const prohibited = kind !== 'openrouter' && looksLikeOpenRouterKey(value);
             keyEl.setCustomValidity(prohibited
-                ? ${jsonForScript(t('OpenRouter API keys cannot be used with a proxy. Use a proxy token or leave the key blank.'))}
+                ? ${jsonForScript(allowProxyConnections ? t('OpenRouter API keys cannot be used with a proxy. Use a proxy token or leave the key blank.') : '')}
                 : '');
             return !prohibited;
         };
@@ -824,9 +760,23 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
                 vsc.postMessage({ type: messageType, value: el.value });
             });
         };
-        bindReserveField('outputReservePercent', 'reservePercent', 'reservePercentBase', 'saveOutputReservePercent');
-        bindReserveField('outputReserveMinTokens', 'reserveMin', 'reserveMinBase', 'saveOutputReserveMinTokens');
-        bindReserveField('outputReserveMaxTokens', 'reserveMax', 'reserveMaxBase', 'saveOutputReserveMaxTokens');
+        const reserveFields = [
+            ['outputReservePercent', 'reservePercent', 'saveOutputReservePercent'],
+            ['outputReserveMinTokens', 'reserveMin', 'saveOutputReserveMinTokens'],
+            ['outputReserveMaxTokens', 'reserveMax', 'saveOutputReserveMaxTokens'],
+        ];
+        for (const [id, prop, messageType] of reserveFields) {
+            bindReserveField(id, prop, prop + 'Base', messageType);
+        }
+        bind('resetOutputReserve', 'click', () => {
+            for (const [id, prop] of reserveFields) {
+                delete draft[prop];
+                delete draft[prop + 'Base'];
+                document.getElementById(id).value = rendered[prop];
+            }
+            persistState();
+            vsc.postMessage({ type: 'resetOutputReserve' });
+        });
         bind('limit', 'change', () => {
             post('saveLimit', document.getElementById('limit').value);
         });
@@ -838,6 +788,12 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
         });
         bind('includeByok', 'change', () => {
             post('saveIncludeByok', document.getElementById('includeByok').checked);
+        });
+        bind('showBudgetInStatusBar', 'change', () => {
+            post('saveShowBudgetInStatusBar', document.getElementById('showBudgetInStatusBar').checked);
+        });
+        bind('statusBarBudgetDisplay', 'change', () => {
+            vsc.postMessage({ type: 'saveStatusBarBudgetDisplay', value: document.getElementById('statusBarBudgetDisplay').value });
         });
         bind('refreshInterval', 'change', () => {
             vsc.postMessage({ type: 'saveRefreshInterval', value: document.getElementById('refreshInterval').value });
@@ -852,7 +808,9 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
             post('saveTemplate', templateEl.value);
         });
         let creatingConnection = false;
+        const connectionKind = document.getElementById('connectionKind');
         const connectionUrl = document.getElementById('connectionUrl');
+        const directBaseUrl = ${jsonForScript(OPENROUTER_BASE_URL)};
         let customBaseUrl = ${jsonForScript(!isOpenRouter ? connection?.baseUrl ?? '' : '')};
         const connectionEditorBase = ${jsonForScript(JSON.stringify({
             name: connection?.name ?? newConnectionName, kind: connection?.kind ?? 'openrouter',
@@ -861,8 +819,8 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
         const rememberConnectionEditor = () => {
             draft.connectionEditor = {
                 name: document.getElementById('connectionName').value,
-                kind: document.getElementById('connectionKind').value,
-                baseUrl: connectionUrl.value,
+                kind: connectionKind?.value ?? 'openrouter',
+                baseUrl: connectionUrl?.value ?? directBaseUrl,
                 enabled: document.getElementById('connectionEnabled').checked,
             };
             draft.connectionEditorBase = connectionEditorBase;
@@ -870,40 +828,44 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
             persistState();
         };
         const updateKeyHint = () => {
-            const kind = document.getElementById('connectionKind').value;
+            const kind = connectionKind?.value ?? 'openrouter';
             const keepingKey = !creatingConnection && ${JSON.stringify(!!maskedKey)};
             keyEl.placeholder = keepingKey ? ${jsonForScript(maskedKey ?? '')}
                 : kind === 'openrouter' ? ${jsonForScript(t('OpenRouter API key (sk-or-v1-...)'))}
-                : ${jsonForScript(t('Proxy token (optional)'))};
+                : ${jsonForScript(allowProxyConnections ? t('Proxy token (optional)') : '')};
             document.getElementById('keyHelp').textContent = keepingKey
                 ? ${jsonForScript(t('Enter a new key to replace the saved key. Leave blank to keep it.'))}
                 : kind === 'openrouter'
-                    ? ${jsonForScript(t('Add a key if this endpoint requires authentication. You can save without one.'))}
-                    : ${jsonForScript(t('Use a proxy token, or leave blank if authentication is not required. OpenRouter keys (sk-or-...) are not accepted.'))};
+                    ? ${jsonForScript(t('You can save the connection before adding an OpenRouter API key.'))}
+                    : ${jsonForScript(allowProxyConnections ? t('Use a proxy token, or leave blank if authentication is not required. OpenRouter keys (sk-or-...) are not accepted.') : '')};
             const endpointHelp = document.getElementById('endpointKeyHelp');
             if (endpointHelp) endpointHelp.hidden = !keepingKey
                 || connectionUrl.value.trim().replace(/\\/+$/, '') === ${jsonForScript(connection?.baseUrl ?? '')};
         };
         const updateConnectionType = () => {
-            const kind = document.getElementById('connectionKind').value;
+            if (!connectionKind || !connectionUrl) {
+                updateKeyHint();
+                return;
+            }
+            const kind = connectionKind.value;
             keyEl.setAttribute('aria-label', kind === 'openrouter'
-                ? ${jsonForScript(t('OpenRouter API key'))} : ${jsonForScript(t('Proxy token'))});
+                ? ${jsonForScript(t('OpenRouter API key'))} : ${jsonForScript(allowProxyConnections ? t('Proxy token') : '')});
             if (kind === 'openrouter') {
-                if (!connectionUrl.disabled && connectionUrl.value !== ${jsonForScript(OPENROUTER_BASE_URL)}) {
+                if (!connectionUrl.disabled && connectionUrl.value !== directBaseUrl) {
                     customBaseUrl = connectionUrl.value;
                 }
-                connectionUrl.value = ${jsonForScript(OPENROUTER_BASE_URL)};
+                connectionUrl.value = directBaseUrl;
                 connectionUrl.disabled = true;
             } else {
                 if (connectionUrl.disabled) connectionUrl.value = customBaseUrl;
                 connectionUrl.disabled = false;
             }
             document.getElementById('connectionTypeHint').textContent = kind === 'openrouter'
-                ? ${jsonForScript(t('Direct OpenRouter access with account credits, presets, and OpenRouter request options.'))}
-                : ${jsonForScript(t('Access OpenRouter through a proxy. OpenRouter request options are retained; the proxy supplies the available models.'))};
+                ? ${jsonForScript(allowProxyConnections ? t('Direct OpenRouter access with account credits, presets, and OpenRouter request options.') : '')}
+                : ${jsonForScript(allowProxyConnections ? t('Access OpenRouter through a proxy. OpenRouter request options are retained; the proxy supplies the available models.') : '')};
             if (kind === 'gateway' && !creatingConnection && ${JSON.stringify(connection?.kind !== 'gateway' && !!connection?.models?.length)}) {
                 document.getElementById('connectionTypeHint').textContent += ' '
-                    + ${jsonForScript(t('Saving as an OpenRouter proxy removes manual model definitions.'))};
+                    + ${jsonForScript(allowProxyConnections ? t('Saving as an OpenRouter proxy removes manual model definitions.') : '')};
             }
             const legacyHint = document.getElementById('legacyConnectionHint');
             if (legacyHint) legacyHint.hidden = creatingConnection || kind !== 'gateway';
@@ -916,11 +878,11 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
         if (draft.connectionEditorBase === connectionEditorBase && editorDraft
             && typeof editorDraft.name === 'string' && typeof editorDraft.baseUrl === 'string'
             && typeof editorDraft.enabled === 'boolean'
-            && ['openrouter', 'gateway', 'openai-compatible'].includes(editorDraft.kind)) {
+            && (connectionKind ? ['openrouter', 'gateway', 'openai-compatible'].includes(editorDraft.kind)
+                : editorDraft.kind === 'openrouter' && editorDraft.baseUrl === directBaseUrl)) {
             document.getElementById('connectionName').value = editorDraft.name;
-            document.getElementById('connectionKind').value = editorDraft.kind === 'openai-compatible'
-                ? 'gateway' : editorDraft.kind;
-            connectionUrl.value = editorDraft.baseUrl;
+            if (connectionKind) connectionKind.value = editorDraft.kind === 'openai-compatible' ? 'gateway' : editorDraft.kind;
+            if (connectionUrl) connectionUrl.value = editorDraft.baseUrl;
             document.getElementById('connectionEnabled').checked = editorDraft.enabled;
             customBaseUrl = editorDraft.kind !== 'openrouter' ? editorDraft.baseUrl
                 : typeof draft.connectionCustomBaseUrl === 'string' ? draft.connectionCustomBaseUrl : '';
@@ -938,8 +900,8 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
             creatingConnection = true;
             customBaseUrl = '';
             document.getElementById('connectionName').value = ${jsonForScript(newConnectionName)};
-            document.getElementById('connectionUrl').value = 'https://openrouter.ai/api/v1';
-            document.getElementById('connectionKind').value = 'openrouter';
+            if (connectionUrl) connectionUrl.value = directBaseUrl;
+            if (connectionKind) connectionKind.value = 'openrouter';
             document.getElementById('newConnectionHint').hidden = false;
             document.getElementById('cancelConnection').hidden = false;
             document.getElementById('connectionEnabled').checked = true;
@@ -962,8 +924,8 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
             const saved = ${jsonForScript(connection ?? {})};
             customBaseUrl = saved.kind !== 'openrouter' ? saved.baseUrl || '' : '';
             document.getElementById('connectionName').value = saved.name || ${jsonForScript(newConnectionName)};
-            document.getElementById('connectionUrl').value = saved.baseUrl || 'https://openrouter.ai/api/v1';
-            document.getElementById('connectionKind').value = saved.kind === 'openai-compatible'
+            if (connectionUrl) connectionUrl.value = saved.baseUrl || directBaseUrl;
+            if (connectionKind) connectionKind.value = saved.kind === 'openai-compatible'
                 ? 'gateway' : saved.kind || 'openrouter';
             document.getElementById('connectionEnabled').checked = saved.enabled !== false;
             document.getElementById('newConnectionHint').hidden = true;
@@ -985,8 +947,8 @@ export function renderPanelHtml(options: PanelRenderOptions): string {
             }
             const value = {
                 name: document.getElementById('connectionName').value,
-                baseUrl: document.getElementById('connectionUrl').value,
-                kind: document.getElementById('connectionKind').value,
+                baseUrl: connectionUrl?.value ?? directBaseUrl,
+                kind: connectionKind?.value ?? 'openrouter',
                 enabled: document.getElementById('connectionEnabled').checked,
             };
             if (keyEl.value.trim()) value.apiKey = keyEl.value.trim();
@@ -1073,22 +1035,25 @@ async function saveConfig(deps: PanelDeps, key: string, value: unknown): Promise
     await deps.updateConfig(key, value);
 }
 
-function parseConnectionInput(value: unknown): ConnectionInput | undefined {
+function parseConnectionInput(value: unknown, allowProxyConnections: boolean): ConnectionInput | undefined {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
     const input = value as Record<string, unknown>;
     if (typeof input.name !== 'string' || !input.name.trim()
         || (input.kind !== 'openrouter' && input.kind !== 'gateway')
+        || (input.kind === 'gateway' && !allowProxyConnections)
         || typeof input.baseUrl !== 'string'
         || (input.enabled !== undefined && typeof input.enabled !== 'boolean')) return undefined;
+    const baseUrl = input.baseUrl.trim();
+    if (input.kind === 'openrouter' && baseUrl.replace(/\/+$/, '') !== OPENROUTER_BASE_URL) return undefined;
     try {
-        const url = new URL(input.baseUrl.trim());
+        const url = new URL(baseUrl);
         if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
             return undefined;
         }
     } catch {
         return undefined;
     }
-    return { name: input.name.trim(), kind: input.kind, baseUrl: input.baseUrl.trim(),
+    return { name: input.name.trim(), kind: input.kind, baseUrl,
         ...(input.enabled !== undefined ? { enabled: input.enabled } : {}),
     };
 }
@@ -1125,16 +1090,18 @@ function parseManualModels(value: unknown): ManualModel[] | undefined {
     return models;
 }
 
-export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Promise<void> {
+export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps, allowProxyConnections = false): Promise<void> {
     switch (msg.type) {
         case 'selectConnection':
             if (msg.connectionId) await deps.selectConnection?.(msg.connectionId);
             return;
         case 'addConnection':
         case 'updateConnection': {
-            const input = parseConnectionInput(msg.value);
+            const input = parseConnectionInput(msg.value, allowProxyConnections);
             if (!input) {
-                deps.error(t('Enter a connection name, API type, and an HTTP or HTTPS base URL without credentials, query, or fragment.'));
+                deps.error(allowProxyConnections
+                    ? t('Enter a connection name, API type, and an HTTP or HTTPS base URL without credentials, query, or fragment.')
+                    : t('Enter a connection name and use the OpenRouter API endpoint.'));
                 return;
             }
             const rawKey = (msg.value as Record<string, unknown>).apiKey;
@@ -1156,6 +1123,7 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Pr
             }
             return;
         case 'saveManualModels': {
+            if (!allowProxyConnections) return;
             const models = parseManualModels(msg.value);
             if (!models) {
                 deps.error(t('Enter a JSON array of models with unique ids and valid optional names, token limits, and capability flags.'));
@@ -1204,6 +1172,22 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Pr
                 return;
             }
             await saveConfig(deps, 'creditIncludeByok', msg.value);
+            return;
+        }
+        case 'saveShowBudgetInStatusBar': {
+            if (typeof msg.value !== 'boolean') {
+                deps.error(t('Choose whether this budget appears in the status bar.'));
+                return;
+            }
+            await saveConfig(deps, 'showBudgetInStatusBar', msg.value);
+            return;
+        }
+        case 'saveStatusBarBudgetDisplay': {
+            if (msg.value !== 'remaining' && msg.value !== 'usage') {
+                deps.error(t('Choose a valid status bar display.'));
+                return;
+            }
+            await saveConfig(deps, 'statusBarBudgetDisplay', msg.value);
             return;
         }
         case 'saveRefreshInterval': {
@@ -1258,6 +1242,11 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps): Pr
             await saveConfig(deps, 'outputReserveMaxTokens', n);
             return;
         }
+        case 'resetOutputReserve':
+            await saveConfig(deps, 'outputReservePercent', undefined);
+            await saveConfig(deps, 'outputReserveMinTokens', undefined);
+            await saveConfig(deps, 'outputReserveMaxTokens', undefined);
+            return;
         case 'clearKey':
             await deps.clearKey();
             await deps.doRefresh();

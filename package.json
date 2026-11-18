@@ -3,7 +3,7 @@
   "displayName": "%displayName%",
   "description": "%description%",
   "l10n": "./l10n",
-  "version": "0.5.0-test.3",
+  "version": "0.5.0",
   "publisher": "tianyu-liu",
   "license": "MIT",
   "repository": {
@@ -121,6 +121,17 @@
             "maximum": 1440,
             "scope": "application",
             "description": "%config.creditRefreshIntervalMinutes.description%"
+          },
+          "openrouterCopilot.statusBarBudgetDisplay": {
+            "type": "string",
+            "enum": ["remaining", "usage"],
+            "enumDescriptions": [
+              "%config.statusBarBudgetDisplay.remaining%",
+              "%config.statusBarBudgetDisplay.usage%"
+            ],
+            "default": "remaining",
+            "scope": "application",
+            "description": "%config.statusBarBudgetDisplay.description%"
           },
           "openrouterCopilot.sanitizeBase64Content": {
             "type": "boolean",

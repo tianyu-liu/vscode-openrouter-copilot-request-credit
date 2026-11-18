@@ -1,9 +1,14 @@
 import * as assert from 'assert';
+import { promises as fs } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import * as vscode from 'vscode';
 import { ConnectionRegistry, OPENROUTER_BASE_URL, type ConnectionDefinition } from '../../connections';
 import { ConnectionChatProvider, connectionModelId } from '../../connectionProvider';
 import { formatMessage, resetTranslator, setTranslator } from '../../i18n';
-import { OpenRouterChatProvider, setRetryDelayForTesting, UNATTRIBUTED_SESSION_ID } from '../../provider';
+import {
+    OpenRouterChatProvider, setRequestDumpDirectory, setRetryDelayForTesting, UNATTRIBUTED_SESSION_ID,
+} from '../../provider';
 
 function memoryState(): vscode.Memento {
     const values = new Map<string, unknown>();
@@ -48,7 +53,7 @@ suite('connection provider routing', () => {
         setRetryDelayForTesting(async () => {});
         registry = new ConnectionRegistry(memoryState(), memorySecrets());
         await registry.initialize();
-        router = new ConnectionChatProvider(registry);
+        router = new ConnectionChatProvider(registry, true);
     });
     teardown(() => {
         router.dispose(); registry.dispose(); globalThis.fetch = originalFetch;
@@ -67,6 +72,78 @@ suite('connection provider routing', () => {
                 : { _capturingTokenCorrelationId: 'marker' },
         }, { report() {} }, token);
     }
+
+    test('the release router rejects saved proxy groups and stale proxy handles without using any key', async () => {
+        const direct = await registry.add({ name: 'Direct', kind: 'openrouter' }, 'sk-or-direct-test');
+        const legacy = await registry.add({ name: 'Legacy', kind: 'openai-compatible', baseUrl: OPENROUTER_BASE_URL },
+            'legacy-token');
+        const gateway = await registry.add({ name: 'Proxy', kind: 'gateway', baseUrl: 'https://proxy.test/v1' },
+            'proxy-token');
+        const staleModels = [await models(legacy), await models(gateway)];
+        assert.ok(staleModels.every(found => found.length > 0), 'both groups had models in a test build');
+        router.dispose();
+        router = new ConnectionChatProvider(registry);
+        calls.length = 0;
+
+        for (const [index, connection] of [legacy, gateway].entries()) {
+            assert.deepStrictEqual(await models(connection), []);
+            assert.strictEqual(router.getProvider(connection.id), undefined);
+            const stale = staleModels[index][0];
+            await assert.rejects(request(stale), /connection changed or is unavailable/);
+            await assert.rejects(router.provideTokenCount(stale, 'hello', token), /connection changed or is unavailable/);
+        }
+        assert.strictEqual(calls.length, 0);
+
+        const [active] = await models(direct);
+        await registry.setBudgetVisibility(direct.id, false);
+        assert.strictEqual(registry.get(direct.id)?.settings.showBudgetInStatusBar, false);
+        await request(active);
+        const post = calls.find(call => call.init?.method === 'POST');
+        assert.strictEqual(post?.url, OPENROUTER_BASE_URL + '/chat/completions');
+        assert.strictEqual(new Headers(post?.init?.headers).get('Authorization'), 'Bearer sk-or-direct-test');
+        assert.strictEqual(await registry.readKey(legacy.id), 'legacy-token');
+        assert.strictEqual(await registry.readKey(gateway.id), 'proxy-token');
+    });
+
+    test('a disabled direct connection keeps its template without fetching preset metadata', async () => {
+        const saved = await registry.add({ name: 'Disabled', kind: 'openrouter', enabled: false }, 'fixture-key');
+        const child = router.getProvider(saved.id)!;
+        await child.setTemplate('{"preset":"fixture"}');
+        assert.deepStrictEqual(await child.getTemplate(), { preset: 'fixture' });
+        assert.deepStrictEqual(await child.getPresets(), []);
+        assert.strictEqual(await child.getPresetConfig('fixture'), undefined);
+        assert.strictEqual(calls.length, 0);
+    });
+
+    test('an opted-in request dump stays in the configured log directory and leaves credentials out', async () => {
+        const saved = await registry.add({ name: 'Debug', kind: 'openrouter' }, 'fixture-authorization');
+        const [model] = await models(saved);
+        const directory = await fs.mkdtemp(join(tmpdir(), 'openrouter-request-dump-'));
+        const file = join(directory, 'openrouter-requests.jsonl');
+        const previous = process.env.OPENROUTER_RC_DEBUG;
+        try {
+            process.env.OPENROUTER_RC_DEBUG = '1';
+            setRequestDumpDirectory(directory);
+            await request(model);
+            const data = await fs.readFile(file, 'utf8');
+            const payload = JSON.parse(data.trim());
+            assert.strictEqual(payload.model, 'anthropic/shared');
+            assert.ok(!data.includes('fixture-authorization'));
+            if (process.platform !== 'win32') {
+                assert.strictEqual((await fs.stat(file)).mode & 0o077, 0);
+                const target = join(directory, 'test-target');
+                await fs.rename(file, target);
+                await fs.symlink(target, file);
+                await request(model);
+                assert.strictEqual(await fs.readFile(target, 'utf8'), data);
+            }
+        } finally {
+            setRequestDumpDirectory(undefined);
+            if (previous === undefined) delete process.env.OPENROUTER_RC_DEBUG;
+            else process.env.OPENROUTER_RC_DEBUG = previous;
+            await fs.rm(directory, { recursive: true, force: true });
+        }
+    });
     test('duplicate upstream model IDs retain distinct stable identities and route key/body by selected connection', async () => {
         const one = await generic('One'); const two = await generic('Two', 9001);
         await registry.storeKey(one.id, 'one'); await registry.storeKey(two.id, 'two');
@@ -205,14 +282,14 @@ suite('connection provider routing', () => {
             await saved.initialize();
             const connection = await saved.add({ name: 'Legacy proxy', kind,
                 baseUrl: 'https://proxy.test/v1' }, 'proxy-token');
-            let local = new ConnectionChatProvider(saved);
+            let local = new ConnectionChatProvider(saved, true);
             try {
                 const [model] = await local.provideLanguageModelChatInformation({ silent: true,
                     configuration: { connectionId: connection.id } } as never, token);
                 const slot = (await secrets.keys()).find(key => key.startsWith(`connection.${connection.id}.key.`))!;
                 await secrets.store(slot, '  SK-OR-V1-LEGACY-TEST  ');
                 local.dispose();
-                local = new ConnectionChatProvider(saved);
+                local = new ConnectionChatProvider(saved, true);
                 const child = local.getProvider(connection.id)!;
                 calls.length = 0;
                 await assert.rejects(local.provideLanguageModelChatInformation({ silent: true,
@@ -551,7 +628,7 @@ suite('connection provider routing', () => {
         fetcher = async () => completed(0); await request(model, 'reported-free');
         assert.strictEqual(router.getSessionCosts(connection.id)[0].costUnavailable, undefined);
         await tick(); await registry.readKey(connection.id);
-        router.dispose(); router = new ConnectionChatProvider(registry);
+        router.dispose(); router = new ConnectionChatProvider(registry, true);
         history = router.getSessionCosts(connection.id);
         assert.strictEqual(history.length, 2);
         const unknown = history.find(session => session.sessionId === 'copilot-chat:unknown-cost')!;
