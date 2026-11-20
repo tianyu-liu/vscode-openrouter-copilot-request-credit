@@ -62,12 +62,17 @@ closest to 256K at or above a 196K floor (`defaultContextCap`). VS Code delivers
 `provideLanguageModelChatResponse` persists the prompt budget verbatim (`applyPickerContextCap`) in
 `globalState.contextCaps` and fires `onDidChangeLanguageModelChatInformation` — the new budget
 applies from the next turn. **The panel has no Context tab** and `readConfig` no longer carries context
-settings. The picker tooltip shows base vs stepped `$Mtok` in the markdown price table and the cap, with a
-`· ≤{threshold}` marker on the detail line — rendered whenever the reported budget sits **inside
-the base tier and below the model's own window-minus-output budget**, i.e. whenever a per-model size is
-actually in effect. There is no separate long-context note (removed as stale — the table's stepped
-columns already state the rate boundaries). The
-info block is plain lines labelled `Context window:` / `Effective prompt cap:` / `Effective completion cap:` /
+settings.
+
+The picker tooltip estimates blended prices per million tokens from OpenRouter's model catalog.
+Each context tier applies strictly above its `min_prompt_tokens` threshold. The tooltip resolves
+matching context-only overrides in catalog order, with later entries taking precedence for the
+rates they specify. Missing cache rates fall back to the effective prompt rate, and a missing
+reasoning rate falls back to the effective completion rate. The detail line's `· ≤{threshold}`
+marker appears when the prompt budget sits inside the base-price tier and below the model's
+window minus the output reserve.
+
+The info block shows `Context window:` / `Effective prompt cap:` / `Effective completion cap:` /
 `Max completion:` (sizes in `formatSize` short form, e.g. `200K`). `Effective completion cap:` is the reserve
 actually used (`effectiveOutputReserve`, always shown) and `Max completion:` reports the published
 `top_provider.max_completion_tokens` verbatim (`not listed` when absent); a real cap below half the

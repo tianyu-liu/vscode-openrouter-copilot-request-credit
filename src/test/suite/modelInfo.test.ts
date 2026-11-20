@@ -206,6 +206,21 @@ suite("model info", () => {
         assert.strictEqual(info.tooltip.split("$0.09").length - 1, 2, "output and thinking rows");
     });
 
+    test("Muse Ember retains its flat catalog estimate", () => {
+        const { detail, tooltip } = buildModelInfo({
+            id: "meta/muse-ember",
+            pricing: {
+                prompt: "0.0000001", completion: "0.0000005",
+                input_cache_read: "0.000000004", input_cache_write: "0.000000125",
+            },
+        });
+        assert.strictEqual(detail, "~$0.044/1M");
+        assert.ok(tooltip.includes("| % | Type | $Mtok |"));
+        assert.ok(tooltip.includes("| 6 | Cache write | $0.125 |"));
+        assert.ok(tooltip.includes("| 5 | Thinking | $0.500 |"));
+        assert.ok(tooltip.includes("| **100** | **Blended** | **$0.044** |"));
+    });
+
     test("cache-write and uncached prices are used when listed", () => {
         const m: ModelCatalogEntry = {
             id: "anthropic/claude-opus-5",
@@ -504,8 +519,142 @@ suite("model info", () => {
         assert.ok(info.tooltip.includes("| % | Type | \u2264272K | >272K |"), "tiered column headers");
         assert.ok(info.tooltip.includes("| 3 | Uncached | $1.250 | $2.500 |"), "uncached row spans both tiers");
         assert.ok(info.tooltip.includes("| 1 | Output | $10.000 | $15.000 |"), "output row spans both tiers");
-        assert.ok(info.tooltip.includes("| **100** | **Blended** | **$0.819** |"), "weighted total row");
+        assert.ok(info.tooltip.includes("| 6 | Cache write | $1.250 | $2.500 |"), "missing cache write follows prompt");
+        assert.ok(info.tooltip.includes("| **100** | **Blended** | **$0.819** | **$1.338** |"), "weighted total row");
         assert.ok(!info.tooltip.includes("up to 272,000 prompt tokens:"), "the old bullet price list is gone");
+    });
+
+    test("Qwen 3.7 Flash applies the effective completion rate to Thinking at each threshold", () => {
+        const { tooltip } = buildModelInfo({
+            id: "qwen/qwen3.7-flash",
+            context_length: 1_000_000,
+            pricing: {
+                prompt: "0.00000003", completion: "0.00000013",
+                input_cache_read: "0.000000006", input_cache_write: "0.000000038",
+                overrides: [
+                    { min_prompt_tokens: 32000, prompt: "0.0000001", completion: "0.0000004",
+                        input_cache_read: "0.00000002", input_cache_write: "0.000000125" },
+                    { min_prompt_tokens: 256000, prompt: "0.0000002", completion: "0.0000008",
+                        input_cache_read: "0.00000004", input_cache_write: "0.00000025" },
+                ],
+            },
+        });
+        assert.ok(tooltip.includes("| % | Type | ≤32K | ≤256K | >256K |"));
+        assert.ok(tooltip.includes("| 5 | Thinking | $0.130 | $0.400 | $0.800 |"));
+        assert.ok(tooltip.includes("| **100** | **Blended** | **$0.016** | **$0.051** | **$0.103** |"));
+    });
+
+    test("Gemini 3.1 Pro Preview inherits its listed cache-write and Thinking rates", () => {
+        const { tooltip } = buildModelInfo({
+            id: "google/gemini-3.1-pro-preview",
+            context_length: 1_048_576,
+            pricing: {
+                prompt: "0.000002", completion: "0.000012", internal_reasoning: "0.000012",
+                input_cache_read: "0.0000002", input_cache_write: "0.000000375",
+                overrides: [
+                    {
+                        min_prompt_tokens: 200000, prompt: "0.000004", completion: "0.000018",
+                        input_cache_read: "0.0000004", audio: "0.000004", input_audio_cache: "0.0000004",
+                    },
+                ],
+            },
+        });
+        assert.ok(tooltip.includes("| 6 | Cache write | $0.375 | $0.375 |"));
+        assert.ok(tooltip.includes("| 5 | Thinking | $12.000 | $12.000 |"));
+        assert.ok(tooltip.includes("| **100** | **Blended** | **$0.973** | **$1.262** |"));
+    });
+
+    test("a completion-only override retains explicit base cache rates", () => {
+        const { tooltip } = buildModelInfo({
+            id: "x/completion-only",
+            pricing: {
+                prompt: "0.000001", completion: "0.000002",
+                input_cache_read: "0.0000001", input_cache_write: "0",
+                overrides: [{ min_prompt_tokens: 200000, completion: "0.000004" }],
+            },
+        });
+        assert.ok(tooltip.includes("| 85 | Cache read | $0.100 | $0.100 |"));
+        assert.ok(tooltip.includes("| 6 | Cache write | $0.000 | $0.000 |"));
+        assert.ok(tooltip.includes("| 5 | Thinking | $2.000 | $4.000 |"));
+        assert.ok(tooltip.includes("| **100** | **Blended** | **$0.235** | **$0.355** |"));
+    });
+
+    test("overlapping overrides apply in catalog order per field, including zero prices", () => {
+        const { tooltip } = buildModelInfo({
+            id: "x/overlapping-tiers",
+            pricing: {
+                prompt: "0.000001", completion: "0.000002", internal_reasoning: "0",
+                input_cache_read: "0.0000001", input_cache_write: "0",
+                overrides: [
+                    { min_prompt_tokens: 300000, prompt: "0.000005", completion: "0" },
+                    { min_prompt_tokens: 200000, prompt: "0.000003", input_cache_write: "0.00000025" },
+                    { min_prompt_tokens: 200000, input_cache_read: "0" },
+                ],
+            },
+        });
+        assert.ok(tooltip.includes("| % | Type | ≤200K | ≤300K | >300K |"));
+        assert.ok(tooltip.includes("| 3 | Uncached | $1.000 | $3.000 | $3.000 |"));
+        assert.ok(tooltip.includes("| 85 | Cache read | $0.100 | $0.000 | $0.000 |"));
+        assert.ok(tooltip.includes("| 5 | Thinking | $0.000 | $0.000 | $0.000 |"));
+        assert.ok(tooltip.includes("| 1 | Output | $2.000 | $2.000 | $0.000 |"));
+        assert.ok(tooltip.includes("| **100** | **Blended** | **$0.135** | **$0.125** | **$0.105** |"));
+    });
+
+    test("cache-only tiers and discounts change the price table while preserving Context size policy", () => {
+        const model: ModelCatalogEntry = {
+            id: "x/cache-only-and-discount",
+            pricing: {
+                prompt: "0.000001", completion: "0.000002", input_cache_read: "0.0000001",
+                overrides: [
+                    { min_prompt_tokens: 200000, input_cache_read: "0.0000003" },
+                    { min_prompt_tokens: 250000, prompt: "0" },
+                ],
+            },
+        };
+        const { tooltip } = buildModelInfo(model);
+        assert.ok(tooltip.includes("| % | Type | ≤200K | ≤250K | >250K |"));
+        assert.ok(tooltip.includes("| 3 | Uncached | $1.000 | $1.000 | $0.000 |"));
+        assert.ok(tooltip.includes("| 6 | Cache write | $1.000 | $1.000 | $0.000 |"));
+        assert.ok(tooltip.includes("| **100** | **Blended** | **$0.295** | **$0.465** | **$0.375** |"));
+        assert.strictEqual(defaultContextCap(model), "full");
+        assert.strictEqual(buildContextCapSchema(model), undefined);
+    });
+
+    test("the detail marks a capped budget only when it fits in the base price segment", () => {
+        const model: ModelCatalogEntry = {
+            id: "x/capped-after-cache-step",
+            context_length: 1_000_000,
+            pricing: {
+                prompt: "0.000001", completion: "0.000002", input_cache_read: "0.0000001",
+                overrides: [
+                    { min_prompt_tokens: 200000, input_cache_read: "0.0000003" },
+                    { min_prompt_tokens: 250000, completion: "0.000004" },
+                ],
+            },
+        };
+        assert.strictEqual(defaultContextCap(model), 250000);
+        assert.strictEqual(buildModelInfo(model, { overrideTokens: 250000 }).detail, "~$0.295/1M");
+        assert.strictEqual(buildModelInfo(model, { overrideTokens: 200000 }).detail, "~$0.295/1M · ≤200K");
+    });
+
+    test("time-dependent, unknown-condition, and unreachable overrides stay out of the context price table", () => {
+        const unknownCondition = { min_prompt_tokens: 40000, prompt: "0.000008", future_condition: true };
+        const { tooltip } = buildModelInfo({
+            id: "x/conditional",
+            context_length: 300000,
+            pricing: {
+                prompt: "0.000001", completion: "0.000002",
+                overrides: [
+                    { utc_start: 0, utc_end: 1600, prompt: "0.000008" },
+                    { min_prompt_tokens: 20000, utc_start: 0, utc_end: 1600, prompt: "0.000008" },
+                    { min_prompt_tokens: 30000, utc_days: ["monday"], prompt: "0.000008" },
+                    unknownCondition,
+                    { min_prompt_tokens: 300000, prompt: "0.000008" },
+                ],
+            },
+        });
+        assert.ok(tooltip.includes("| % | Type | $Mtok |"));
+        assert.ok(tooltip.includes("| **100** | **Blended** | **$1.060** |"));
     });
 
     const STEPPED: ModelCatalogEntry = {

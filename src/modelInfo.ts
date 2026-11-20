@@ -6,9 +6,12 @@ export interface PricingOverride {
     completion?: string;
     input_cache_read?: string;
     input_cache_write?: string;
+    audio?: string;
+    input_audio_cache?: string;
+    input_cache_write_1h?: string;
     utc_start?: number;
     utc_end?: number;
-    utc_days?: number;
+    utc_days?: string[];
 }
 
 export interface ModelPricing {
@@ -211,7 +214,7 @@ const T_THINK = 5;
 const T_OUT = 1;
 export const ASSUMED_CONTEXT_TOKENS = 1_048_576;
 
-/** A stepped price that begins at `min_prompt_tokens` (OpenRouter `pricing.overrides`). */
+/** A stepped price that applies above `min_prompt_tokens` (OpenRouter `pricing.overrides`). */
 export interface LongContextTier {
     threshold: number;
     prompt: number;
@@ -563,32 +566,88 @@ interface PriceColumn extends PriceRow {
     header: string;
 }
 
+interface PriceTier {
+    threshold: number;
+    prices: PriceRow;
+}
+
+const displayedOverrideKeys = ['prompt', 'completion', 'input_cache_read', 'input_cache_write'] as const;
+// Other documented price keys can accompany a context tier without affecting this blend.
+const contextOverrideKeys = new Set([
+    'min_prompt_tokens', ...displayedOverrideKeys, 'audio', 'input_audio_cache', 'input_cache_write_1h',
+]);
+
+function priceRow(pricing: ModelPricing): PriceRow {
+    const pIn = parsePrice(pricing.prompt);
+    const pOut = parsePrice(pricing.completion);
+    return {
+        pIn,
+        pCw: priceOr(pricing.input_cache_write, pIn),
+        pCr: priceOr(pricing.input_cache_read, pIn),
+        pThink: priceOr(pricing.internal_reasoning, pOut),
+        pOut,
+    };
+}
+
+function tooltipPriceTiers(pricing: ModelPricing, base: PriceRow, context: number | undefined): PriceTier[] {
+    if (!Array.isArray(pricing.overrides)) {
+        return [];
+    }
+    const overrides = [];
+    for (const override of pricing.overrides) {
+        const threshold = override?.min_prompt_tokens;
+        if (typeof threshold !== 'number' || !Number.isFinite(threshold) || threshold < 0
+            || (context !== undefined && threshold >= context)
+            || Object.keys(override).some((key) => !contextOverrideKeys.has(key))) {
+            continue;
+        }
+        overrides.push({ threshold, override });
+    }
+
+    const thresholds = [...new Set(overrides.map(({ threshold }) => threshold))].sort((a, b) => a - b);
+    const tiers: PriceTier[] = [];
+    let previous = base;
+    for (const threshold of thresholds) {
+        const effective = { ...pricing };
+        // At the start of this segment, all lower and equal thresholds apply in catalog order.
+        for (const { threshold: minimum, override } of overrides) {
+            if (minimum > threshold) {
+                continue;
+            }
+            for (const key of displayedOverrideKeys) {
+                const rate = override[key];
+                if (rate !== undefined && Number.isFinite(Number.parseFloat(rate))) {
+                    effective[key] = rate;
+                }
+            }
+        }
+        const prices = priceRow(effective);
+        if (prices.pIn !== previous.pIn || prices.pOut !== previous.pOut || prices.pCr !== previous.pCr
+            || prices.pCw !== previous.pCw || prices.pThink !== previous.pThink) {
+            tiers.push({ threshold, prices });
+            previous = prices;
+        }
+    }
+    return tiers;
+}
+
 /**
  * One price column per pricing segment: `≤ <threshold>` for each step bound and a
- * final `> <threshold>` for the top segment (mirrors the panel table). A model
- * with no steps gets the single `$/1M` column.
+ * final `> <threshold>` for the top segment.
  */
-function priceColumns(m: ModelCatalogEntry, base: PriceRow): PriceColumn[] {
-    const tiers = longContextTiers(m);
+function priceColumns(base: PriceRow, tiers: PriceTier[]): PriceColumn[] {
     if (tiers.length === 0) {
         return [{ header: t('$Mtok'), ...base }];
     }
-    const columns: PriceColumn[] = [{ header: `\u2264${formatSize(tiers[0].threshold)}`, ...base }];
-    tiers.forEach((tier, index) => {
-        const pIn = tier.prompt;
-        const isLast = index === tiers.length - 1;
-        columns.push({
-            header: isLast
-                ? `>${formatSize(tier.threshold)}`
-                : `\u2264${formatSize(tiers[index + 1].threshold)}`,
-            pIn,
-            pCw: tier.inputCacheWrite ?? pIn,
-            pCr: tier.inputCacheRead ?? pIn,
-            pThink: base.pThink,
-            pOut: tier.completion,
-        });
-    });
-    return columns;
+    return [
+        { header: `\u2264${formatSize(tiers[0].threshold)}`, ...base },
+        ...tiers.map(({ threshold, prices }, index) => ({
+            header: index + 1 < tiers.length
+                ? `\u2264${formatSize(tiers[index + 1].threshold)}`
+                : `>${formatSize(threshold)}`,
+            ...prices,
+        })),
+    ];
 }
 
 function pricingTableMarkdown(columns: PriceColumn[]): string {
@@ -766,12 +825,7 @@ export function effectiveMaxInputTokens(m: ModelCatalogEntry, opts: ContextBudge
 
 export function buildModelInfo(m: ModelCatalogEntry, opts: ContextBudgetOptions = {}): ModelInfo {
     const pricing = m.pricing ?? {};
-    const pIn = parsePrice(pricing.prompt);
-    const pOut = parsePrice(pricing.completion);
-    const pCr = priceOr(pricing.input_cache_read, pIn);
-    const pCw = priceOr(pricing.input_cache_write, pIn);
-    const pThink = priceOr(pricing.internal_reasoning, pOut);
-    const hasPricing = pricing.prompt !== undefined || pricing.completion !== undefined || pIn > 0 || pOut > 0;
+    const hasPricing = pricing.prompt !== undefined || pricing.completion !== undefined;
 
     const contextWindow = effectiveContextLength(m);
     const hasContextLength = contextWindow !== undefined;
@@ -779,12 +833,14 @@ export function buildModelInfo(m: ModelCatalogEntry, opts: ContextBudgetOptions 
     const listedCap = finitePositive(m.top_provider?.max_completion_tokens);
     const maxInputTokens = effectiveMaxInputTokens(m, opts);
 
-    const basePrices: PriceRow = { pIn, pCw, pCr, pThink, pOut };
-    const pAvgM = hasPricing ? blendedOf(pIn, pCw, pCr, pThink, pOut) : 0;
+    const basePrices = priceRow(pricing);
+    const { pIn, pCw, pCr, pThink, pOut } = basePrices;
+    const pAvgM = blendedOf(pIn, pCw, pCr, pThink, pOut);
+    const priceTiers = hasPricing ? tooltipPriceTiers(pricing, basePrices, contextWindow) : [];
 
     const blocks: string[] = [];
     if (hasPricing) {
-        blocks.push(pricingTableMarkdown(priceColumns(m, basePrices)));
+        blocks.push(pricingTableMarkdown(priceColumns(basePrices, priceTiers)));
     } else {
         blocks.push(t('Pricing: not listed by OpenRouter'));
     }
@@ -808,14 +864,14 @@ export function buildModelInfo(m: ModelCatalogEntry, opts: ContextBudgetOptions 
     }
     blocks.push(infoLines.join('\n\n'));
 
-    const tier = longContextTier(m);
     const uncappedBudget = hasContextLength
         ? Math.max(1, Math.floor((contextWindow ?? ASSUMED_CONTEXT_TOKENS) - maxOutputTokens))
         : maxInputTokens;
-    const cappedToBase = tier !== undefined && maxInputTokens <= tier.threshold && maxInputTokens < uncappedBudget;
+    const cappedToBase = priceTiers.length > 0
+        && maxInputTokens <= priceTiers[0].threshold && maxInputTokens < uncappedBudget;
 
     const detail = hasPricing
-        ? `${t('~{0}/1M', formatPricePerM(pAvgM))}${cappedToBase && tier ? ` \u00b7 \u2264${formatSize(maxInputTokens)}` : ''}`
+        ? `${t('~{0}/1M', formatPricePerM(pAvgM))}${cappedToBase ? ` \u00b7 \u2264${formatSize(maxInputTokens)}` : ''}`
         : undefined;
 
     return { detail, tooltip: blocks.join('\n\n'), maxInputTokens, maxOutputTokens };
