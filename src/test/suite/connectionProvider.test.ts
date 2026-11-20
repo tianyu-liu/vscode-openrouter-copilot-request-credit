@@ -3,11 +3,13 @@ import { promises as fs } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import * as vscode from 'vscode';
-import { ConnectionRegistry, OPENROUTER_BASE_URL, type ConnectionDefinition } from '../../connections';
+import { ConnectionRegistry, LEGACY_CONNECTION_ID, OPENROUTER_BASE_URL, type ConnectionDefinition } from '../../connections';
 import { ConnectionChatProvider, connectionModelId } from '../../connectionProvider';
 import { formatMessage, resetTranslator, setTranslator } from '../../i18n';
+import { ProfileStorage } from '../../profileStorage';
 import {
-    OpenRouterChatProvider, setRequestDumpDirectory, setRetryDelayForTesting, UNATTRIBUTED_SESSION_ID,
+    MAX_TRACKED_SESSIONS, OpenRouterChatProvider, setRequestDumpDirectory, setRetryDelayForTesting,
+    UNATTRIBUTED_SESSION_ID,
 } from '../../provider';
 
 function memoryState(): vscode.Memento {
@@ -149,7 +151,7 @@ suite('connection provider routing', () => {
         await registry.storeKey(one.id, 'one'); await registry.storeKey(two.id, 'two');
         const [first] = await models(one); const [second] = await models(two);
         assert.notStrictEqual(first.id, second.id);
-        assert.strictEqual(first.id, connectionModelId(one.id, 'anthropic/shared'));
+        assert.strictEqual(first.id, connectionModelId(one.id, 'anthropic/shared', registry.get(one.id)!.routingRevision));
         await request(first); await request(second);
         const posts = calls.filter(call => call.init?.method === 'POST');
         assert.deepStrictEqual(posts.map(call => call.url), [one.baseUrl + '/chat/completions', two.baseUrl + '/chat/completions']);
@@ -212,7 +214,7 @@ suite('connection provider routing', () => {
             calls.length = 0;
             [model] = await models(connection);
             assert.deepStrictEqual(await child.getPresets(), []);
-            assert.strictEqual(model.id, obsolete.id);
+            assert.notStrictEqual(model.id, obsolete.id);
             assert.notStrictEqual(model.version, obsolete.version);
             await request(model, 'conversion-chat');
             const post = calls.find(call => call.init?.method === 'POST')!;
@@ -258,7 +260,7 @@ suite('connection provider routing', () => {
         await tick();
         const updated = await registry.update(connection.id, { kind: 'gateway', baseUrl: 'https://new.test/v1' }, 'new-key');
         const [fresh] = await models(updated);
-        release(new Response('retry', { status: 503 }));
+        release(new Response('retry', { status: 429 }));
         await pending;
         const oldPosts = calls.filter(call => call.init?.method === 'POST');
         assert.strictEqual(oldPosts.length, 2);
@@ -554,8 +556,9 @@ suite('connection provider routing', () => {
     });
     test('gateway rejects caller-forged models and cancels an active SSE reader', async () => {
         const connection = await gateway(); const [model] = await models(connection);
-        await assert.rejects(request({ ...model, id: connectionModelId(connection.id, 'unlisted'),
-            version: JSON.stringify(['unlisted', registry.get(connection.id)!.revision]) }), /unavailable in the gateway catalog/);
+        const current = registry.get(connection.id)!;
+        await assert.rejects(request({ ...model, id: connectionModelId(connection.id, 'unlisted', current.routingRevision),
+            version: JSON.stringify(['unlisted', current.revision]) }), /unavailable in the gateway catalog/);
         let cancelled = false;
         const source = new vscode.CancellationTokenSource();
         fetcher = async () => new Response(new ReadableStream({
@@ -637,6 +640,117 @@ suite('connection provider routing', () => {
         assert.strictEqual(unknown.promptTokens, 8); assert.strictEqual(free.paid, 0);
         assert.strictEqual(free.calls, 1); assert.strictEqual(free.costUnavailable, undefined);
     });
+    test('independent profile windows merge spend and restore parent attribution only for the same workspace', async () => {
+        const directory = await fs.mkdtemp(join(tmpdir(), 'openrouter-spend-'));
+        const state = memoryState();
+        const credentials = memorySecrets();
+        const stores: ConnectionRegistry[] = [];
+        const windows: ConnectionChatProvider[] = [];
+        const connectionId = LEGACY_CONNECTION_ID;
+        const legacySpend = {
+            sessionId: 'copilot-chat:legacy-chat', paid: 0.125, calls: 1, updatedAt: Date.now(), routes: [],
+        };
+        await state.update('sessionCosts', [legacySpend]);
+        await state.update('parentSession', { sessionId: 'copilot-chat:legacy-parent', at: Date.now() });
+        fetcher = async (url) => {
+            if (url.endsWith('/models')) { return Response.json({ data: [{ id: 'anthropic/shared' }] }); }
+            if (url.endsWith('/presets')) { return Response.json({ data: [] }); }
+            return completed();
+        };
+        async function openWorkspace(workspaceId: string) {
+            const store = new ConnectionRegistry(state, credentials, directory);
+            stores.push(store);
+            await store.initialize({ hideUnavailableModels: false });
+            const window = new ConnectionChatProvider(store, false, workspaceId);
+            windows.push(window);
+            return { store, window };
+        }
+        async function select(window: ConnectionChatProvider) {
+            const [model] = await window.provideLanguageModelChatInformation({
+                silent: true, configuration: { connectionId },
+            } as never, token);
+            return model;
+        }
+        function run(window: ConnectionChatProvider, model: vscode.LanguageModelChatInformation, id?: string) {
+            const modelOptions = { _capturingTokenCorrelationId: 'marker', ...(id ? { _conversationId: id } : {}) };
+            return window.provideLanguageModelChatResponse(model, [], {
+                toolMode: vscode.LanguageModelChatToolMode.Auto, modelOptions,
+            }, { report() {} }, token);
+        }
+        function lastPostedSession(): string | undefined {
+            const post = calls.filter(call => call.init?.method === 'POST').at(-1);
+            return post ? JSON.parse(String(post.init?.body)).session_id : undefined;
+        }
+        try {
+            const a = await openWorkspace('workspace-a');
+            await a.store.storeKey(connectionId, 'fixture-key');
+            const b = await openWorkspace('workspace-b');
+            const [modelA, modelB] = await Promise.all([select(a.window), select(b.window)]);
+            await run(a.window, modelA);
+            assert.strictEqual(lastPostedSession(), undefined, 'the old global parent has no workspace provenance');
+            await Promise.all([run(a.window, modelA, 'shared'), run(b.window, modelB, 'shared')]);
+            await Promise.all([run(a.window, modelA, 'chat-a'), run(b.window, modelB, 'chat-b')]);
+            for (const window of [a.window, b.window]) {
+                const history = new Map(window.getSessionCosts(connectionId).map(session => [session.sessionId, session]));
+                assert.strictEqual(history.get('copilot-chat:legacy-chat')?.paid, 0.125);
+                assert.strictEqual(history.get('copilot-chat:shared')?.paid, 0.5);
+                assert.strictEqual(history.get('copilot-chat:chat-a')?.paid, 0.25);
+                assert.strictEqual(history.get('copilot-chat:chat-b')?.paid, 0.25);
+            }
+
+            const c = await openWorkspace('workspace-c');
+            const modelC = await select(c.window);
+            await run(c.window, modelC);
+            assert.strictEqual(lastPostedSession(), undefined, 'an unrelated workspace cannot inherit a parent');
+            const reloadedA = await openWorkspace('workspace-a');
+            const modelReloadedA = await select(reloadedA.window);
+            await run(reloadedA.window, modelReloadedA);
+            assert.strictEqual(lastPostedSession(), 'copilot-chat:chat-a');
+            const history = reloadedA.window.getSessionCosts(connectionId);
+            assert.strictEqual(history.find(session => session.sessionId === 'copilot-chat:chat-a')?.paid, 0.5);
+            assert.strictEqual(history.find(session => session.sessionId === UNATTRIBUTED_SESSION_ID)?.paid, 0.5);
+
+            for (let index = 0; index < MAX_TRACKED_SESSIONS; index++) {
+                await run(index % 2 ? a.window : b.window, index % 2 ? modelA : modelB, `bounded-${index}`);
+            }
+            const bounded = reloadedA.window.getSessionCosts(connectionId);
+            assert.strictEqual(bounded.length, MAX_TRACKED_SESSIONS);
+            assert.ok(bounded.some(session => session.sessionId === UNATTRIBUTED_SESSION_ID));
+            assert.strictEqual(bounded[0].sessionId, `copilot-chat:bounded-${MAX_TRACKED_SESSIONS - 1}`);
+            assert.ok(!bounded.some(session => session.sessionId === 'copilot-chat:bounded-0'));
+
+            let startRequest!: () => void;
+            let finishRequest!: (response: Response) => void;
+            const started = new Promise<void>(resolve => { startRequest = resolve; });
+            const response = new Promise<Response>(resolve => { finishRequest = resolve; });
+            const previousFetcher = fetcher;
+            fetcher = async (url, init) => {
+                if (init?.method !== 'POST') { return previousFetcher(url, init); }
+                startRequest();
+                return response;
+            };
+            const late = run(a.window, modelA, 'late-request');
+            await started;
+            try {
+                await b.store.remove(connectionId);
+            } finally {
+                finishRequest(completed());
+            }
+            await late;
+            assert.deepStrictEqual(reloadedA.window.getSessionCosts(connectionId), []);
+            const disk = new ProfileStorage(directory);
+            try {
+                assert.ok(!disk.keys().some(key => key.startsWith(`connections.${connectionId}.`)));
+            } finally {
+                disk.dispose();
+            }
+        } finally {
+            for (const window of windows) { window.dispose(); }
+            for (const store of stores) { store.dispose(); }
+            await tick();
+            await fs.rm(directory, { recursive: true, force: true });
+        }
+    });
     test('the template snapshot precedes an awaited credential lookup', async () => {
         let release!: (key: string) => void;
         const secrets = memorySecrets();
@@ -669,7 +783,7 @@ suite('connection provider routing', () => {
         const pending = request(model); await tick();
         await router.getProvider(connection.id)!.setTemplate('{"temperature":0.9}');
         await registry.storeKey(connection.id, 'new-key');
-        release(new Response('retry', { status: 503 })); await pending;
+        release(new Response('retry', { status: 429 })); await pending;
         const requests = calls.filter(call => call.init?.method === 'POST');
         assert.strictEqual(requests.length, 2);
         assert.ok(requests.every(call => new Headers(call.init?.headers).get('Authorization') === 'Bearer old-key'));

@@ -19,6 +19,8 @@ export interface FixtureResponse {
 }
 
 export interface FixtureApi {
+    globalState: vscode.Memento;
+    releaseProvider(): void;
     setPreference(connectionId: string, value: string): Thenable<void>;
     getPreference(connectionId: string): string | undefined;
 }
@@ -63,8 +65,11 @@ export function activate(context: vscode.ExtensionContext): FixtureApi {
             return 1;
         },
     };
-    context.subscriptions.push(vscode.lm.registerLanguageModelChatProvider(VENDOR, provider));
+    const registration = vscode.lm.registerLanguageModelChatProvider(VENDOR, provider);
+    context.subscriptions.push(registration);
     return {
+        globalState: context.globalState,
+        releaseProvider: () => registration.dispose(),
         setPreference: (connectionId, value) => context.globalState.update(`preference.${connectionId}`, value),
         getPreference: (connectionId) => context.globalState.get<string>(`preference.${connectionId}`),
     };

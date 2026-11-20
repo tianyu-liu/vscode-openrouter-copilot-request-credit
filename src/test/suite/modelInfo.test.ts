@@ -765,6 +765,21 @@ suite("model info", () => {
         assert.strictEqual(defaultContextCap({ id: "x/y" }), "full", "a model with no step has no default cap");
     });
 
+    test("conditional price overrides never create context cap choices", () => {
+        const model: ModelCatalogEntry = {
+            id: "x/conditional", context_length: 1_000_000,
+            pricing: { prompt: "0.000001", overrides: [
+                { min_prompt_tokens: 250000, prompt: "0.000002", utc_start: 1, utc_end: 2 },
+                { min_prompt_tokens: 300000, prompt: "0.000003", utc_days: ["monday"] },
+            ] },
+        };
+        assert.strictEqual(defaultContextCap(model), "full");
+        assert.strictEqual(buildContextCapSchema(model), undefined);
+        assert.strictEqual(buildModelInfo(model).maxInputTokens, 875000);
+        model.pricing!.overrides!.push({ min_prompt_tokens: 256000, prompt: "0.000002" });
+        assert.strictEqual(defaultContextCap(model), 256000);
+    });
+
     test("context size selection and picker parsing round-trip a saved size", () => {
         assert.strictEqual(contextCapSelection(undefined), "full");
         assert.strictEqual(contextCapSelection("full"), "full");
@@ -841,6 +856,31 @@ suite("model info", () => {
         const property = schema!.properties["reasoningEffort"] as Record<string, unknown>;
         assert.deepStrictEqual(property["enum"], ["xhigh", "high", "medium", "low", "minimal"]);
         assert.strictEqual(property["default"], "xhigh");
+    });
+
+    test("off by default takes precedence over a listed default effort in picker and tooltip", () => {
+        for (const efforts of [["low", "high"], null]) {
+            const model: ModelCatalogEntry = {
+                id: "x/y", reasoning: { supported_efforts: efforts, default_effort: "high", default_enabled: false },
+            };
+            const property = buildReasoningSchema(model)!.properties.reasoningEffort as Record<string, unknown>;
+            assert.strictEqual(property.default, "none");
+            assert.ok(buildModelInfo(model).tooltip.includes("**None**/"));
+        }
+    });
+
+    test("mandatory reasoning removes none even if the catalog lists it", () => {
+        const model: ModelCatalogEntry = {
+            id: "x/y", reasoning: { mandatory: true, supported_efforts: ["none", "high"],
+                default_effort: "none", default_enabled: false },
+        };
+        const property = buildReasoningSchema(model)!.properties.reasoningEffort as Record<string, unknown>;
+        assert.deepStrictEqual(property.enum, ["high"]);
+        assert.strictEqual(property.default, "high");
+        assert.ok(buildModelInfo(model).tooltip.includes("**High** (required)"));
+        model.reasoning!.supported_efforts = ["none"];
+        assert.strictEqual(buildReasoningSchema(model), undefined);
+        assert.ok(buildModelInfo(model).tooltip.includes("Reasoning: required"));
     });
 
     test("buildReasoningSchema falls back to the first effort and omits models without reasoning", () => {

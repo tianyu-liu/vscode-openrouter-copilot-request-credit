@@ -292,6 +292,7 @@ suite("toOpenAI", () => {
         const out = toOpenAI([
             msg(vscode.LanguageModelChatMessageRole.Assistant, [
                 new vscode.LanguageModelTextPart("I'll check the weather."),
+                vscode.LanguageModelDataPart.image(Uint8Array.of(1), "image/png"),
                 new vscode.LanguageModelToolCallPart("call_1", "get_weather", {}),
             ]),
         ]);
@@ -349,6 +350,25 @@ suite("toOpenAI", () => {
         assert.deepStrictEqual(out, [{ role: "tool", tool_call_id: "call_1", content: 'hello\n{"ok":true}' }]);
     });
 
+    test("parallel tool results stay together before images from either result", () => {
+        const image = vscode.LanguageModelDataPart.image(Uint8Array.of(1), "image/png");
+        const out = toOpenAI([
+            msg(vscode.LanguageModelChatMessageRole.Assistant, [
+                new vscode.LanguageModelToolCallPart("first", "inspect", {}),
+                new vscode.LanguageModelToolCallPart("second", "inspect", {}),
+            ]),
+            msg(vscode.LanguageModelChatMessageRole.User, [new vscode.LanguageModelToolResultPart("first", [image])]),
+            msg(vscode.LanguageModelChatMessageRole.User, [new vscode.LanguageModelToolResultPart("second", ["ready"])]),
+            msg(vscode.LanguageModelChatMessageRole.Assistant, [new vscode.LanguageModelTextPart("done")]),
+        ]);
+        assert.deepStrictEqual(out.slice(1), [
+            { role: "tool", tool_call_id: "first", content: "" },
+            { role: "tool", tool_call_id: "second", content: "ready" },
+            { role: "user", content: [{ type: "image_url", image_url: { url: "data:image/png;base64,AQ==" } }] },
+            { role: "assistant", content: "done", reasoning_content: "" },
+        ]);
+    });
+
     test("prompt-tsx tool results are flattened without the class wrapper", () => {
         const out = toOpenAI([
             msg(vscode.LanguageModelChatMessageRole.User, [
@@ -380,17 +400,21 @@ suite("toOpenAI", () => {
         assert.strictEqual(content[0].image_url.url, "data:image/png;base64,iVBORw==");
     });
 
-    test("mixed text and image content uses multipart objects for every item", () => {
+    test("interleaved text and images retain their order in multipart content", () => {
         const image = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
         const out = toOpenAI([
             msg(vscode.LanguageModelChatMessageRole.User, [
                 new vscode.LanguageModelTextPart("Describe this image."),
                 vscode.LanguageModelDataPart.image(image, "image/png"),
+                new vscode.LanguageModelTextPart("Compare it with this one."),
+                vscode.LanguageModelDataPart.image(Uint8Array.of(1), "image/png"),
             ]),
         ]);
         assert.deepStrictEqual((out[0] as { content: unknown[] }).content, [
             { type: "text", text: "Describe this image." },
             { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw==" } },
+            { type: "text", text: "Compare it with this one." },
+            { type: "image_url", image_url: { url: "data:image/png;base64,AQ==" } },
         ]);
     });
 
@@ -1853,10 +1877,44 @@ suite("provideLanguageModelChatResponse (stubbed stream)", () => {
             textReported().map((p) => (p as { value: string }).value),
             ["visible reply"]
         );
-        assert.strictEqual(thinkingReported().length, 1);
+        assert.strictEqual(thinkingReported().length, runtimeThinkingPartCtor ? 1 : 0);
         if (runtimeThinkingPartCtor) {
             assert.strictEqual((thinkingReported()[0] as { value: string }).value, "step one");
         }
+    });
+
+    test("a reasoning delta preserves distinct answer text carried in reasoning_details", async () => {
+        nextResponses.push(() => streamResponse(sseBody([{ choices: [{ delta: {
+            reasoning: "thinking",
+            reasoning_details: [{ type: "response.output_text", output_text: "final reply" }],
+        } }] }])));
+        await run();
+        assert.deepStrictEqual(textReported().map(p => (p as vscode.LanguageModelTextPart).value), ["final reply"]);
+    });
+
+    test("a successful HTTP response without SSE events rejects without echoing its body", async () => {
+        nextResponses.push(() => Response.json({ error: { message: "private error details" } }));
+        await assert.rejects(run(), (err: Error) => err.message === "OpenRouter returned an unexpected stream response.");
+        assert.deepStrictEqual(reported, []);
+    });
+
+    test("a terminator alone or unrelated SSE metadata cannot produce a successful blank response", async () => {
+        for (const events of [[], [{}], [{ metadata: "only" }], [{ choices: [{}] }], [{ usage: {} }],
+            [{ choices: [{ delta: { unknown: true } }] }], [{ choices: [{ delta: [], finish_reason: "stop" }] }]]) {
+            nextResponses.push(() => streamResponse(sseBody(events)));
+            await assert.rejects(run(), /unexpected stream response/);
+        }
+        assert.deepStrictEqual(reported, []);
+    });
+
+    test("a recognized empty completion and a valid usage-only event keep the space fallback", async () => {
+        for (const event of [{ choices: [{ delta: {}, finish_reason: "stop" }] },
+            { choices: [], usage: { prompt_tokens: 1, completion_tokens: 0, total_tokens: 1 } }]) {
+            nextResponses.push(() => streamResponse(sseBody([event])));
+            await run();
+        }
+        assert.deepStrictEqual(textReported().map(p => (p as vscode.LanguageModelTextPart).value), [" ", " "]);
+        assert.strictEqual(usageParts().length, 1);
     });
 
     test("a streamed error event rejects without echoing upstream error fields", async () => {
@@ -1901,26 +1959,21 @@ suite("provideLanguageModelChatResponse (stubbed stream)", () => {
         );
     });
 
-    test("gives up after three retries on a persistent 503 without echoing the error body or unvalidated ID", async () => {
-        for (let i = 0; i < 10; i++) {
+    test("an upstream server error never replays a paid POST or echoes an unvalidated ID", async () => {
+        for (const status of [500, 502, 503, 504]) {
             nextResponses.push(() => new Response("synthetic upstream body", {
-                status: 503, headers: { "x-generation-id": "synthetic upstream header" },
+                status, headers: { "x-generation-id": "synthetic upstream header" },
             }));
+            const before = fetchCalls.length;
+            await assert.rejects(run(), (err: Error) => err.message === `OpenRouter request failed (${status}).`);
+            assert.strictEqual(fetchCalls.length - before, 1);
         }
-        const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
-        await assert.rejects(
-            provider.provideLanguageModelChatResponse(model, [], options, progress as never, token as never),
-            (err: Error) => err.message === "OpenRouter request failed (503)."
-        );
-        assert.strictEqual(fetchCalls.length, 4, "initial + three retries");
     });
 
-    test("a transport failure is rethrown without request details", async () => {
-        for (let i = 0; i < 4; i++) {
-            nextResponses.push(() => { throw new Error("transport echoed a synthetic credential"); });
-        }
+    test("an ambiguous inference transport failure never replays the paid POST or exposes request details", async () => {
+        nextResponses.push(() => { throw new Error("transport echoed a synthetic credential"); }, okStream());
         await assert.rejects(run(), (err: Error) => err.message === "OpenRouter request failed.");
-        assert.strictEqual(fetchCalls.length, 4, "initial + three retries");
+        assert.strictEqual(fetchCalls.length, 1);
     });
 
     test("a request cancelled up front makes no network calls", async () => {
@@ -2083,11 +2136,12 @@ suite("provideLanguageModelChatResponse (stubbed stream)", () => {
         assert.deepStrictEqual(textReported(), [], "the empty-response fallback is not appended after tool calls");
     });
 
-    test("flushes pending tool calls when the stream ends at EOF without [DONE]", async () => {
+    test("an explicit complete tool finish permits EOF without [DONE]", async () => {
         const body = `data: ${JSON.stringify({
             choices: [
                 {
                     delta: { tool_calls: [{ index: 0, id: "call_7", function: { name: "get_info", arguments: '{"q":"x"}' } }] },
+                    finish_reason: "tool_calls",
                 },
             ],
         })}\n\n`;
@@ -2099,6 +2153,43 @@ suite("provideLanguageModelChatResponse (stubbed stream)", () => {
         assert.strictEqual(call.callId, "call_7");
         assert.strictEqual(call.name, "get_info");
         assert.deepStrictEqual(call.input, { q: "x" });
+    });
+
+    test("a complete-looking pending tool call requires a finish reason or DONE", async () => {
+        const choices = [{ delta: { tool_calls: [{ id: "a", function: { name: "read", arguments: "{}" } }] } }];
+        const event = `data: ${JSON.stringify({ choices })}\n\n`;
+        nextResponses.push(() => streamResponse(event), () => streamResponse(event + "data: [DONE]\n\n"));
+        await assert.rejects(run(), /incomplete or invalid tool call/);
+        assert.strictEqual(reported.length, 0);
+        await run();
+        assert.strictEqual(reported.length, 1);
+        assert.ok(reported[0] instanceof vscode.LanguageModelToolCallPart);
+    });
+
+    test("a length limit invalidates pending tool calls, even with syntactically complete input", async () => {
+        nextResponses.push(() => streamResponse(sseBody([{ choices: [{
+            delta: { tool_calls: [{ index: 0, id: "a", function: { name: "read", arguments: "{}" } }] },
+            finish_reason: "length",
+        }] }])));
+        await assert.rejects(run(), /incomplete or invalid tool call/);
+        assert.deepStrictEqual(reported, []);
+    });
+
+    test("malformed parallel arguments reject the whole batch even with a DONE marker", async () => {
+        const choices = [{ delta: { tool_calls: [
+            { index: 0, id: "a", function: { name: "first", arguments: "{}" } },
+            { index: 1, id: "b", function: { name: "second", arguments: '{"unfinished":' } },
+        ] } }];
+        nextResponses.push(() => streamResponse(sseBody([{ choices }])));
+        await assert.rejects(run(), /incomplete or invalid tool call/);
+        assert.deepStrictEqual(reported, []);
+    });
+
+    test("duplicate tool-call IDs at different indexes reject the whole parallel batch", async () => {
+        const tool_calls = [0, 1].map(index => ({ index, id: "same", function: { name: "read", arguments: "{}" } }));
+        nextResponses.push(() => streamResponse(sseBody([{ choices: [{ delta: { tool_calls }, finish_reason: "tool_calls" }] }])));
+        await assert.rejects(run(), /incomplete or invalid tool call/);
+        assert.deepStrictEqual(reported, []);
     });
 
     test("two overlapping calls report their own usage and cost (per-call stream state)", async () => {
@@ -2325,6 +2416,25 @@ suite("provideLanguageModelChatResponse (stubbed stream)", () => {
         }
     });
 
+    test("disabling a connection during discovery prevents retries and preset detail requests", async () => {
+        let active = true;
+        const provider = new OpenRouterChatProvider(fakeSecrets("fixture"), fakeState(), {
+            isCurrent: () => active,
+        });
+        setRetryDelayForTesting(async () => { active = false; });
+        nextResponses.push(() => new Response("", { status: 503 }));
+        assert.deepStrictEqual(await provider.provideLanguageModelChatInformation({ silent: true }, token), []);
+        assert.strictEqual(fetchCalls.length, 1);
+
+        active = true;
+        nextResponses.push(() => {
+            active = false;
+            return Response.json({ data: [{ status: "active", slug: "pinned" }] });
+        });
+        assert.strictEqual(await provider.getPresets(), undefined);
+        assert.strictEqual(fetchCalls.length, 2);
+    });
+
     test("an in-flight catalog from the old key never repopulates the cache after a key switch", async () => {
         const original = globalThis.fetch;
         let release!: (response: Response) => void;
@@ -2337,9 +2447,11 @@ suite("provideLanguageModelChatResponse (stubbed stream)", () => {
                 headers: { "content-type": "application/json" },
             });
         let catalogCalls = 0;
+        let availabilityCalls = 0;
         globalThis.fetch = (async (input: unknown) => {
             const url = String(input);
             if (url.includes("/models/user")) {
+                availabilityCalls++;
                 return new Response("nope", { status: 404 });
             }
             if (url.endsWith("/models")) {
@@ -2357,7 +2469,8 @@ suite("provideLanguageModelChatResponse (stubbed stream)", () => {
             await provider.setKey("sk-new");
             release(catalogJson("old-key/model"));
             const stale = await staleRun;
-            assert.deepStrictEqual(stale.map((m) => m.id), ["old-key/model"]);
+            assert.deepStrictEqual(stale, []);
+            assert.strictEqual(availabilityCalls, 0, "no follow-up availability lookup with the superseded key");
             const fresh = await provider.provideLanguageModelChatInformation({ silent: true } as never, token as never);
             assert.deepStrictEqual(fresh.map((m) => m.id), ["new-key/model"], "the new query fetches with the new key");
             assert.strictEqual(catalogCalls, 2, "the stale result never served the new query or the cache");
@@ -3052,6 +3165,8 @@ suite("preset model entries (catalog + presets)", () => {
             },
             async () => {
                 try {
+                    const initial = await provider.provideLanguageModelChatInformation({ silent: true }, token);
+                    assert.deepStrictEqual(initial.map(model => model.id), ["z-ai/glm-5.3-flash"]);
                     assert.strictEqual(
                         await provider.getPresets(),
                         undefined,
@@ -3060,11 +3175,35 @@ suite("preset model entries (catalog + presets)", () => {
                     healthy = true;
                     const presets = await provider.getPresets();
                     assert.deepStrictEqual(presets!.map((p) => p.slug), ["faster-glm-flash"], "a later call retries and succeeds");
+                    const recovered = await provider.provideLanguageModelChatInformation({ silent: true }, token);
+                    assert.ok(recovered.some(model => model.id === "@preset/faster-glm-flash"));
                 } finally {
                     setRetryDelayForTesting((ms) => new Promise((r) => setTimeout(r, ms)));
                 }
             }
         );
+    });
+
+    test("a partial preset lookup recovers its missing model on the next picker query", async () => {
+        const provider = new OpenRouterChatProvider(fakeSecrets("fixture"), fakeState(), { hideUnavailableModels: false });
+        const routes = presetRoutes();
+        let failed = false;
+        await withFetch(url => {
+            if (!failed && url.endsWith("/presets/faster-glm-flash")) {
+                failed = true;
+                return new Response("", { status: 401 });
+            }
+            return routes(url);
+        }, async () => {
+            await provider.provideLanguageModelChatInformation({ silent: true }, token);
+            const partial = await provider.getPresets();
+            assert.strictEqual(partial?.find(preset => preset.slug === "faster-glm-flash")?.model, undefined);
+            await provider.provideLanguageModelChatInformation({ silent: true }, token);
+            await provider.getPresets();
+            const models = await provider.provideLanguageModelChatInformation({ silent: true }, token);
+            assert.strictEqual(models.filter(model => model.id === "@preset/faster-glm-flash").length, 1);
+            assert.strictEqual(models.filter(model => model.id === "@preset/orphan-model").length, 1);
+        });
     });
 
     test("concurrent getPresets calls share one sweep", async () => {
@@ -3346,6 +3485,23 @@ suite("stripTemplateComments and setTemplate", () => {
         assert.deepStrictEqual(await provider.getTemplate(), { preset: "faster-glm-flash", temperature: 0.2 });
     });
 
+    test("failed writes preserve the effective request template and credential", async () => {
+        const state = fakeState({ requestTemplate: { temperature: 0.3 } });
+        state.update = async () => { throw new Error("save failed"); };
+        const secrets = fakeSecrets("old-key");
+        secrets.store = secrets.delete = async () => { throw new Error("keychain failed"); };
+        const provider = new OpenRouterChatProvider(secrets, state);
+        assert.deepStrictEqual(await provider.getTemplate(), { temperature: 0.3 });
+        await assert.rejects(provider.setTemplate('{"temperature":0.9}'), /save failed/);
+        assert.deepStrictEqual(await provider.getTemplate(), { temperature: 0.3 });
+        await assert.rejects(provider.clearTemplate(), /save failed/);
+        assert.deepStrictEqual(await provider.getTemplate(), { temperature: 0.3 });
+        await assert.rejects(provider.setKey("new-key"), /keychain failed/);
+        assert.strictEqual(await provider.getKey(true), "old-key");
+        await assert.rejects(provider.clearKey(), /keychain failed/);
+        assert.strictEqual(await provider.getKey(true), "old-key");
+    });
+
     test("a comments-only save clears the template; malformed JSON still errors", async () => {
         const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState({ requestTemplate: { temperature: 0.2 } }));
         const cleared = await provider.setTemplate("// just notes\n// nothing else");
@@ -3524,6 +3680,43 @@ suite("hide unavailable models", () => {
         });
     });
 
+    test("recovered presets use exact dated catalog limits while standalone models stay filtered", async () => {
+        const provider = new OpenRouterChatProvider(fakeSecrets("fixture"), fakeState(), { hideUnavailableModels: true });
+        const dated = "vendor/model-20260826";
+        const undated = "vendor/model";
+        let healthy = false;
+        await withFetch(url => {
+            if (url.endsWith("/models")) return jsonResponse({ data: [
+                { id: dated, context_length: 131072, top_provider: { max_completion_tokens: 4096 } },
+                { id: undated, context_length: 32768, top_provider: { max_completion_tokens: 1024 } },
+            ] });
+            if (url.includes("/models/user")) return jsonResponse({ data: [{ id: undated }] });
+            if (url.includes("/presets?")) return healthy
+                ? jsonResponse({ data: [{ status: "active", slug: "pinned" }] })
+                : new Response("", { status: 401 });
+            if (url.endsWith("/presets/pinned")) {
+                return jsonResponse({ data: { designated_version: { config: { model: dated } } } });
+            }
+            throw new Error("unexpected fetch");
+        }, async () => {
+            const discover = () => provider.provideLanguageModelChatInformation({ silent: true }, token);
+            assert.deepStrictEqual((await discover()).map(model => model.id), [undated]);
+            assert.strictEqual(await provider.getPresets(), undefined);
+            healthy = true;
+            await provider.getPresets();
+            const verify = async () => {
+                const models = await discover();
+                assert.deepStrictEqual(models.map(model => model.id), [undated, "@preset/pinned"]);
+                assert.strictEqual(models[0].maxInputTokens, 31744);
+                assert.strictEqual(models[1].maxInputTokens, 126976);
+                assert.strictEqual(models[1].maxOutputTokens, 4096);
+            };
+            await verify();
+            provider.refreshModelInfo();
+            await verify();
+        });
+    });
+
     test("a preset pinned to an unavailable model is omitted from the picker", async () => {
         const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
         await withHide(true, async () => {
@@ -3623,7 +3816,7 @@ suite("context tier rows", () => {
             if (String(input).endsWith("/models")) {
                 return jsonResponse(STEPPED_CATALOG);
             }
-            return new Response("data: [DONE]\n\n", {
+            return new Response('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n', {
                 status: 200,
                 headers: { "content-type": "text/event-stream" },
             });
@@ -3702,7 +3895,19 @@ suite("context tier rows", () => {
     });
 
     test("a context-cap or reserve change rebuilds model info without re-fetching /models or /models/user", async () => {
-        const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), fakeState());
+        const state = fakeState();
+        const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), state);
+        const update = state.update.bind(state);
+        let releaseWrite!: () => void;
+        let markStarted!: () => void;
+        const writeStarted = new Promise<void>(resolve => { markStarted = resolve; });
+        state.update = async (key, value) => {
+            if (key === "contextCaps") {
+                markStarted();
+                await new Promise<void>(resolve => { releaseWrite = resolve; });
+            }
+            await update(key, value);
+        };
         const cfg = vscode.workspace.getConfiguration("openrouterCopilot");
         const previousHide = cfg.get<boolean>("hideUnavailableModels", true);
         const original = globalThis.fetch;
@@ -3725,8 +3930,12 @@ suite("context tier rows", () => {
             await provider.provideLanguageModelChatInformation({ silent: true } as never, tierToken as never);
             assert.strictEqual(modelRequests, 1);
             assert.strictEqual(userRequests, 1, "the availability set is fetched once");
-            await provider.setContextCap("openai/gpt-5.6", 300000);
-            provider.refreshModelInfo();
+            const pending = provider.setContextCap("openai/gpt-5.6", 300000);
+            await writeStarted;
+            const before = await provider.provideLanguageModelChatInformation({ silent: true }, tierToken as never);
+            assert.strictEqual(before[0].maxInputTokens, 272000);
+            releaseWrite();
+            await pending;
             const info = await provider.provideLanguageModelChatInformation({ silent: true } as never, tierToken as never);
             assert.strictEqual(modelRequests, 1, "the kept catalog serves the rebuilt information");
             assert.strictEqual(userRequests, 1, "the cached availability set is reused");
@@ -3739,13 +3948,14 @@ suite("context tier rows", () => {
 });
 
 suite("legacy context-cap migration", () => {
-    test("restores the gross cap from a margin-reduced store and clears the retired keys", () => {
+    test("restores the gross cap from a margin-reduced store and clears the retired keys", async () => {
         const state = fakeState({
             contextCaps: { "openai/gpt-5.6": 200000, "qwen/qwen3.7-flash": "full" },
             contextCapsBase: { "openai/gpt-5.6": 250000 },
             contextMarginPercent: 20,
         });
         const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), state);
+        await new Promise<void>(resolve => setImmediate(resolve));
         assert.deepStrictEqual(provider.getContextCaps(), {
             "openai/gpt-5.6": 250000,
             "qwen/qwen3.7-flash": "full",
@@ -3754,10 +3964,32 @@ suite("legacy context-cap migration", () => {
         assert.strictEqual(state.get("contextMarginPercent"), undefined);
     });
 
-    test("derives the gross cap from the margin when no base was persisted", () => {
+    test("derives the gross cap from the margin when no base was persisted", async () => {
         const state = fakeState({ contextCaps: { "openai/gpt-5.6": 200000 }, contextMarginPercent: 20 });
         const provider = new OpenRouterChatProvider(fakeSecrets("sk-test"), state);
+        await new Promise<void>(resolve => setImmediate(resolve));
         assert.deepStrictEqual(provider.getContextCaps(), { "openai/gpt-5.6": 250000 });
+    });
+
+    test("restarts safely after each interrupted legacy write", async () => {
+        for (let failAt = 1; failAt <= 4; failAt++) {
+            const state = fakeState({ contextCaps: { model: 200000 }, contextMarginPercent: 20 });
+            const update = state.update.bind(state);
+            let writes = 0;
+            state.update = async (key, value) => {
+                if (++writes === failAt) throw new Error("interrupted");
+                await update(key, value);
+            };
+            new OpenRouterChatProvider(fakeSecrets("fixture"), state).dispose();
+            await new Promise<void>(resolve => setImmediate(resolve));
+            state.update = update;
+            const restored = new OpenRouterChatProvider(fakeSecrets("fixture"), state);
+            await new Promise<void>(resolve => setImmediate(resolve));
+            assert.deepStrictEqual(restored.getContextCaps(), { model: 250000 });
+            assert.strictEqual(state.get("contextCapsBase"), undefined);
+            assert.strictEqual(state.get("contextMarginPercent"), undefined);
+            restored.dispose();
+        }
     });
 
     test("leaves a modern cap store alone", () => {

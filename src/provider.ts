@@ -24,7 +24,7 @@ import {
     type OutputReservePolicy,
 } from './modelInfo';
 import { formatUsdPrecise, roundSignificant } from './logic';
-import type { ConnectionKind, ManualModel } from './connections';
+import type { AtomicConnectionState, ConnectionKind, ManualModel } from './connections';
 
 const TEMPLATE_KEY = 'requestTemplate';
 const OPENROUTER_API_BASE_URL = 'https://openrouter.ai/api/v1';
@@ -347,6 +347,12 @@ interface SpendLedger {
     persistSessionCosts?: (snapshot: SessionCost[]) => void;
     persistParentSession?: (sessionId: string, at: number) => void;
 }
+
+interface ParentSession {
+    sessionId: string;
+    at: number;
+}
+
 function createSpendLedger(): SpendLedger {
     return { sessionCosts: new Map(), lastActiveAt: 0, lastStamp: 0, persistQueue: Promise.resolve() };
 }
@@ -411,10 +417,14 @@ export function resolveCostSession(
         ledger.persistParentSession?.(sessionId, now);
         return sessionId;
     }
-    if (harnessOwned && ledger.lastActiveSessionId !== undefined && now - ledger.lastActiveAt <= PARENT_ATTRIBUTION_WINDOW_MS) {
+    if (harnessOwned && ledger.lastActiveSessionId !== undefined && recentParent(ledger.lastActiveAt, now)) {
         return ledger.lastActiveSessionId;
     }
     return UNATTRIBUTED_SESSION_ID;
+}
+
+function recentParent(at: number, now: number): boolean {
+    return at <= now && now - at <= PARENT_ATTRIBUTION_WINDOW_MS;
 }
 
 /**
@@ -572,6 +582,7 @@ export interface SessionCost extends CostBucket {
 
 export const MAX_TRACKED_SESSIONS = 10;
 const SESSION_COSTS_KEY = 'sessionCosts';
+const PARENT_SESSIONS_KEY = 'parentSessions';
 const PARENT_SESSION_KEY = 'parentSession';
 
 /**
@@ -619,7 +630,7 @@ function trimToCap(ledger: SpendLedger): void {
 export function hydrateSessionCosts(
     sessions: SessionCost[] | undefined, ledger: SpendLedger = defaultLedger
 ): void {
-    for (const session of sessions ?? []) {
+    for (const session of Array.isArray(sessions) ? sessions : []) {
         if (
             session &&
             typeof session.sessionId === 'string' &&
@@ -646,13 +657,15 @@ export function hydrateSessionCosts(
                     byok: route.byok === true,
                     updatedAt: finiteNumber(route.updatedAt) ?? 0,
                 }));
+            const updatedAt = finiteNumber(raw.updatedAt) ?? 0;
             ledger.sessionCosts.set(session.sessionId, {
                 ...session,
                 ...restoredBucket(raw),
                 byok: session.byok === true,
-                updatedAt: finiteNumber(raw.updatedAt) ?? 0,
+                updatedAt,
                 routes,
             });
+            ledger.lastStamp = Math.max(ledger.lastStamp, updatedAt);
         }
     }
     trimToCap(ledger);
@@ -710,6 +723,18 @@ export function accumulateSessionCost(
     if (typeof sessionId !== 'string' || sessionId.trim() === '') {
         return undefined;
     }
+    const cost = sessionTurnCost(usage, provider, includeTokenOnlyUsage);
+    if (!cost) { return undefined; }
+
+    const session = addTurnToLedger(ledger, sessionId, cost, model);
+    ledger.persistSessionCosts?.(getSessionCosts(ledger));
+    turnCostEmitter.fire({ ...cost, ...(connectionId ? { connectionId } : {}) });
+    return snapshotSession(session);
+}
+
+function sessionTurnCost(
+    usage: unknown, provider: string | undefined, includeTokenOnlyUsage: boolean
+): TurnCost | undefined {
     let cost = turnCostOf(usage, provider);
     if (!cost && includeTokenOnlyUsage && usage && typeof usage === 'object' && !Array.isArray(usage)) {
         const raw = usage as Record<string, unknown>;
@@ -731,7 +756,10 @@ export function accumulateSessionCost(
             };
         }
     }
-    if (!cost) { return undefined; }
+    return cost;
+}
+
+function addTurnToLedger(ledger: SpendLedger, sessionId: string, cost: TurnCost, model?: string): SessionCost {
     const now = stamp(ledger);
     const session = ledger.sessionCosts.get(sessionId) ?? {
         sessionId,
@@ -760,9 +788,7 @@ export function accumulateSessionCost(
 
     // Bound the map: keep only the most recently updated sessions.
     trimToCap(ledger);
-    ledger.persistSessionCosts?.(getSessionCosts(ledger));
-    turnCostEmitter.fire({ ...cost, ...(connectionId ? { connectionId } : {}) });
-    return snapshotSession(session);
+    return session;
 }
 
 function snapshotSession(session: SessionCost): SessionCost {
@@ -874,10 +900,6 @@ function dumpRequestBody(body: unknown): void {
     }
 }
 
-function isRetryable(status: number): boolean {
-    return status === 429 || status >= 500;
-}
-
 function jitteredDelay(baseMs: number): number {
     const jitter = Math.round(baseMs * (Math.random() - 0.5) * 0.4);
     return Math.min(Math.max(baseMs + jitter, 0), MAX_BACKOFF_MS);
@@ -934,11 +956,13 @@ function boundedFetchSignal(token: vscode.CancellationToken): { signal: AbortSig
 async function fetchWithRetry(
     url: string,
     init: RequestInit,
-    token: vscode.CancellationToken
+    token: vscode.CancellationToken,
+    isCurrent?: () => boolean
 ): Promise<Response> {
+    const isPost = init.method === 'POST';
     let attempt = 0;
     for (; ;) {
-        if (token.isCancellationRequested) {
+        if (token.isCancellationRequested || isCurrent?.() === false) {
             throw new vscode.CancellationError();
         }
         let response: Response | undefined;
@@ -948,7 +972,8 @@ async function fetchWithRetry(
             if (token.isCancellationRequested) {
                 throw new vscode.CancellationError();
             }
-            if (init.signal?.aborted || attempt >= MAX_RETRIES) {
+            // A failed fetch may have lost the response after a paid generation began.
+            if (isPost || init.signal?.aborted || attempt >= MAX_RETRIES) {
                 throw new Error(t('OpenRouter request failed.'));
             }
         }
@@ -956,7 +981,8 @@ async function fetchWithRetry(
             if (/^https:/i.test(url)) {
                 assertSecureResponse(response);
             }
-            if (!isRetryable(response.status) || attempt >= MAX_RETRIES) {
+            const retryable = response.status === 429 || (!isPost && response.status >= 500);
+            if (!retryable || attempt >= MAX_RETRIES) {
                 return response;
             }
             await discardBody(response);
@@ -1193,6 +1219,7 @@ function validGatewayCatalog(data: unknown[]): data is ModelCatalogEntry[] {
 
 export interface ProviderRuntimeConfig {
     connectionId?: string;
+    workspaceId?: string;
     baseUrl?: string;
     kind?: ConnectionKind;
     hideUnavailableModels?: boolean;
@@ -1208,6 +1235,7 @@ interface ChatModelInfo extends vscode.LanguageModelChatInformation {
 
 export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider {
     private cachedInfo: ChatModelInfo[] | undefined;
+    private cachedCapsSnapshot = '';
     private cachedCatalog: ModelCatalogEntry[] | undefined;
     private readonly genericAssumptions = new WeakMap<ModelCatalogEntry, string[]>();
     private catalogPromise: Promise<ModelCatalogEntry[]> | undefined;
@@ -1216,13 +1244,14 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
     private availablePromise: Promise<Set<string> | undefined> | undefined;
     private availablePromiseKey: string | undefined;
     private cachedPresets: PresetSummary[] | undefined;
+    private presetsComplete = false;
     private presetsPromise: Promise<PresetSummary[] | undefined> | undefined;
     private presetsPromiseKey: string | undefined;
     private readonly presetConfigs = new Map<string, Record<string, unknown>>();
     private readonly presetConfigPromises = new Map<string, Promise<Record<string, unknown> | undefined>>();
     private cacheGeneration = 0;
+    private disposed = false;
     private key: string | undefined;
-    private template: Record<string, unknown> | undefined;
     private readonly infoChangeEvent = new vscode.EventEmitter<void>();
     private contextCapQueue: Promise<void> = Promise.resolve();
     private readonly ledger: SpendLedger;
@@ -1231,30 +1260,81 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
 
     constructor(
         private readonly secrets: vscode.SecretStorage,
-        private readonly state: vscode.Memento,
+        private readonly state: vscode.Memento & Partial<Pick<AtomicConnectionState, 'mutate' | 'exclusive'>>,
         private readonly runtime: ProviderRuntimeConfig = {}
     ) {
         this.ledger = runtime.accounting?.ledger ?? (runtime.connectionId ? createSpendLedger() : defaultLedger);
-        // Production connections own their ledger; the default ledger preserves
-        // the exported accounting helpers used by legacy callers and tests.
-        hydrateSessionCosts(this.state.get<SessionCost[]>(SESSION_COSTS_KEY), this.ledger);
-        hydrateParentAttribution(this.state.get<{ sessionId: string; at: number }>(PARENT_SESSION_KEY), this.ledger);
-        this.migrateLegacyContextCaps();
-        this.ledger.persistSessionCosts = (snapshot) => {
-            const value = snapshot.length === 0 ? undefined : snapshot;
-            this.ledger.persistQueue = this.ledger.persistQueue
-                .then(() => this.state.update(SESSION_COSTS_KEY, value))
-                .catch(() => undefined);
-        };
-        this.ledger.persistParentSession = (sessionId, at) => {
-            this.ledger.persistQueue = this.ledger.persistQueue
-                .then(() => this.state.update(PARENT_SESSION_KEY, { sessionId, at }))
-                .catch(() => undefined);
-        };
+        this.contextCapQueue = this.migrateLegacyContextCaps().catch(() => undefined);
+        const mutate = state.mutate?.bind(state);
+        if (!mutate) {
+            hydrateSessionCosts(state.get<SessionCost[]>(SESSION_COSTS_KEY), this.ledger);
+            this.ledger.persistSessionCosts = (snapshot) => {
+                this.ledger.persistQueue = this.ledger.persistQueue
+                    .then(() => state.update(SESSION_COSTS_KEY, snapshot))
+                    .catch(() => undefined);
+            };
+        }
+        if (mutate && runtime.workspaceId) {
+            const workspaceId = runtime.workspaceId;
+            if (!runtime.accounting) {
+                hydrateParentAttribution(state.get<Record<string, ParentSession>>(PARENT_SESSIONS_KEY)?.[workspaceId],
+                    this.ledger);
+            }
+            this.ledger.persistParentSession = (sessionId, at) => {
+                this.ledger.persistQueue = this.ledger.persistQueue
+                    .then(() => mutate<Record<string, ParentSession>>(PARENT_SESSIONS_KEY, (current) => {
+                        const now = Date.now();
+                        const parents = Object.fromEntries(Object.entries(current ?? {})
+                            .filter(([, parent]) => recentParent(parent?.at, now)));
+                        const previous = parents[workspaceId];
+                        if (recentParent(at, now) && (!previous || at >= previous.at)) {
+                            parents[workspaceId] = { sessionId, at };
+                        }
+                        return parents;
+                    }))
+                    .catch(() => undefined);
+            };
+        } else if (!runtime.connectionId) {
+            // Older callers using an unscoped Memento have no workspace information.
+            hydrateParentAttribution(state.get<ParentSession>(PARENT_SESSION_KEY), this.ledger);
+            this.ledger.persistParentSession = (sessionId, at) => {
+                this.ledger.persistQueue = this.ledger.persistQueue
+                    .then(() => state.update(PARENT_SESSION_KEY, { sessionId, at }))
+                    .catch(() => undefined);
+            };
+        }
     }
 
     getSessionCosts(): SessionCost[] {
-        return getSessionCosts(this.ledger);
+        if (!this.state.mutate) { return getSessionCosts(this.ledger); }
+        const snapshot = createSpendLedger();
+        hydrateSessionCosts(this.state.get<SessionCost[]>(SESSION_COSTS_KEY), snapshot);
+        return getSessionCosts(snapshot);
+    }
+
+    private async recordSessionCost(
+        sessionId: string, usage: unknown, provider: string | undefined, model: string
+    ): Promise<void> {
+        const { connectionId } = this.runtime;
+        const includeTokenOnlyUsage = !this.isDirectOpenRouter;
+        if (!this.state.mutate) {
+            accumulateSessionCost(sessionId, usage, provider, model, this.ledger, connectionId, includeTokenOnlyUsage);
+            return;
+        }
+        const cost = sessionTurnCost(usage, provider, includeTokenOnlyUsage);
+        if (!cost) { return; }
+        try {
+            await this.state.mutate<SessionCost[]>(SESSION_COSTS_KEY, (previous) => {
+                const ledger = createSpendLedger();
+                hydrateSessionCosts(previous, ledger);
+                addTurnToLedger(ledger, sessionId, cost, model);
+                return getSessionCosts(ledger);
+            });
+        } catch {
+            // The connection may have been deleted while inference was running.
+            return;
+        }
+        turnCostEmitter.fire({ ...cost, ...(connectionId ? { connectionId } : {}) });
     }
 
     private get isDirectOpenRouter(): boolean {
@@ -1285,7 +1365,12 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         return key ? { Authorization: `Bearer ${key}` } : {};
     }
 
+    private discoveryCurrent(generation: number): boolean {
+        return !this.disposed && generation === this.cacheGeneration && this.runtime.isCurrent?.() !== false;
+    }
+
     dispose(): void {
+        this.disposed = true;
         this.invalidateCatalogCaches();
         this.infoChangeEvent.dispose();
     }
@@ -1296,47 +1381,47 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
      * `contextCapsBase`. Restore the gross choice so a saved budget survives,
      * then drop both retired keys.
      */
-    private migrateLegacyContextCaps(): void {
-        try {
-            const base = this.state.get<Record<string, number>>(LEGACY_CONTEXT_CAPS_BASE_KEY);
-            const margin = this.state.get<number>(LEGACY_CONTEXT_MARGIN_KEY, 0);
+    private async migrateLegacyContextCaps(): Promise<void> {
+        if (!this.state.get(LEGACY_CONTEXT_CAPS_BASE_KEY) && !this.state.get(LEGACY_CONTEXT_MARGIN_KEY)) return;
+        const migrate = async (state: Pick<vscode.Memento, 'get' | 'update'>): Promise<void> => {
+            const base = state.get<Record<string, number>>(LEGACY_CONTEXT_CAPS_BASE_KEY);
+            const margin = state.get<number>(LEGACY_CONTEXT_MARGIN_KEY, 0);
             if (!base && !margin) {
                 return;
             }
-            const factor = 1 - Math.min(50, Math.max(0, margin)) / 100;
-            const caps = { ...this.getContextCaps() };
+            const factor = 1 - Math.min(50, Math.max(0, margin || 0)) / 100;
+            const caps = { ...state.get<Record<string, ContextCapValue>>(CONTEXT_CAPS_KEY) };
+            const grossCaps: Record<string, number> = {};
             for (const [modelId, value] of Object.entries(caps)) {
-                if (typeof value !== 'number' || !(value > 0)) {
-                    continue;
-                }
-                const stored = base?.[modelId];
-                const gross = typeof stored === 'number' && stored > 0
-                    ? stored
-                    : margin > 0
-                        ? Math.max(1, Math.round(value / factor))
-                        : value;
-                caps[modelId] = Math.floor(gross);
+                if (typeof value !== 'number' || !(value > 0)) continue;
+                const saved = base?.[modelId];
+                const gross = typeof saved === 'number' && saved > 0 ? saved : Math.max(1, Math.round(value / factor));
+                grossCaps[modelId] = Math.floor(gross);
+                caps[modelId] = grossCaps[modelId];
             }
-            void this.state.update(CONTEXT_CAPS_KEY, Object.keys(caps).length > 0 ? caps : undefined);
-            void this.state.update(LEGACY_CONTEXT_CAPS_BASE_KEY, undefined);
-            void this.state.update(LEGACY_CONTEXT_MARGIN_KEY, undefined);
-        } catch {
-            // A state read failure must never block activation.
-        }
+            // Preserve every target before replacing reduced values so retries cannot apply the margin twice.
+            await state.update(LEGACY_CONTEXT_CAPS_BASE_KEY, grossCaps);
+            await state.update(CONTEXT_CAPS_KEY, Object.keys(caps).length > 0 ? caps : undefined);
+            await state.update(LEGACY_CONTEXT_MARGIN_KEY, undefined);
+            await state.update(LEGACY_CONTEXT_CAPS_BASE_KEY, undefined);
+        };
+        if (this.state.exclusive) await this.state.exclusive(migrate);
+        else await migrate(this.state);
+        this.refreshModelInfo();
     }
 
     async setKey(value: string): Promise<void> {
         assertConnectionCredential(this.runtime.kind, value);
+        await storeKey(this.secrets, value);
         this.key = value;
         this.invalidateCatalogCaches();
-        await storeKey(this.secrets, value);
         this.infoChangeEvent.fire();
     }
 
     async clearKey(): Promise<void> {
+        await clearStoredKey(this.secrets);
         this.key = undefined;
         this.invalidateCatalogCaches();
-        await clearStoredKey(this.secrets);
         this.infoChangeEvent.fire();
     }
 
@@ -1360,6 +1445,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         this.availablePromise = undefined;
         this.availablePromiseKey = undefined;
         this.cachedPresets = undefined;
+        this.presetsComplete = false;
         this.presetsPromise = undefined;
         this.presetsPromiseKey = undefined;
         this.presetConfigs.clear();
@@ -1383,22 +1469,29 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
 
     async setContextCap(modelId: string, value: ContextCapValue | null): Promise<void> {
         this.contextCapQueue = this.contextCapQueue.then(async () => {
-            const caps = { ...this.getContextCaps() };
-            if (value === 'full') {
-                caps[modelId] = 'full';
-            } else if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
-                const model = (this.cachedCatalog ?? []).find((entry) => entry.id === modelId);
-                const fullCap = model
-                    ? effectiveMaxInputTokens(model, { outputReserve: outputReservePolicy() })
-                    : undefined;
-                caps[modelId] =
-                    fullCap !== undefined ? Math.max(1, Math.min(Math.floor(value), fullCap)) : Math.floor(value);
+            await this.migrateLegacyContextCaps();
+            const change = (previous: Record<string, ContextCapValue> | undefined) => {
+                const caps = { ...previous };
+                if (value === 'full') {
+                    caps[modelId] = 'full';
+                } else if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+                    const model = (this.cachedCatalog ?? []).find((entry) => entry.id === modelId);
+                    const fullCap = model
+                        ? effectiveMaxInputTokens(model, { outputReserve: outputReservePolicy() })
+                        : undefined;
+                    caps[modelId] =
+                        fullCap !== undefined ? Math.max(1, Math.min(Math.floor(value), fullCap)) : Math.floor(value);
+                } else {
+                    delete caps[modelId];
+                }
+                return Object.keys(caps).length > 0 ? caps : undefined;
+            };
+            if (this.state.mutate) {
+                await this.state.mutate(CONTEXT_CAPS_KEY, change);
             } else {
-                delete caps[modelId];
+                await this.state.update(CONTEXT_CAPS_KEY, change(this.getContextCaps()));
             }
-            this.cachedInfo = undefined;
-            await this.state.update(CONTEXT_CAPS_KEY, Object.keys(caps).length > 0 ? caps : undefined);
-            this.infoChangeEvent.fire();
+            this.refreshModelInfo();
         }).catch(() => undefined);
         return this.contextCapQueue;
     }
@@ -1431,16 +1524,17 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         }
     }
 
-    contextBudgetFor(modelId: string): ContextBudgetOptions {
+    contextBudgetFor(
+        modelId: string, caps = this.getContextCaps(), model = this.cachedCatalog?.find(entry => entry.id === modelId)
+    ): ContextBudgetOptions {
         const outputReserve = outputReservePolicy();
-        const stored = this.getContextCaps()[modelId];
+        const stored = caps[modelId];
         if (typeof stored === 'number') {
             return { overrideTokens: stored, outputReserve };
         }
         if (stored === 'full') {
             return { outputReserve };
         }
-        const model = (this.cachedCatalog ?? []).find((entry) => entry.id === modelId);
         if (!model) {
             return { outputReserve };
         }
@@ -1468,34 +1562,30 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         if (this.supportsOpenRouterRequestFields) {
             delete params.session_id;
         }
-        this.template = params;
         await this.state.update(TEMPLATE_KEY, params);
         return { ok: true };
     }
 
     async getTemplate(): Promise<Record<string, unknown> | undefined> {
-        if (this.template) {
-            return this.template;
-        }
-        this.template = this.state.get<Record<string, unknown>>(TEMPLATE_KEY);
-        return this.template;
+        return this.state.get<Record<string, unknown>>(TEMPLATE_KEY);
     }
 
     async clearTemplate(): Promise<void> {
-        this.template = undefined;
         await this.state.update(TEMPLATE_KEY, undefined);
     }
 
     async getKey(silent: boolean): Promise<string | undefined> {
+        if (!this.discoveryCurrent(this.cacheGeneration)) return undefined;
         if (this.key) {
             assertConnectionCredential(this.runtime.kind, this.key);
             return this.key;
         }
         const generation = this.cacheGeneration;
         const stored = this.runtime.readKey ? await this.runtime.readKey() : await readKey(this.secrets);
+        if (!this.discoveryCurrent(generation)) return undefined;
         assertConnectionCredential(this.runtime.kind, stored);
         if (stored) {
-            if (generation === this.cacheGeneration) { this.key = stored; }
+            this.key = stored;
             return stored;
         }
         if (silent || !this.isDirectOpenRouter) {
@@ -1506,7 +1596,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             password: true,
             ignoreFocusOut: true,
         });
-        if (value) {
+        if (value && this.discoveryCurrent(generation)) {
             await this.setKey(value.trim());
             return this.key;
         }
@@ -1517,34 +1607,32 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         options: vscode.PrepareLanguageModelChatModelOptions,
         token: vscode.CancellationToken
     ): Promise<ChatModelInfo[]> {
-        if (this.cachedInfo) {
+        let generation = this.cacheGeneration;
+        if (!this.discoveryCurrent(generation)) return [];
+        if (this.cachedInfo && this.cachedCapsSnapshot === JSON.stringify(this.getContextCaps())) {
+            if (this.isDirectOpenRouter && !this.presetsComplete && this.key) {
+                void this.ensurePresets(this.key).catch(() => undefined);
+            }
             return this.cachedInfo;
         }
-        const generation = this.cacheGeneration;
         const key = await this.getKey(options.silent);
-        if (this.isGateway && generation !== this.cacheGeneration) { return []; }
-        if (!key && this.isDirectOpenRouter) {
-            return [];
-        }
+        // Saving a newly prompted key invalidates this child's original, keyless generation.
+        if (!options.silent && key && key === this.key) generation = this.cacheGeneration;
+        if (!this.discoveryCurrent(generation) || (!key && this.isDirectOpenRouter)) return [];
         const models = await this.ensureCatalog(key ?? '', token);
+        if (!this.discoveryCurrent(generation)) return [];
         const visible = await this.resolveVisibleCatalog(key ?? '', models, token, generation);
-        const stale = generation !== this.cacheGeneration;
-        if (!stale) {
-            this.cachedCatalog = visible;
-        }
-        const info = visible.map(m => this.toInfo(m));
-        if (stale) {
-            return this.isGateway ? [] : info;
-        }
+        if (!this.discoveryCurrent(generation)) return [];
+        // A permitted preset may pin a dated catalog entry hidden as a standalone picker model.
+        this.cachedCatalog = models;
+        const caps = this.getContextCaps();
+        this.cachedCapsSnapshot = JSON.stringify(caps);
+        const info = visible.map(m => this.toInfo(m, caps));
         this.cachedInfo = info;
-        if (!this.isDirectOpenRouter) {
-            return info;
+        if (this.isDirectOpenRouter) {
+            if (this.cachedPresets) this.appendPresetEntries(info, models);
+            if (!this.presetsComplete) void this.ensurePresets(key ?? '').catch(() => undefined);
         }
-        if (this.cachedPresets) {
-            this.appendPresetEntries(info, models);
-            return info;
-        }
-        void this.attachPresets(key ?? '', models, info, generation);
         return info;
     }
 
@@ -1583,7 +1671,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         if (visible.length === 0) {
             return models;
         }
-        if (generation === this.cacheGeneration) {
+        if (this.discoveryCurrent(generation)) {
             this.cachedAvailableIds = available;
             this.availableCacheKey = key;
         }
@@ -1694,31 +1782,6 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         }
     }
 
-    private async attachPresets(
-        key: string,
-        models: ModelCatalogEntry[],
-        snapshot: ChatModelInfo[],
-        generation: number
-    ): Promise<void> {
-        try {
-            const presets = await this.ensurePresets(key);
-            if (presets === undefined || this.cachedInfo !== snapshot || generation !== this.cacheGeneration) {
-                return;
-            }
-            this.cachedPresets = presets;
-            const entries = presets
-                .map(p => this.toPresetInfo(p, models))
-                .filter((e): e is ChatModelInfo => e !== undefined);
-            if (entries.length === 0 || this.cachedInfo !== snapshot || generation !== this.cacheGeneration) {
-                return;
-            }
-            this.cachedInfo = [...snapshot, ...entries];
-            this.infoChangeEvent.fire();
-        } catch {
-            // the picker stays models-only until the next query when the sweep fails or is cancelled
-        }
-    }
-
     async provideLanguageModelChatResponse(
         model: vscode.LanguageModelChatInformation,
         messages: readonly vscode.LanguageModelChatRequestMessage[],
@@ -1808,15 +1871,13 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         let usage: unknown;
         let provider: string | undefined;
         let usageAccounted = false;
-        const accountUsage = (): void => {
+        const accountUsage = async (): Promise<void> => {
             if (usage === undefined || usageAccounted) {
                 return;
             }
             usageAccounted = true;
+            await this.recordSessionCost(costKey, usage, provider, recordedModel);
             reportUsagePart(progress, usage);
-            accumulateSessionCost(
-                costKey, usage, provider, recordedModel, this.ledger, this.runtime.connectionId, !this.isDirectOpenRouter
-            );
         };
         const streamState = { reportedAnyPart: false, sawReasoning: false };
         const trackedProgress: vscode.Progress<ResponsePart> = {
@@ -1864,7 +1925,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
                 const cleaned = sanitizeRequestBody(body);
                 if (cleaned.removed > 0) {
                     await discardBody(response);
-                    trackedProgress.report(new vscode.LanguageModelTextPart(t(GUARDRAIL_RETRY_NOTICE)));
+                    progress.report(new vscode.LanguageModelTextPart(t(GUARDRAIL_RETRY_NOTICE)));
                     response = await fetchWithRetry(
                         `${this.baseUrl}/chat/completions`,
                         init(cleaned.body),
@@ -1883,9 +1944,18 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             const reader = response.body.getReader();
             const decoder = new TextDecoder();
             let buffer = '';
-            const finishTurn = (): void => {
+            let sawStop = false;
+            let toolCallsInterrupted = false;
+            const finishTurn = async (doneMarker: boolean): Promise<void> => {
+                if (!sawStop && !streamState.reportedAnyPart && !streamState.sawReasoning
+                    && !toolCalls.size && !buildUsagePart(usage)) {
+                    throw new Error(t('OpenRouter returned an unexpected stream response.'));
+                }
+                if (toolCallsInterrupted || (toolCalls.size > 0 && !doneMarker)) {
+                    throw invalidToolCall();
+                }
                 flushToolCalls(toolCalls, trackedProgress);
-                accountUsage();
+                await accountUsage();
                 lastStreamUsage = usage;
                 lastStreamProvider = provider;
                 finishStream(trackedProgress, streamState);
@@ -1918,11 +1988,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
                 if (stallExpired) {
                     throw new Error(t('OpenRouter stopped sending data after {0} seconds.', postTimeoutMs / 1000));
                 }
-                if (chunk.done) {
-                    finishTurn();
-                    break;
-                }
-                buffer += decoder.decode(chunk.value, { stream: true });
+                buffer += chunk.done ? decoder.decode() + '\n' : decoder.decode(chunk.value, { stream: true });
                 if (buffer.length > MAX_SSE_BUFFER_CHARS) {
                     throw new Error(t('OpenRouter: oversized SSE line in the stream response.'));
                 }
@@ -1938,7 +2004,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
                         continue;
                     }
                     if (data === '[DONE]') {
-                        finishTurn();
+                        await finishTurn(true);
                         return;
                     }
                     let json: any;
@@ -1946,6 +2012,9 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
                         json = JSON.parse(data);
                     } catch {
                         throw new Error(t('OpenRouter: malformed SSE data line in the stream response.'));
+                    }
+                    if (!json || typeof json !== 'object' || Array.isArray(json)) {
+                        throw new Error(t('OpenRouter returned an unexpected stream response.'));
                     }
                     if (json.error !== undefined) {
                         throw mapStreamedError(json, generationId) ?? new Error(t('OpenRouter stream error.'));
@@ -1956,25 +2025,43 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
                     if (json.usage !== undefined && typeof json.usage === 'object' && json.usage !== null) {
                         usage = json.usage;
                     }
-                    const choice = json.choices?.[0];
-                    if (!choice) {
+                    const choice = Array.isArray(json.choices) ? json.choices[0] : undefined;
+                    if (!choice || typeof choice !== 'object' || Array.isArray(choice)) {
                         continue;
                     }
                     const delta = choice.delta ?? {};
+                    if (typeof delta !== 'object' || Array.isArray(delta)) {
+                        throw new Error(t('OpenRouter returned an unexpected stream response.'));
+                    }
                     if (typeof delta.content === 'string' && delta.content.length > 0) {
                         trackedProgress.report(new vscode.LanguageModelTextPart(delta.content));
                     }
                     reportThinkingParts(delta, trackedProgress, streamState);
-                    for (const tc of delta.tool_calls ?? []) {
+                    const calls = delta.tool_calls ?? [];
+                    if (!Array.isArray(calls)) {
+                        throw invalidToolCall();
+                    }
+                    for (const tc of calls) {
                         accumulateToolCall(toolCalls, tc);
                     }
-                    if (choice.finish_reason === 'tool_calls') {
-                        flushToolCalls(toolCalls, trackedProgress);
+                    if (choice.finish_reason === 'stop') {
+                        sawStop = true;
                     }
+                    if (toolCalls.size && choice.finish_reason) {
+                        if (choice.finish_reason !== 'tool_calls' && choice.finish_reason !== 'stop') {
+                            toolCallsInterrupted = true;
+                        } else if (!toolCallsInterrupted) {
+                            flushToolCalls(toolCalls, trackedProgress);
+                        }
+                    }
+                }
+                if (chunk.done) {
+                    await finishTurn(false);
+                    break;
                 }
             }
         } catch (err) {
-            accountUsage();
+            await accountUsage();
             if (token.isCancellationRequested && !(err instanceof vscode.CancellationError)) {
                 throw new vscode.CancellationError();
             }
@@ -2014,12 +2101,13 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
     }
 
     private async fetchCatalog(key: string, token: vscode.CancellationToken): Promise<ModelCatalogEntry[]> {
+        const generation = this.cacheGeneration;
         const bounded = boundedFetchSignal(token);
         try {
             const response = await fetchWithRetry(
                 `${this.baseUrl}/models`,
                 { headers: this.headers(key), signal: bounded.signal },
-                token
+                token, () => this.discoveryCurrent(generation)
             );
             await throwIfNotOk(response);
             let json: { data?: unknown };
@@ -2037,6 +2125,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             const models = (json.data as ModelCatalogEntry[]).filter(m => m && typeof m.id === 'string');
             return this.isDirectOpenRouter ? models : this.genericCatalog(models, !this.isGateway);
         } catch (error) {
+            if (!this.discoveryCurrent(generation)) return [];
             if (this.runtime.kind === 'openai-compatible' && this.runtime.manualModels?.length
                 && !token.isCancellationRequested) {
                 return this.genericCatalog([]);
@@ -2094,37 +2183,44 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
     }
 
     async getPresets(): Promise<PresetSummary[] | undefined> {
-        if (!this.isDirectOpenRouter || this.runtime.isCurrent?.() === false) { return []; }
-        if (this.cachedPresets) {
+        if (!this.isDirectOpenRouter || !this.discoveryCurrent(this.cacheGeneration)) { return []; }
+        if (this.presetsComplete) {
             return this.cachedPresets;
         }
         const generation = this.cacheGeneration;
         const key = await this.getKey(true);
-        if (!key) {
-            return [];
-        }
-        let presets: PresetSummary[] | undefined;
+        if (!this.discoveryCurrent(generation)) return undefined;
+        if (!key) return [];
         try {
-            presets = await this.ensurePresets(key);
+            const presets = await this.ensurePresets(key);
+            return this.discoveryCurrent(generation) ? presets : undefined;
         } catch {
             return undefined;
         }
-        if (presets === undefined || generation !== this.cacheGeneration) {
-            return undefined;
-        }
-        if (!this.cachedPresets) {
-            this.cachedPresets = presets;
-        }
-        return this.cachedPresets;
     }
 
     private ensurePresets(key: string): Promise<PresetSummary[] | undefined> {
+        if (this.presetsComplete) return Promise.resolve(this.cachedPresets);
         const existing = this.presetsPromise;
         if (existing && this.presetsPromiseKey === key) {
             return existing;
         }
         const cts = new vscode.CancellationTokenSource();
-        const promise = this.fetchPresets(key, cts.token).finally(() => {
+        const generation = this.cacheGeneration;
+        const promise = this.fetchPresets(key, cts.token).then(presets => {
+            if (!presets || !this.discoveryCurrent(generation)) return undefined;
+            const previousPinned = this.cachedPresets?.filter(preset => preset.model) ?? [];
+            this.cachedPresets = presets;
+            this.presetsComplete = presets.every(preset => preset.lookupSkipped || this.presetConfigs.has(preset.slug));
+            const pinned = presets.filter(preset => preset.model);
+            if (this.cachedInfo && this.cachedCatalog && JSON.stringify(previousPinned) !== JSON.stringify(pinned)) {
+                const info = this.cachedInfo.filter(model => !model.id.startsWith(PRESET_ID_PREFIX));
+                this.appendPresetEntries(info, this.cachedCatalog);
+                this.cachedInfo = info;
+                this.infoChangeEvent.fire();
+            }
+            return presets;
+        }).finally(() => {
             cts.dispose();
             if (this.presetsPromise === promise) {
                 this.presetsPromise = undefined;
@@ -2137,21 +2233,21 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
     }
 
     private async fetchPresets(key: string, token: vscode.CancellationToken): Promise<PresetSummary[] | undefined> {
-        if (this.runtime.isCurrent?.() === false) return undefined;
         const generation = this.cacheGeneration;
         const bounded = boundedFetchSignal(token);
         try {
             const response = await fetchWithRetry(
                 `${this.baseUrl}/presets?limit=100`,
                 { headers: this.headers(key), signal: bounded.signal },
-                token
+                token, () => this.discoveryCurrent(generation)
             );
             if (!response.ok) {
                 return undefined;
             }
             const json = (await response.json()) as { data?: Array<Record<string, unknown>> };
-            const summaries: PresetSummary[] = (json.data ?? [])
-                .filter((raw) => raw.status === 'active' && typeof raw.slug === 'string' && raw.slug.trim() !== '')
+            if (!Array.isArray(json?.data) || !this.discoveryCurrent(generation)) return undefined;
+            const summaries: PresetSummary[] = json.data
+                .filter((raw) => raw?.status === 'active' && typeof raw.slug === 'string' && raw.slug.trim() !== '')
                 .map((raw) => {
                     const slug = raw.slug as string;
                     return {
@@ -2160,7 +2256,9 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
                     };
                 });
             await mapWithConcurrency(summaries.slice(0, MAX_PRESET_LOOKUPS), PRESET_LOOKUP_CONCURRENCY, async (summary) => {
-                summary.model = presetModelOf(await this.fetchPresetConfig(key, summary.slug, token, generation));
+                const config = this.presetConfigs.get(summary.slug)
+                    ?? await this.fetchPresetConfig(key, summary.slug, token, generation);
+                summary.model = presetModelOf(config);
             });
             for (const summary of summaries.slice(MAX_PRESET_LOOKUPS)) {
                 summary.lookupSkipped = true;
@@ -2177,14 +2275,14 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
     }
 
     async getPresetConfig(slug: string): Promise<Record<string, unknown> | undefined> {
-        if (!this.isDirectOpenRouter || this.runtime.isCurrent?.() === false) { return undefined; }
+        if (!this.isDirectOpenRouter || !this.discoveryCurrent(this.cacheGeneration)) { return undefined; }
         const cached = this.presetConfigs.get(slug);
         if (cached) {
             return cached;
         }
         const generation = this.cacheGeneration;
         const key = await this.getKey(true);
-        if (!key || generation !== this.cacheGeneration) {
+        if (!key || !this.discoveryCurrent(generation)) {
             return undefined;
         }
         const existing = this.presetConfigPromises.get(slug);
@@ -2208,13 +2306,13 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         token: vscode.CancellationToken,
         generation: number
     ): Promise<Record<string, unknown> | undefined> {
-        if (this.runtime.isCurrent?.() === false) return undefined;
+        if (!this.discoveryCurrent(generation)) return undefined;
         const bounded = boundedFetchSignal(token);
         try {
             const response = await fetchWithRetry(
                 `${this.baseUrl}/presets/${encodeURIComponent(slug)}`,
                 { headers: this.headers(key), signal: bounded.signal },
-                token
+                token, () => this.discoveryCurrent(generation)
             );
             if (!response.ok) {
                 return undefined;
@@ -2227,9 +2325,8 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
                 return undefined;
             }
             const result = config as Record<string, unknown>;
-            if (generation === this.cacheGeneration) {
-                this.presetConfigs.set(slug, result);
-            }
+            if (!this.discoveryCurrent(generation)) return undefined;
+            this.presetConfigs.set(slug, result);
             return result;
         } catch (err) {
             if (err instanceof vscode.CancellationError) {
@@ -2288,9 +2385,9 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
         return info;
     }
 
-    private toInfo(m: ModelCatalogEntry): ChatModelInfo {
+    private toInfo(m: ModelCatalogEntry, caps: Record<string, ContextCapValue>): ChatModelInfo {
         const [family] = m.id.split('/');
-        const budget = this.contextBudgetFor(m.id);
+        const budget = this.contextBudgetFor(m.id, caps, m);
         const { detail, tooltip, maxInputTokens, maxOutputTokens } = buildModelInfo(m, budget);
         let info: ChatModelInfo = {
             id: m.id,
@@ -2332,7 +2429,7 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
             if (!this.supportsOpenRouterRequestFields) return info;
         }
         const reasoningSchema = buildReasoningSchema(m);
-        const capSchema = buildContextCapSchema(m, this.getContextCaps()[m.id], budget.outputReserve);
+        const capSchema = buildContextCapSchema(m, caps[m.id], budget.outputReserve);
         const schemaProperties = {
             ...(reasoningSchema?.properties ?? {}),
             ...(capSchema?.properties ?? {}),
@@ -2344,16 +2441,24 @@ export class OpenRouterChatProvider implements vscode.LanguageModelChatProvider 
     }
 }
 
-function contentOrString(text: string[], multimodal: unknown[]): string | unknown[] | null {
-    const content: unknown[] = [];
-    if (text.length > 0) {
-        content.push(multimodal.length > 0 ? { type: 'text', text: text.join('\n') } : text.join('\n'));
-    }
-    content.push(...multimodal);
-    if (content.length === 0) {
+interface ImageContent {
+    type: 'image_url';
+    image_url: { url: string };
+}
+
+function imageContent(part: vscode.LanguageModelDataPart): ImageContent {
+    const base64 = Buffer.from(part.data).toString('base64');
+    return { type: 'image_url', image_url: { url: `data:${part.mimeType};base64,${base64}` } };
+}
+
+function contentOrString(parts: (string | ImageContent)[]): string | unknown[] | null {
+    if (parts.length === 0) {
         return null;
     }
-    return content.length === 1 && typeof content[0] === 'string' ? content[0] : content;
+    if (parts.every(part => typeof part === 'string')) {
+        return parts.join('\n');
+    }
+    return parts.map(part => typeof part === 'string' ? { type: 'text', text: part } : part);
 }
 
 const RUNTIME_SYSTEM_ROLE = (vscode.LanguageModelChatMessageRole as unknown as { System?: number }).System;
@@ -2370,18 +2475,18 @@ function openAIRoleOf(message: vscode.LanguageModelChatRequestMessage): 'assista
 
 export function toOpenAI(messages: readonly vscode.LanguageModelChatRequestMessage[]): unknown[] {
     const out: unknown[] = [];
+    const afterToolResults: unknown[] = [];
     for (const message of messages) {
         const role = openAIRoleOf(message);
         const name = typeof message.name === 'string' && message.name.trim() !== '' ? message.name : undefined;
-        const text: string[] = [];
+        const parts: (string | ImageContent)[] = [];
         const thinking: string[] = [];
-        const multimodal: unknown[] = [];
         const toolCalls: unknown[] = [];
         const toolResults: unknown[] = [];
         for (const part of message.content) {
             if (part instanceof vscode.LanguageModelTextPart) {
                 if (part.value.length > 0) {
-                    text.push(part.value);
+                    parts.push(part.value);
                 }
             } else if (thinkingPartCtor && part instanceof thinkingPartCtor) {
                 const value = Array.isArray(part.value) ? part.value.join('\n') : part.value;
@@ -2405,11 +2510,7 @@ export function toOpenAI(messages: readonly vscode.LanguageModelChatRequestMessa
                         resultParts.push(typeof c.value === 'string' ? c.value : JSON.stringify(c.value ?? ''));
                     } else if (c instanceof vscode.LanguageModelDataPart) {
                         if (c.mimeType.startsWith('image/')) {
-                            const base64 = Buffer.from(c.data).toString('base64');
-                            multimodal.push({
-                                type: 'image_url',
-                                image_url: { url: `data:${c.mimeType};base64,${base64}` },
-                            });
+                            parts.push(imageContent(c));
                         } else {
                             resultParts.push(Buffer.from(c.data).toString('utf8'));
                         }
@@ -2420,69 +2521,46 @@ export function toOpenAI(messages: readonly vscode.LanguageModelChatRequestMessa
                 toolResults.push({ role: 'tool', tool_call_id: part.callId, content: resultParts.join('\n') });
             } else if (part instanceof vscode.LanguageModelDataPart) {
                 if (part.mimeType.startsWith('image/')) {
-                    const base64 = Buffer.from(part.data).toString('base64');
-                    multimodal.push({
-                        type: 'image_url',
-                        image_url: { url: `data:${part.mimeType};base64,${base64}` },
-                    });
+                    parts.push(imageContent(part));
                 } else {
                     const decoded = Buffer.from(part.data).toString('utf8');
                     if (decoded.length > 0) {
-                        text.push(decoded);
+                        parts.push(decoded);
                     }
                 }
             }
         }
+        const content = contentOrString(parts);
+        const converted: Record<string, unknown> = { role, content };
+        if (name) {
+            converted.name = name;
+        }
         if (role === 'user' && toolResults.length > 0) {
             out.push(...toolResults);
-            const userContent = contentOrString(text, multimodal);
-            if (userContent !== null) {
-                const userMessage: Record<string, unknown> = { role: 'user', content: userContent };
-                if (name) {
-                    userMessage.name = name;
-                }
-                out.push(userMessage);
+            if (content !== null) {
+                // Copilot can deliver parallel results in consecutive user messages.
+                afterToolResults.push(converted);
             }
             continue;
         }
+        out.push(...afterToolResults);
+        afterToolResults.length = 0;
         if (role === 'assistant') {
-            const converted: Record<string, unknown> = { role };
             if (thinking.length > 0) {
                 converted.reasoning = thinking.join('\n');
             } else {
                 converted.reasoning_content = '';
             }
             if (toolCalls.length > 0) {
-                converted.content = text.length > 0 ? text.join('\n') : null;
+                converted.content = contentOrString(parts.filter(part => typeof part === 'string'));
                 converted.tool_calls = toolCalls;
-            } else {
-                const content = contentOrString(text, multimodal);
-                if (content === null) {
-                    if (thinking.length === 0) {
-                        continue;
-                    }
-                    converted.content = null;
-                } else {
-                    converted.content = content;
-                }
             }
-            if (name) {
-                converted.name = name;
-            }
+        }
+        if (content !== null || (role === 'assistant' && (thinking.length > 0 || toolCalls.length > 0))) {
             out.push(converted);
-            continue;
         }
-        const converted: Record<string, unknown> = { role };
-        const content = contentOrString(text, multimodal);
-        if (content === null) {
-            continue;
-        }
-        converted.content = content;
-        if (name) {
-            converted.name = name;
-        }
-        out.push(converted);
     }
+    out.push(...afterToolResults);
     return out;
 }
 
@@ -2514,35 +2592,36 @@ function reportThinkingParts(
     const details = Array.isArray(delta.reasoning_details)
         ? flattenReasoningDetails(delta.reasoning_details)
         : undefined;
-    const hasReasoning =
-        reasoning.length > 0 ||
-        (details !== undefined && (details.thinking.length > 0 || details.text.length > 0));
-    if (state && hasReasoning) {
-        state.sawReasoning = true;
-    }
-    if (!thinkingPartCtor) {
-        return;
-    }
-    if (reasoning.length > 0) {
-        progress.report(new thinkingPartCtor(reasoning));
-        return;
-    }
-    if (details) {
-        if (details.thinking.length > 0) {
-            progress.report(new thinkingPartCtor(details.thinking));
+    const thinking = reasoning || details?.thinking;
+    if (thinking) {
+        if (state) {
+            state.sawReasoning = true;
         }
-        if (details.text.length > 0) {
-            progress.report(new vscode.LanguageModelTextPart(details.text));
+        if (thinkingPartCtor) {
+            progress.report(new thinkingPartCtor(thinking));
         }
     }
+    if (details?.text && details.text !== delta.content) {
+        progress.report(new vscode.LanguageModelTextPart(details.text));
+    }
+}
+
+function invalidToolCall(): Error {
+    return new Error(t('OpenRouter returned an incomplete or invalid tool call.'));
 }
 
 function accumulateToolCall(
     toolCalls: Map<number, { id: string; name: string; arguments: string }>,
     tc: any
 ): void {
-    const index = tc.index ?? 0;
-    const current = toolCalls.get(index) ?? { id: tc.id ?? `call_${index}`, name: '', arguments: '' };
+    const index = tc?.index ?? 0;
+    if (!tc || typeof tc !== 'object' || !Number.isSafeInteger(index) || index < 0
+        || (tc.id != null && typeof tc.id !== 'string')
+        || (tc.function?.name != null && typeof tc.function.name !== 'string')
+        || (tc.function?.arguments != null && typeof tc.function.arguments !== 'string')) {
+        throw invalidToolCall();
+    }
+    const current = toolCalls.get(index) ?? { id: '', name: '', arguments: '' };
     if (tc.id) {
         current.id = tc.id;
     }
@@ -2559,14 +2638,24 @@ function flushToolCalls(
     toolCalls: Map<number, { id: string; name: string; arguments: string }>,
     progress: vscode.Progress<ResponsePart>
 ): void {
-    for (const call of toolCalls.values()) {
-        let input: object;
+    // Validate every sibling before exposing any tool in a parallel batch to Copilot.
+    const ids = new Set<string>();
+    const parts = Array.from(toolCalls.values(), call => {
+        let input: unknown;
         try {
-            input = call.arguments ? JSON.parse(call.arguments) : {};
+            input = JSON.parse(call.arguments);
         } catch {
-            input = { raw: call.arguments };
+            throw invalidToolCall();
         }
-        progress.report(new vscode.LanguageModelToolCallPart(call.id, call.name, input));
+        if (!call.id.trim() || ids.has(call.id) || !call.name.trim()
+            || !input || typeof input !== 'object' || Array.isArray(input)) {
+            throw invalidToolCall();
+        }
+        ids.add(call.id);
+        return new vscode.LanguageModelToolCallPart(call.id, call.name, input);
+    });
+    for (const part of parts) {
+        progress.report(part);
     }
     toolCalls.clear();
 }

@@ -272,11 +272,11 @@ export function nextUtcMonthStart(now: Date = new Date()): Date {
     );
 }
 
-/** OR usage plus BYOK usage when counted (missing/NaN BYOK counts as 0). */
+/** Unknown OpenRouter usage leaves the budget unknown. Optional BYOK usage defaults to zero. */
 function sumUsage(or: number | null | undefined, byok: number | null | undefined, includeByok: boolean): number {
-    const o = toNum(or ?? 0);
-    const b = toNum(byok ?? 0);
-    return (Number.isFinite(o) ? o : 0) + (includeByok && Number.isFinite(b) ? b : 0);
+    const o = toNum(or);
+    const b = toNum(byok);
+    return o + (includeByok && Number.isFinite(b) ? b : 0);
 }
 
 /** Daily spend (usage_daily + optional BYOK). */
@@ -574,7 +574,7 @@ export function buildDetail(
             sumValue:
                 !Number.isFinite(o) && !Number.isFinite(b)
                     ? t("n/a")
-                    : formatUsdOrNa(sumUsage(or, byok, true)),
+                    : formatUsdOrNa(sumUsage(Number.isFinite(o) ? o : 0, b, true)),
         };
     };
     const rows: DetailRow[] = [

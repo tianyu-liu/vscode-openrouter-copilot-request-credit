@@ -213,6 +213,10 @@ export interface PanelRenderOptions {
 }
 
 export function renderPanelHtml(options: PanelRenderOptions, allowProxyConnections = false): string {
+    return renderPanel(options, allowProxyConnections).html;
+}
+
+export function renderPanel(options: PanelRenderOptions, allowProxyConnections = false) {
     const { refreshIntervalMinutes = 5, settings = {} } = options;
     const savedConnections: ConnectionDefinition[] = options.connections ?? [{
         id: 'default', name: DEFAULT_CONNECTION_NAME, kind: 'openrouter', baseUrl: OPENROUTER_BASE_URL,
@@ -310,7 +314,7 @@ export function renderPanelHtml(options: PanelRenderOptions, allowProxyConnectio
             .map((line) => `// ${line}`)
             .join('\n')
         : '';
-    const templateJson = JSON.stringify(presetComment ? `${templateValue}\n${presetComment}` : templateValue).replace(/</g, '\\u003c');
+    const templateDisplay = presetComment ? `${templateValue}\n${presetComment}` : templateValue;
     const currentPreset = selectedPreset;
     const presetOptions: Array<{ slug: string; label: string }> = (presets ?? []).map(p => ({
         slug: p.slug,
@@ -340,12 +344,25 @@ export function renderPanelHtml(options: PanelRenderOptions, allowProxyConnectio
     const outputReserveMinTokens = settings.outputReserveMinTokens ?? DEFAULT_OUTPUT_RESERVE_MIN_TOKENS;
     const outputReserveMaxTokens = settings.outputReserveMaxTokens ?? DEFAULT_OUTPUT_RESERVE_MAX_TOKENS;
     const ktok = (tokens: number): string => String(parseFloat((tokens / 1000).toFixed(3)));
+    const live = {
+        errorBanner,
+        creditUsage: detail ? `${modeLine}<div class="table-scroll">${usageTable}</div>${freeTierLine}${remainingLine}`
+            : helpText(t(maskedKey ? 'Refresh to load credit usage.' : 'Save an API key in Settings to see credit usage.')),
+        creditLimit: limitLine,
+        creditUpdated: updatedLine,
+        sessionSpend: sessionCostHtml,
+        presetOptions: `<div class="keyline"><label class="optlabel" for="presetSelect">${t('Preset')}</label>
+            ${presetSelectHtml}</div>${presetsHint}`,
+        templateDisplay,
+        templateBase: templateValue,
+        preset: currentPreset,
+    };
 
-    return `<!DOCTYPE html>
+    const layout = `<!DOCTYPE html>
 <html lang="${esc(vscode.env.language)}">
 <head>
 <meta charset="UTF-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-<!--PANEL-NONCE-->'">
 <style>
     .wrap { max-width: 1100px; }
     .group-management { max-width: 700px; }
@@ -483,7 +500,8 @@ export function renderPanelHtml(options: PanelRenderOptions, allowProxyConnectio
         <button class="tab" id="tab-settings" role="tab" aria-selected="true" aria-controls="panel-settings" tabindex="0">${t('Settings')}</button>
         ${connections.map(item => `<button class="tab" id="tab-connection-${esc(encodeURIComponent(item.id))}" data-connection-id="${esc(item.id)}" role="tab" aria-selected="false" aria-controls="panel-connection" tabindex="-1">${esc(item.name)}${item.enabled ? '' : ` (${t('Disabled')})`}</button>`).join('')}
     </div>
-    ${errorBanner}
+    <div id="connectionLoading" role="status" hidden>${t('Loading connection…')}</div>
+    <div id="errorBanner"><!--LIVE:errorBanner--></div>
     <section class="tab-panel" id="panel-settings" role="tabpanel" aria-labelledby="tab-settings" tabindex="0">
     <div class="section group-management">
         <div class="section-title">${t('Group management')}</div>
@@ -516,6 +534,7 @@ export function renderPanelHtml(options: PanelRenderOptions, allowProxyConnectio
             <div class="keyline connection-actions form-wide">
                 <button id="saveConnection" class="primary" type="submit">${t('Save connection')}</button>
                 <button id="cancelConnection" class="secondary" type="button"${connection ? '' : ' hidden'}>${t('Cancel')}</button>
+                ${connection ? `<button id="repairModelGroup" class="secondary" type="button">${t('Repair model group')}</button>` : ''}
                 ${connection ? `<button id="deleteConnection" class="secondary" type="button">${t('Delete connection')}</button>` : ''}
                 <span id="newConnectionHint" class="helptext" hidden>${t('New connection')}</span>
             </div>
@@ -568,10 +587,10 @@ export function renderPanelHtml(options: PanelRenderOptions, allowProxyConnectio
     ${connection?.enabled === false ? `<p class="warn">${t('This connection is disabled. Enable it in Settings to show its models in Copilot.')}</p>` : ''}
     ${isOpenRouter ? `    <div class="section">
         <div class="section-title">${t('Credit usage')}</div>
-        ${detail ? `${modeLine}<div class="table-scroll">${usageTable}</div>${freeTierLine}${remainingLine}` : helpText(t(maskedKey ? 'Refresh to load credit usage.' : 'Save an API key in Settings to see credit usage.'))}
-        ${limitLine}
+        <div id="creditUsage"><!--LIVE:creditUsage--></div>
+        <div id="creditLimit"><!--LIVE:creditLimit--></div>
         ${connection ? `<div class="keyline"><label class="optlabel"><input type="checkbox" id="showBudgetInStatusBar"${showBudgetInStatusBar ? ' checked' : ''} /> ${t('Show this budget in the status bar')}</label></div>` : ''}
-        ${updatedLine}
+        <div id="creditUpdated"><!--LIVE:creditUpdated--></div>
     </div>
     <div class="section">
         <div class="section-title">${t('Model availability')}</div>
@@ -586,16 +605,12 @@ export function renderPanelHtml(options: PanelRenderOptions, allowProxyConnectio
     </div>`}
     <div class="section">
         <div class="section-title">${t('Session spend')}</div>
-        ${sessionCostHtml}
+        <div id="sessionSpend"><!--LIVE:sessionSpend--></div>
         ${isOpenRouter ? helpText(t('When OpenRouter reports zero for a BYOK request, the total uses the upstream provider’s reported cost.')) : ''}
     </div>
     ${isOpenRouter ? `<div class="section">
         <div class="section-title">${t('Presets')}</div>
-        <div class="keyline">
-            <label class="optlabel" for="presetSelect">${t('Preset')}</label>
-            ${presetSelectHtml}
-        </div>
-        ${presetsHint}
+        <div id="presetOptions"><!--LIVE:presetOptions--></div>
         ${helpText(t('Selecting a preset replaces the saved request. The “No preset loaded” option clears it. Copy fields from the comments into the request JSON to override the preset.'))}
         ${helpText(t('Selecting an <code>@preset/&lt;slug&gt;</code> model in the picker uses that preset for the model, overriding the saved request’s preset.'))}
     </div>` : ''}
@@ -613,8 +628,9 @@ export function renderPanelHtml(options: PanelRenderOptions, allowProxyConnectio
     </div>
     </section>
 
-    <script nonce="${nonce}">
+    <script nonce="<!--PANEL-NONCE-->">
         const vsc = acquireVsCodeApi();
+        const documentId = document.currentScript?.nonce;
         const savedState = vsc.getState() || {};
         const connectionId = ${jsonForScript(connectionId)};
         const requireConnectionScope = ${JSON.stringify(options.connections !== undefined)};
@@ -625,6 +641,10 @@ export function renderPanelHtml(options: PanelRenderOptions, allowProxyConnectio
             draft[prop] = sharedDraft[prop];
         }
         let stateTimer;
+        let presetSequence = savedState.presetSequence ?? 0;
+        let pendingConnectionId = savedState.pendingConnectionId;
+        let requestedConnectionId = pendingConnectionId ? savedState.requestedConnectionId : undefined;
+        let creatingConnection = false;
         const persistState = () => {
             if (stateTimer) {
                 clearTimeout(stateTimer);
@@ -633,44 +653,67 @@ export function renderPanelHtml(options: PanelRenderOptions, allowProxyConnectio
             connectionDrafts[connectionId] = {
                 template: draft.template, templateBase: draft.templateBase,
                 preset: draft.preset, presetBase: draft.presetBase,
-                manualModels: draft.manualModels, manualModelsBase: draft.manualModelsBase,
+                pendingPreset: draft.pendingPreset,
                 connectionEditor: draft.connectionEditor, connectionEditorBase: draft.connectionEditorBase,
                 connectionCustomBaseUrl: draft.connectionCustomBaseUrl,
+                creatingConnection: draft.creatingConnection,
             };
             const sharedDraft = {};
             for (const prop of ['reservePercent', 'reservePercentBase', 'reserveMin', 'reserveMinBase', 'reserveMax', 'reserveMaxBase']) {
                 sharedDraft[prop] = draft[prop];
             }
-            vsc.setState({ activeTab: draft.activeTab, connectionDrafts, sharedDraft });
+            vsc.setState({
+                documentId, activeTab: draft.activeTab, connectionDrafts, sharedDraft,
+                pendingConnectionId, requestedConnectionId, presetSequence,
+            });
         };
         const persistStateSoon = () => {
             if (stateTimer) clearTimeout(stateTimer);
             stateTimer = setTimeout(persistState, 250);
         };
-        const post = (type, value) => vsc.postMessage({ type, value, connectionId });
+        const post = (type, value, presetMutationId) => {
+            if (!pendingConnectionId) vsc.postMessage({ type, value, connectionId, presetMutationId });
+        };
         const bind = (id, event, fn) => {
             const el = document.getElementById(id);
             if (el) el.addEventListener(event, fn);
         };
         const tabs = Array.from(document.querySelectorAll('[role="tab"]'));
-        const activateTab = (tab, notify = true) => {
-            const targetId = tab.dataset.connectionId;
-            const nextKey = document.getElementById('key');
-            if (nextKey) { nextKey.value = ''; nextKey.disabled = false; }
-            validateConnectionKey();
+        const tabForConnection = id => id && tabs.find(tab => tab.dataset.connectionId === id);
+        if (!tabForConnection(pendingConnectionId) || pendingConnectionId === connectionId) pendingConnectionId = undefined;
+        if (!tabForConnection(requestedConnectionId)) requestedConnectionId = undefined;
+        const showNavigation = () => {
+            const tab = tabs.find(item => item.id === draft.activeTab) || tabs[0];
+            const viewingConnection = !!tab.dataset.connectionId;
+            const loading = !!pendingConnectionId;
             tabs.forEach((item) => {
                 const selected = item === tab;
                 item.setAttribute('aria-selected', String(selected));
                 item.tabIndex = selected ? 0 : -1;
             });
-            document.getElementById('panel-settings').hidden = !!targetId;
-            document.getElementById('panel-connection').hidden = !targetId || targetId !== connectionId;
-            if (targetId) document.getElementById('panel-connection').setAttribute('aria-labelledby', tab.id);
-            draft.activeTab = tab.id;
+            document.getElementById('panel-settings').hidden = viewingConnection;
+            document.getElementById('panel-connection').hidden = !viewingConnection || loading;
+            if (viewingConnection) document.getElementById('panel-connection').setAttribute('aria-labelledby', tab.id);
+            document.getElementById('connectionLoading').hidden = !loading;
+            document.getElementById('connectionForm').hidden = loading;
+            document.getElementById('connectionSelect').value = requestedConnectionId ?? connectionId;
+            showConnectionEditorMode();
+        };
+        const requestConnection = id => {
+            requestedConnectionId = id;
+            const send = !pendingConnectionId && !!id && id !== connectionId;
+            if (send) pendingConnectionId = id;
+            showNavigation();
             persistState();
-            if (notify && targetId && targetId !== connectionId) {
-                vsc.postMessage({ type: 'selectConnection', connectionId: targetId });
+            if (send) vsc.postMessage({ type: 'selectConnection', connectionId: id });
+        };
+        const activateTab = (tab) => {
+            if (draft.activeTab !== tab.id) {
+                keyEl.value = '';
+                validateConnectionKey();
             }
+            draft.activeTab = tab.id;
+            requestConnection(tab.dataset.connectionId ?? requestedConnectionId);
         };
         tabs.forEach((tab, index) => {
             tab.addEventListener('click', () => activateTab(tab));
@@ -687,20 +730,31 @@ export function renderPanelHtml(options: PanelRenderOptions, allowProxyConnectio
             });
         });
         const rendered = {
-            template: ${templateJson},
-            preset: ${JSON.stringify(currentPreset).replace(/</g, '\\u003c')},
+            templateDisplay: <!--LIVE-JSON:templateDisplay-->,
+            templateBase: <!--LIVE-JSON:templateBase-->,
+            preset: <!--LIVE-JSON:preset-->,
             reservePercent: ${JSON.stringify(String(outputReservePercent))},
             reserveMin: ${JSON.stringify(ktok(outputReserveMinTokens))},
             reserveMax: ${JSON.stringify(ktok(outputReserveMaxTokens))},
         };
         const templateEl = document.getElementById('template');
-        templateEl.value = ${templateJson};
-        if (typeof draft.template === 'string' && draft.templateBase === rendered.template) {
-            templateEl.value = draft.template;
-        }
+        const legacyCommentsAt = typeof draft.templateBase === 'string' ? draft.templateBase.indexOf('\\n// ') : -1;
+        if (legacyCommentsAt >= 0) draft.templateBase = draft.templateBase.slice(0, legacyCommentsAt);
+        const invalidateTemplateDraft = () => {
+            delete draft.template;
+            delete draft.templateBase;
+        };
+        const showTemplate = (reopening = false) => {
+            const canRestore = draft.templateBase === rendered.templateBase || draft.pendingPreset?.edited;
+            if (!canRestore && !reopening) invalidateTemplateDraft();
+            const value = (canRestore ? draft.template : undefined) ?? rendered.templateDisplay;
+            if (templateEl.value !== value) templateEl.value = value;
+        };
+        showTemplate(savedState.documentId === documentId);
         templateEl.addEventListener('input', () => {
             draft.template = templateEl.value;
-            draft.templateBase = rendered.template;
+            draft.templateBase = rendered.templateBase;
+            if (draft.pendingPreset) draft.pendingPreset.edited = true;
             persistStateSoon();
         });
         const keyEl = document.getElementById('key');
@@ -721,7 +775,7 @@ export function renderPanelHtml(options: PanelRenderOptions, allowProxyConnectio
             rememberConnectionEditor();
             post('clearKey');
         });
-        const presetEl = document.getElementById('presetSelect');
+        let presetEl;
         const restorePreset = (value) => {
             if (!presetEl) return;
             const exists = Array.from(presetEl.options).some((o) => o.value === value);
@@ -733,15 +787,27 @@ export function renderPanelHtml(options: PanelRenderOptions, allowProxyConnectio
             }
             presetEl.value = value;
         };
-        if (presetEl && typeof draft.preset === 'string' && draft.presetBase === rendered.preset) {
-            restorePreset(draft.preset);
-        }
-        bind('presetSelect', 'change', () => {
-            draft.preset = presetEl.value;
-            draft.presetBase = rendered.preset;
-            persistState();
-            post('selectPreset', presetEl.value);
-        });
+        const bindPreset = () => {
+            presetEl = document.getElementById('presetSelect');
+            if (!presetEl) return;
+            if (draft.presetBase !== rendered.preset) {
+                delete draft.preset;
+                delete draft.presetBase;
+            }
+            restorePreset(draft.preset ?? rendered.preset);
+            presetEl.disabled = !!draft.pendingPreset;
+            presetEl.addEventListener('change', () => {
+                if (pendingConnectionId || draft.pendingPreset) return;
+                const id = documentId + ':' + ++presetSequence;
+                draft.pendingPreset = { id, edited: false };
+                draft.preset = presetEl.value;
+                draft.presetBase = rendered.preset;
+                presetEl.disabled = true;
+                persistState();
+                post('selectPreset', presetEl.value, id);
+            });
+        };
+        bindPreset();
         const bindReserveField = (id, prop, baseProp, messageType) => {
             const el = document.getElementById(id);
             if (!el) return;
@@ -777,18 +843,14 @@ export function renderPanelHtml(options: PanelRenderOptions, allowProxyConnectio
             persistState();
             vsc.postMessage({ type: 'resetOutputReserve' });
         });
-        bind('limit', 'change', () => {
-            post('saveLimit', document.getElementById('limit').value);
-        });
-        bind('refresh', 'click', () => {
-            post('refresh');
-        });
-        bind('resetPeriod', 'change', () => {
-            post('saveResetPeriod', document.getElementById('resetPeriod').value);
-        });
-        bind('includeByok', 'change', () => {
-            post('saveIncludeByok', document.getElementById('includeByok').checked);
-        });
+        const bindCreditLimit = () => {
+            bind('limit', 'change', () => post('saveLimit', document.getElementById('limit').value));
+            bind('resetPeriod', 'change', () => post('saveResetPeriod', document.getElementById('resetPeriod').value));
+            bind('includeByok', 'change', () => post('saveIncludeByok', document.getElementById('includeByok').checked));
+        };
+        const bindCreditRefresh = () => bind('refresh', 'click', () => post('refresh'));
+        bindCreditLimit();
+        bindCreditRefresh();
         bind('showBudgetInStatusBar', 'change', () => {
             post('saveShowBudgetInStatusBar', document.getElementById('showBudgetInStatusBar').checked);
         });
@@ -807,7 +869,6 @@ export function renderPanelHtml(options: PanelRenderOptions, allowProxyConnectio
         bind('saveTemplate', 'click', () => {
             post('saveTemplate', templateEl.value);
         });
-        let creatingConnection = false;
         const connectionKind = document.getElementById('connectionKind');
         const connectionUrl = document.getElementById('connectionUrl');
         const directBaseUrl = ${jsonForScript(OPENROUTER_BASE_URL)};
@@ -825,7 +886,14 @@ export function renderPanelHtml(options: PanelRenderOptions, allowProxyConnectio
             };
             draft.connectionEditorBase = connectionEditorBase;
             draft.connectionCustomBaseUrl = customBaseUrl;
+            draft.creatingConnection = creatingConnection;
             persistState();
+        };
+        const forgetConnectionEditor = () => {
+            delete draft.connectionEditor;
+            delete draft.connectionEditorBase;
+            delete draft.connectionCustomBaseUrl;
+            delete draft.creatingConnection;
         };
         const updateKeyHint = () => {
             const kind = connectionKind?.value ?? 'openrouter';
@@ -872,8 +940,26 @@ export function renderPanelHtml(options: PanelRenderOptions, allowProxyConnectio
             updateKeyHint();
             validateConnectionKey();
         };
-        bind('connectionKind', 'change', updateConnectionType);
-        bind('connectionUrl', 'input', updateKeyHint);
+        bind('connectionName', 'input', rememberConnectionEditor);
+        bind('connectionEnabled', 'change', rememberConnectionEditor);
+        bind('connectionKind', 'change', () => {
+            updateConnectionType();
+            rememberConnectionEditor();
+        });
+        bind('connectionUrl', 'input', () => {
+            updateKeyHint();
+            rememberConnectionEditor();
+        });
+        const showConnectionEditorMode = () => {
+            document.getElementById('newConnectionHint').hidden = !creatingConnection;
+            document.getElementById('cancelConnection').hidden = !creatingConnection && !connectionId;
+            document.getElementById('savedKeyState').hidden = creatingConnection;
+            document.getElementById('addConnection').disabled = creatingConnection || !!pendingConnectionId;
+            const repairButton = document.getElementById('repairModelGroup');
+            if (repairButton) repairButton.disabled = creatingConnection;
+            const deleteButton = document.getElementById('deleteConnection');
+            if (deleteButton) deleteButton.disabled = creatingConnection;
+        };
         const editorDraft = draft.connectionEditor;
         if (draft.connectionEditorBase === connectionEditorBase && editorDraft
             && typeof editorDraft.name === 'string' && typeof editorDraft.baseUrl === 'string'
@@ -886,40 +972,34 @@ export function renderPanelHtml(options: PanelRenderOptions, allowProxyConnectio
             document.getElementById('connectionEnabled').checked = editorDraft.enabled;
             customBaseUrl = editorDraft.kind !== 'openrouter' ? editorDraft.baseUrl
                 : typeof draft.connectionCustomBaseUrl === 'string' ? draft.connectionCustomBaseUrl : '';
+            creatingConnection = draft.creatingConnection === true;
         } else {
-            delete draft.connectionEditor;
-            delete draft.connectionEditorBase;
-            delete draft.connectionCustomBaseUrl;
+            forgetConnectionEditor();
         }
         updateConnectionType();
         bind('connectionSelect', 'change', () => {
-            persistState();
-            vsc.postMessage({ type: 'selectConnection', connectionId: document.getElementById('connectionSelect').value, value: 'settings' });
+            keyEl.value = '';
+            validateConnectionKey();
+            requestConnection(document.getElementById('connectionSelect').value);
         });
         bind('addConnection', 'click', () => {
+            if (pendingConnectionId) return;
             creatingConnection = true;
             customBaseUrl = '';
             document.getElementById('connectionName').value = ${jsonForScript(newConnectionName)};
             if (connectionUrl) connectionUrl.value = directBaseUrl;
             if (connectionKind) connectionKind.value = 'openrouter';
-            document.getElementById('newConnectionHint').hidden = false;
-            document.getElementById('cancelConnection').hidden = false;
             document.getElementById('connectionEnabled').checked = true;
             keyEl.value = '';
             keyEl.disabled = false;
             updateConnectionType();
-            document.getElementById('savedKeyState').hidden = true;
-            for (const id of ['deleteConnection', 'addConnection']) {
-                const control = document.getElementById(id);
-                if (control) control.disabled = true;
-            }
+            showConnectionEditorMode();
+            rememberConnectionEditor();
             document.getElementById('connectionName').focus();
         });
         bind('cancelConnection', 'click', () => {
             creatingConnection = false;
-            delete draft.connectionEditor;
-            delete draft.connectionEditorBase;
-            delete draft.connectionCustomBaseUrl;
+            forgetConnectionEditor();
             persistState();
             const saved = ${jsonForScript(connection ?? {})};
             customBaseUrl = saved.kind !== 'openrouter' ? saved.baseUrl || '' : '';
@@ -928,19 +1008,14 @@ export function renderPanelHtml(options: PanelRenderOptions, allowProxyConnectio
             if (connectionKind) connectionKind.value = saved.kind === 'openai-compatible'
                 ? 'gateway' : saved.kind || 'openrouter';
             document.getElementById('connectionEnabled').checked = saved.enabled !== false;
-            document.getElementById('newConnectionHint').hidden = true;
-            document.getElementById('cancelConnection').hidden = !connectionId;
             keyEl.value = '';
             keyEl.disabled = false;
             updateConnectionType();
-            document.getElementById('savedKeyState').hidden = false;
-            for (const id of ['deleteConnection', 'addConnection']) {
-                const control = document.getElementById(id);
-                if (control) control.disabled = false;
-            }
+            showConnectionEditorMode();
         });
         bind('connectionForm', 'submit', (event) => {
             event.preventDefault();
+            if (pendingConnectionId) return;
             if (!validateConnectionKey()) {
                 keyEl.reportValidity();
                 return;
@@ -952,25 +1027,89 @@ export function renderPanelHtml(options: PanelRenderOptions, allowProxyConnectio
                 enabled: document.getElementById('connectionEnabled').checked,
             };
             if (keyEl.value.trim()) value.apiKey = keyEl.value.trim();
-            if (creatingConnection || !connectionId) vsc.postMessage({ type: 'addConnection', value });
-            else post('updateConnection', value);
+            if (creatingConnection || !connectionId) {
+                forgetConnectionEditor();
+                persistState();
+                vsc.postMessage({ type: 'addConnection', value });
+                return;
+            }
+            post('updateConnection', value);
+        });
+        bind('repairModelGroup', 'click', () => {
+            if (!creatingConnection) post('repairModelGroup');
         });
         bind('deleteConnection', 'click', () => post('deleteConnection'));
-        const initialTab = tabs.find((tab) => tab.id === draft.activeTab) || tabs[0];
-        activateTab(initialTab, false);
+        const initialTab = tabs.find(tab => tab.id === draft.activeTab) || tabs[0];
+        const tabConnection = initialTab.dataset.connectionId;
+        draft.activeTab = tabConnection && !pendingConnectionId && !requestedConnectionId && tabConnection !== connectionId
+            ? (tabForConnection(connectionId) ?? tabs[0]).id : initialTab.id;
+        requestConnection(requestedConnectionId);
+        const applyRefresh = (content) => {
+            for (const id of ['errorBanner', 'creditUsage', 'creditLimit', 'creditUpdated', 'sessionSpend', 'presetOptions']) {
+                const element = document.getElementById(id);
+                if (element && typeof content[id] === 'string') element.innerHTML = content[id];
+            }
+            if (typeof content.creditLimit === 'string') bindCreditLimit();
+            if (typeof content.creditUpdated === 'string') bindCreditRefresh();
+            if (typeof content.preset === 'string') rendered.preset = content.preset;
+            if (typeof content.presetOptions === 'string') bindPreset();
+            else if (typeof content.preset === 'string') restorePreset(draft.preset ?? rendered.preset);
+            if (typeof content.templateBase === 'string' || typeof content.templateDisplay === 'string') {
+                if (typeof content.templateBase === 'string') rendered.templateBase = content.templateBase;
+                if (typeof content.templateDisplay === 'string') rendered.templateDisplay = content.templateDisplay;
+                showTemplate();
+                persistState();
+            }
+        };
         window.addEventListener('message', (event) => {
             const m = event.data;
             if (!m || typeof m !== 'object') return;
+            if (m.type === 'panelRefresh' && m.documentId === documentId) {
+                applyRefresh(m.content);
+                return;
+            }
+            if (m.type === 'connectionSelectionFailed' && pendingConnectionId && m.connectionId === pendingConnectionId) {
+                pendingConnectionId = undefined;
+                if (requestedConnectionId === m.connectionId) {
+                    if (draft.activeTab !== 'tab-settings') draft.activeTab = (tabForConnection(connectionId) ?? tabs[0]).id;
+                    requestedConnectionId = undefined;
+                }
+                requestConnection(requestedConnectionId);
+                return;
+            }
             if (requireConnectionScope ? m.connectionId !== connectionId : m.connectionId && m.connectionId !== connectionId) {
+                return;
+            }
+            if (m.type === 'presetSelectionResult') {
+                if (!draft.pendingPreset || draft.pendingPreset.id !== m.presetMutationId) return;
+                const edited = draft.pendingPreset.edited;
+                delete draft.pendingPreset;
+                delete draft.preset;
+                delete draft.presetBase;
+                if (typeof m.value === 'string') {
+                    const base = m.value ? JSON.stringify({ preset: m.value }, null, 2) : '';
+                    if (!edited) invalidateTemplateDraft();
+                    else draft.templateBase = base;
+                    if (rendered.templateBase !== base) rendered.templateDisplay = base;
+                    rendered.templateBase = base;
+                    rendered.preset = m.value;
+                }
+                restorePreset(rendered.preset);
+                if (presetEl) presetEl.disabled = false;
+                showTemplate();
+                persistState();
                 return;
             }
             if (m.type === 'templateCleared') {
                 templateEl.value = '';
-                delete draft.template;
-                delete draft.templateBase;
+                invalidateTemplateDraft();
                 delete draft.preset;
                 delete draft.presetBase;
-                if (presetEl) presetEl.value = '';
+                delete draft.pendingPreset;
+                if (presetEl) {
+                    presetEl.value = '';
+                    presetEl.disabled = false;
+                }
                 persistState();
                 return;
             }
@@ -982,10 +1121,20 @@ export function renderPanelHtml(options: PanelRenderOptions, allowProxyConnectio
             draft.presetBase = rendered.preset;
             persistStateSoon();
         });
+        vsc.postMessage({
+            type: 'panelReady', documentId, connectionId: pendingConnectionId, presetMutationId: draft.pendingPreset?.id,
+        });
     </script>
 </div>
 </body>
 </html>`;
+    // Keep the layout stable across live updates and nonce rotation.
+    const html = layout.replace(/<!--(PANEL-NONCE|LIVE|LIVE-JSON)(?::(\w+))?-->/g,
+        (_, type: string, key: keyof typeof live) => {
+            if (type === 'PANEL-NONCE') return nonce;
+            return type === 'LIVE' ? live[key] : jsonForScript(live[key]);
+        });
+    return { html, layout, live, documentId: nonce };
 }
 
 function esc(s: string): string {
@@ -996,6 +1145,8 @@ function esc(s: string): string {
 
 export interface PanelMessage {
     type: string;
+    documentId?: string;
+    presetMutationId?: string;
     value?: unknown;
     currentKeyMasked?: string;
     connectionId?: string;
@@ -1005,6 +1156,7 @@ export interface PanelDeps {
     selectConnection?: (id: string) => Promise<void>;
     addConnection?: (input: ConnectionInput, apiKey?: string | null) => Promise<void>;
     updateConnection?: (id: string, patch: ConnectionPatch, apiKey?: string | null) => Promise<void>;
+    repairModelGroup?: (id: string) => Promise<void>;
     deleteConnection?: (id: string) => Promise<void>;
     updateConfig: (key: string, value: unknown) => Thenable<void>;
     error: (message: string) => void;
@@ -1016,6 +1168,7 @@ export interface PanelDeps {
     setKey: (value: string) => Promise<void>;
     clearKey: () => Promise<void>;
     syncPresetSelection: (slug: string | undefined) => void;
+    finishPresetSelection?: (mutationId: string, preset?: string) => void;
 }
 
 export function templatePresetSlug(template: Record<string, unknown> | undefined): string | undefined {
@@ -1114,6 +1267,9 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps, all
             else if (msg.connectionId) await deps.updateConnection?.(msg.connectionId, input, apiKey);
             return;
         }
+        case 'repairModelGroup':
+            if (msg.connectionId) await deps.repairModelGroup?.(msg.connectionId);
+            return;
         case 'deleteConnection':
             if (msg.connectionId) await deps.deleteConnection?.(msg.connectionId);
             return;
@@ -1250,7 +1406,7 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps, all
         case 'clearKey':
             await deps.clearKey();
             await deps.doRefresh();
-            deps.info('API key cleared.');
+            deps.info(t('API key cleared.'));
             return;
         case 'saveTemplate': {
             const raw = String(msg.value ?? '');
@@ -1273,27 +1429,36 @@ export async function handlePanelMessage(msg: PanelMessage, deps: PanelDeps, all
         case 'clearTemplate':
             await deps.clearTemplate();
             deps.syncPresetSelection(undefined);
-            deps.info('Custom request cleared.');
+            deps.info(t('Custom request cleared.'));
             return;
         case 'selectPreset': {
             const slug = presetSlugFromPickerValue(String(msg.value ?? ''));
-            if (slug === '') {
-                await deps.clearTemplate();
-                await deps.doRefresh();
-                deps.info(t('Preset unloaded; custom request cleared.'));
-                return;
-            }
-            if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(slug)) {
+            const finish = (preset?: string): void => {
+                if (typeof msg.presetMutationId === 'string') deps.finishPresetSelection?.(msg.presetMutationId, preset);
+            };
+            if (slug && !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(slug)) {
+                finish();
                 deps.error(t('Enter a valid preset slug.'));
                 return;
             }
-            const result = await deps.saveTemplate(JSON.stringify({ preset: slug }));
-            if (!result.ok) {
-                deps.error(result.error ?? t('The request template is not valid.'));
-                return;
+            try {
+                if (!slug) {
+                    await deps.clearTemplate();
+                } else {
+                    const result = await deps.saveTemplate(JSON.stringify({ preset: slug }));
+                    if (!result.ok) {
+                        finish();
+                        deps.error(result.error ?? t('The request template is not valid.'));
+                        return;
+                    }
+                }
+            } catch (error) {
+                finish();
+                throw error;
             }
+            finish(slug);
             await deps.doRefresh();
-            deps.info(t('Preset "{0}" loaded as the request template.', slug));
+            deps.info(slug ? t('Preset "{0}" loaded as the request template.', slug) : t('Preset unloaded; custom request cleared.'));
             return;
         }
         case 'refresh':

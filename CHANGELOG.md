@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.1
+
+- Keep connection edits, key changes, and spend totals consistent across VS Code windows. After
+  replacing a key or re-enabling a connection, select its model again in Copilot.
+- Preserve unsaved panel edits during credit refreshes and connection switches. **Repair model
+  group** restores a missing or renamed group and preserves comments in the profile configuration.
+- Stop resending inference requests after a lost response. Report incomplete tool calls as errors
+  and preserve the order of text, images, and tool results.
+- Correct long-context pricing, default context budgets, reasoning defaults, and preset discovery.
+  Show unavailable usage as `n/a` and keep chat attribution within its originating workspace.
+- On first use, migrate connections, request templates, and spend history to a local database for
+  each VS Code profile. API keys stay in SecretStorage. Version 0.5.0 cannot read the migrated records.
+
 ## 0.5.0
 
 - Add named OpenRouter connections with separate keys, request settings, model groups, and spend history.

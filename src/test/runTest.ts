@@ -32,11 +32,16 @@ async function main(): Promise<void> {
         // so the test host launches as the real VS Code application.
         delete process.env.ELECTRON_RUN_AS_NODE;
 
-        // Download VS Code, unzip it and run the integration tests
-        await runTests({ extensionDevelopmentPath, extensionTestsPath, launchArgs: [
-            "--disable-extensions",
-            `--user-data-dir=${userDataDir}`,
-        ] });
+        await runTests({
+            extensionDevelopmentPath,
+            extensionTestsPath,
+            version: 'stable',
+            launchArgs: [
+                "--disable-extensions",
+                "--use-inmemory-secretstorage",
+                `--user-data-dir=${userDataDir}`,
+            ],
+        });
     } catch (err) {
         console.error("Failed to run tests", err);
         // Set the exit code rather than calling process.exit(): exit() skips

@@ -2,6 +2,8 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as vscode from 'vscode';
 import type { FixtureApi, FixtureResponse } from './extension';
+import { ConnectionRegistry } from '../../connections';
+import { ConnectionChatProvider } from '../../connectionProvider';
 
 const EXTENSION_ID = 'tianyu-liu.openrouter-copilot-request-credit';
 const VENDOR = 'openrouter-copilot-request-credit';
@@ -200,6 +202,64 @@ suite('native configured model groups (isolated fixture)', () => {
             assert.strictEqual(groups[0].name, renamed.name);
             assert.strictEqual(groups[0].connectionId, personal.connectionId);
             evidence.checks.push('process restart restores renamed group and native settings');
+        });
+
+        test('key rotation retires an acquired public handle before using the replacement credential', async () => {
+            api.releaseProvider();
+            const secrets = new Map<string, string>();
+            const secretEvents = new vscode.EventEmitter<vscode.SecretStorageChangeEvent>();
+            const registry = new ConnectionRegistry(api.globalState, {
+                keys: async () => Array.from(secrets.keys()),
+                get: async key => secrets.get(key),
+                store: async (key, value) => { secrets.set(key, value); },
+                delete: async key => { secrets.delete(key); },
+                onDidChange: secretEvents.event,
+            });
+            const originalFetch = globalThis.fetch;
+            const posts: Array<string | null> = [];
+            globalThis.fetch = async (input, init) => {
+                if (String(input).endsWith('/chat/completions')) {
+                    posts.push(new Headers(init?.headers).get('authorization'));
+                    return new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n',
+                        { headers: { 'Content-Type': 'text/event-stream' } });
+                }
+                return Response.json({ data: String(input).endsWith('/models') ? [{ id: UPSTREAM_ID }] : [] });
+            };
+            let router: ConnectionChatProvider | undefined;
+            let registration: vscode.Disposable | undefined;
+            try {
+                await registry.initialize();
+                const connection = await registry.add({ kind: 'openrouter', name: 'Rotation fixture',
+                    settings: { hideUnavailableModels: false } }, 'fixture-original');
+                router = new ConnectionChatProvider(registry);
+                registration = vscode.lm.registerLanguageModelChatProvider(VENDOR, router);
+                await writeGroups([{ vendor: VENDOR, name: connection.name, connectionId: connection.id }]);
+                const first = await eventually(async () =>
+                    (await vscode.lm.selectChatModels({ vendor: VENDOR })).find(model => model.id.startsWith('rc:')));
+                await registry.storeKey(connection.id, 'fixture-replacement');
+                const current = await eventually(async () =>
+                    (await vscode.lm.selectChatModels({ vendor: VENDOR })).find(model => model.version !== first.version
+                        && model.id.startsWith('rc:')));
+                assert.notStrictEqual(current.id, first.id);
+                const send = async (model: vscode.LanguageModelChat): Promise<string> => {
+                    const response = await model.sendRequest([vscode.LanguageModelChatMessage.User('rotation probe')]);
+                    let text = '';
+                    for await (const part of response.text) text += part;
+                    return text;
+                };
+                await assert.rejects(send(first), (error: unknown) =>
+                    error instanceof vscode.LanguageModelError && error.code === vscode.LanguageModelError.NotFound().code);
+                assert.deepStrictEqual(posts, []);
+                assert.strictEqual(await send(current), 'ok');
+                assert.deepStrictEqual(posts, ['Bearer fixture-replacement']);
+                evidence.checks.push('key rotation retires public model handle before authenticated inference');
+            } finally {
+                registration?.dispose();
+                router?.dispose();
+                registry.dispose();
+                secretEvents.dispose();
+                globalThis.fetch = originalFetch;
+            }
         });
     }
 });

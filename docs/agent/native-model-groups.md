@@ -11,9 +11,9 @@ through `connections.ts`, `connectionProvider.ts`, and `nativeGroups.ts`. See
 npm run test:groups
 ```
 
-The runner defaults to the latest stable VS Code integration client. To check a particular installed
-client, set `OPENROUTER_RC_VSCODE_EXECUTABLE` to its application executable (the Electron binary, not the
-CLI wrapper). Linux needs a display, such as an isolated Xvfb display. The runner uses the standard
+The release check uses the latest VS Code Stable. To reuse an installed copy of that release,
+set `OPENROUTER_RC_VSCODE_EXECUTABLE` to its Electron application executable.
+Linux needs a display, such as an isolated Xvfb display. The runner uses the standard
 `@vscode/test-electron` launch arguments and leaves inference TLS behavior unchanged.
 
 The runner creates a temporary fixture extension with the existing package/publisher/vendor IDs,

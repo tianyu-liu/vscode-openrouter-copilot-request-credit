@@ -116,7 +116,12 @@ const HARNESS = `
                 const url = new URL(location.href);
                 url.searchParams.set('connection', m.connectionId);
                 location.href = url;
-            } else {
+            } else if (m.type === 'selectPreset') {
+                window.postMessage({
+                    type: 'presetSelectionResult', connectionId: m.connectionId,
+                    presetMutationId: m.presetMutationId, value: m.value,
+                }, location.origin);
+            } else if (m.type !== 'panelReady') {
                 console.log('Preview action', m.type);
             }
         },
@@ -444,10 +449,11 @@ function markdownToHtml(markdown) {
 }
 
 function renderModelInfoHtml() {
-    const { buildModelInfo } = freshRequire('modelInfo.js');
+    const { buildModelInfo, defaultContextCap } = freshRequire('modelInfo.js');
     const cards = buildModelFixtures()
         .map((entry) => {
-            const info = buildModelInfo(entry);
+            const cap = defaultContextCap(entry);
+            const info = buildModelInfo(entry, typeof cap === 'number' ? { overrideTokens: cap } : {});
             return `<section class="card">
                 <h2>${escapeHtml(entry.name ?? entry.id)} <span class="id">${escapeHtml(entry.id)}</span></h2>
                 <p class="detail">picker detail: <code>${escapeHtml(info.detail ?? '(none)')}</code></p>

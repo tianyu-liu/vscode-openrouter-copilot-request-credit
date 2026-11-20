@@ -1,11 +1,15 @@
 # Session identity (P11) — what survives a window reload
 
-Local accounting is scoped to permanent connection IDs. Each production child provider owns its
-ledger and last-active-parent state, persisted under `connections.<id>.sessionCosts` and
-`connections.<id>.parentSession`. The same Copilot chat can appear independently on two connections;
-a utility call can reuse only a parent seen on its own connection. Renaming keeps that state;
-deleting a connection removes it and blocks late callbacks from restoring it. Child replacement
-for a new revision retains the connection's live ledger, including in-flight usage.
+Local accounting is scoped to permanent connection IDs. Windows in the same VS Code profile atomically
+merge each call's usage into the shared `connections.<id>.sessionCosts` ledger. The most recent parent is
+stored under `connections.<id>.parentSessions` using a hash of VS Code's workspace storage identity.
+An unidentified call can reuse only a parent on its own connection in the same workspace. A window
+without a workspace keeps parent attribution in memory. On upgrade, the first identified request
+establishes a workspace's parent. Existing session spend migrates into the shared ledger.
+
+Renaming keeps the history and parent records. Deleting a connection removes both and blocks late
+callbacks from restoring them. An in-flight request can still record usage after child replacement
+as long as its connection exists.
 
 The wire `session_id` behavior below applies to **direct OpenRouter and explicit Gateway connections**. Generic OpenAI-compatible
 connections retain the same local chat/unattributed accounting rules but receive no automatic
@@ -29,7 +33,7 @@ its turns join the parent's OpenRouter session exactly; the harness's **tool-sty
 (`execution_subagent` for the edit agent, `search_subagent`) and Copilot's **utility flows** (title
 generation, progress messages, the inline-chat intent pass, NES) pass the id only inside
 `telemetryProperties` and therefore have none — those are attributed to the **last active chat**
-instead (persisted in that connection's scoped state under `parentSession` so it survives a reload, bounded by the
+instead (persisted for that workspace and connection so it survives a reload, bounded by the
 10-minute `PARENT_ATTRIBUTION_WINDOW_MS`); and an **agent-host / SDK client-BYOK session** ([§Harness
 boundary](harness-boundary.md)) never comes through the harness at all, so it is never attributed to a chat — its spend
 appears in the panel's **Unattributed** entry (**P12b**) instead. For a call with no parent known

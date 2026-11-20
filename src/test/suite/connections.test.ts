@@ -1,9 +1,15 @@
 import * as assert from 'assert';
+import { spawnSync } from 'node:child_process';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import * as vscode from 'vscode';
 import {
     ConnectionRegistry, LEGACY_CONNECTION_ID, OPENROUTER_BASE_URL, type ConnectionKind,
 } from '../../connections';
 import { clearStoredKey, readKey, storeKey } from '../../storage';
+import { profileDirectory } from '../../profileStorage';
 
 const REGISTRY = 'connectionRegistry.v1';
 const LEGACY = 'openrouterCopilot.apiKey';
@@ -58,6 +64,223 @@ function populateLegacy(data: ReturnType<typeof fixture>): void {
 }
 
 suite('connection registry', () => {
+    test('simultaneous bootstrap resolves profile identity before either Memento receives the other window’s writes', async () => {
+        const client = (active: string) => {
+            let candidates: string[] | undefined;
+            return {
+                getCommands: async () => ['default', 'named'].map(id => 'workbench.profiles.actions.profileEntry.' + id),
+                executeCommand: async (command: string, _key?: unknown, list?: string[]) => {
+                    if (command === 'setContext') { candidates = list; return; }
+                    assert.strictEqual(command, '_getAllCommands');
+                    return !candidates || candidates.includes(active) ? [{ command: 'openrouterCopilot.manage' }] : [];
+                },
+            } as Pick<typeof vscode.commands, 'getCommands' | 'executeCommand'>;
+        };
+        const named = fixture().state;
+        const [one, two, separate] = await Promise.all([
+            profileDirectory('storage', fixture().state, client('default'), 'machine'),
+            profileDirectory('storage', fixture().state, client('default'), 'machine'),
+            profileDirectory('storage', named, client('named'), 'machine'),
+        ]);
+        assert.strictEqual(one, two);
+        assert.notStrictEqual(one, separate);
+        const noProbe = {
+            getCommands: () => assert.fail('an initialized Memento already owns its namespace'),
+            executeCommand: () => assert.fail('no profile query expected'),
+        };
+        assert.strictEqual(await profileDirectory('storage', named, noProbe, 'machine'), separate);
+    });
+
+    test('hosts without a profile context probe retain an opaque namespace in their own Memento', async () => {
+        const unavailable = {
+            getCommands: async () => [],
+            executeCommand: async () => undefined,
+        } as Pick<typeof vscode.commands, 'getCommands' | 'executeCommand'>;
+        const shared = fixture().state;
+        const first = await profileDirectory('storage', shared, unavailable, 'machine');
+        assert.strictEqual(await profileDirectory('storage', shared, unavailable, 'machine'), first);
+        assert.notStrictEqual(await profileDirectory('storage', fixture().state, unavailable, 'machine'), first);
+    });
+
+    test('profile storage serializes independent hosts and rejects reads and writes after removal', async () => {
+        const directory = await mkdtemp(join(tmpdir(), 'openrouter-registry-'));
+        const data = fixture('first');
+        // Each window can carry a different, stale Memento snapshot.
+        const first = new ConnectionRegistry(data.state, data.secrets, directory);
+        const second = new ConnectionRegistry(fixture().state, data.secrets, directory);
+        const reopened = new ConnectionRegistry(fixture().state, data.secrets, directory);
+        try {
+            await first.initialize();
+            await second.initialize();
+            await first.storeKey(LEGACY_CONNECTION_ID, 'replacement');
+            const revision = first.get(LEGACY_CONNECTION_ID)!.routingRevision;
+            let changes = 0;
+            second.onDidChange(() => changes++);
+            await second.setBudgetVisibility(LEGACY_CONNECTION_ID, false);
+            assert.ok(changes > 0);
+            assert.strictEqual(await second.readKey(LEGACY_CONNECTION_ID), 'replacement');
+            assert.strictEqual(second.get(LEGACY_CONNECTION_ID)!.routingRevision, revision);
+
+            const [one, two] = await Promise.all([
+                first.add({ name: 'Added in first', kind: 'openrouter' }, 'one'),
+                second.add({ name: 'Added in second', kind: 'openrouter' }, 'two'),
+            ]);
+            assert.deepStrictEqual(first.list(), second.list());
+            assert.strictEqual(first.list().length, 3);
+            assert.strictEqual(await first.readKey(two.id), 'two');
+            const firstState = first.stateFor(one.id);
+            const staleState = second.stateFor(one.id);
+            const addCall = (calls: number | undefined) => (calls ?? 0) + 1;
+            await Promise.all([firstState.mutate('calls', addCall), staleState.mutate('calls', addCall)]);
+            await reopened.initialize();
+            assert.strictEqual(reopened.stateFor(one.id).get('calls'), 2);
+            assert.strictEqual(await reopened.readKey(LEGACY_CONNECTION_ID), 'replacement');
+            await first.remove(one.id);
+            assert.strictEqual(staleState.get('calls'), undefined);
+            await assert.rejects(staleState.mutate('calls', addCall), /no longer exists/);
+            await assert.rejects(second.readKey(one.id), /no longer exists/);
+            assert.strictEqual(reopened.get(one.id), undefined);
+        } finally {
+            await Promise.all([first.dispose(), second.dispose(), reopened.dispose()]);
+            await rm(directory, { recursive: true, force: true });
+        }
+    });
+
+    test('named profiles serialize legacy key adoption and never rotate or clear each other’s key', async () => {
+        const shared = await mkdtemp(join(tmpdir(), 'openrouter-named-profiles-'));
+        const data = fixture('shared-old-alias');
+        const first = new ConnectionRegistry(data.state, data.secrets, join(shared, 'first'), shared);
+        const second = new ConnectionRegistry(fixture().state, data.secrets, join(shared, 'second'), shared);
+        try {
+            await Promise.all([first.initialize(), second.initialize()]);
+            const initial = await Promise.all([first.readKey(LEGACY_CONNECTION_ID), second.readKey(LEGACY_CONNECTION_ID)]);
+            assert.strictEqual(initial.filter(key => key === 'shared-old-alias').length, 1);
+            const owner = initial[0] ? first : second;
+            const other = initial[0] ? second : first;
+            await other.storeKey(LEGACY_CONNECTION_ID, 'second-key');
+            await owner.clearKey(LEGACY_CONNECTION_ID);
+            assert.strictEqual(await other.readKey(LEGACY_CONNECTION_ID), 'second-key');
+            assert.strictEqual(data.credentials.size, 1);
+        } finally {
+            await Promise.all([first.dispose(), second.dispose()]);
+            await rm(shared, { recursive: true, force: true });
+        }
+    });
+
+    test('a profile resumes its staged key after another profile has consumed the legacy alias', async () => {
+        const root = await mkdtemp(join(tmpdir(), 'openrouter-resume-profile-'));
+        const firstPath = join(root, 'first');
+        const data = fixture('previous-key');
+        const first = new ConnectionRegistry(data.state, data.secrets, firstPath, root);
+        const second = new ConnectionRegistry(fixture().state, data.secrets, join(root, 'second'), root);
+        const resumed = new ConnectionRegistry(data.state, data.secrets, firstPath, root);
+        const database = new DatabaseSync(join(firstPath, 'connections.sqlite'));
+        try {
+            database.exec(`CREATE TRIGGER fail_registry BEFORE INSERT ON state WHEN NEW.key = 'connectionRegistry.v1'
+                BEGIN SELECT RAISE(ABORT, 'registry commit interrupted'); END`);
+            await assert.rejects(first.initialize(), /registry commit interrupted/);
+            await first.dispose();
+            database.exec('DROP TRIGGER fail_registry');
+            await second.initialize();
+            assert.ok(!data.credentials.has(CURRENT));
+            await resumed.initialize();
+            assert.strictEqual(await resumed.readKey(LEGACY_CONNECTION_ID), 'previous-key');
+            await second.clearKey(LEGACY_CONNECTION_ID);
+            assert.strictEqual(await resumed.readKey(LEGACY_CONNECTION_ID), 'previous-key');
+        } finally {
+            database.close();
+            await Promise.all([first.dispose(), second.dispose(), resumed.dispose()]);
+            await rm(root, { recursive: true, force: true });
+        }
+    });
+
+    test('disposing a window rejects its waiting mutation while another window holds the profile lock', async () => {
+        const directory = await mkdtemp(join(tmpdir(), 'openrouter-waiting-window-'));
+        const data = fixture();
+        const owner = new ConnectionRegistry(data.state, data.secrets, directory);
+        const waiting = new ConnectionRegistry(data.state, data.secrets, directory);
+        let release!: () => void;
+        const gate = new Promise<void>(resolve => { release = resolve; });
+        let acquired!: () => void;
+        const locked = new Promise<void>(resolve => { acquired = resolve; });
+        try {
+            await owner.initialize();
+            await waiting.initialize();
+            const active = owner.stateFor(LEGACY_CONNECTION_ID).exclusive(async state => {
+                acquired();
+                await gate;
+                await state.update('finished', true);
+            });
+            await locked;
+            const rejection = assert.rejects(waiting.add({ name: 'Should never commit', kind: 'openrouter' }), /disposed/);
+            await new Promise<void>(resolve => setImmediate(resolve));
+            // Disposal must finish even while the original lock holder is still running.
+            await Promise.all([waiting.dispose(), rejection]);
+            release();
+            await active;
+            assert.strictEqual(owner.list().length, 1);
+            assert.strictEqual(owner.stateFor(LEGACY_CONNECTION_ID).get('finished'), true);
+        } finally {
+            release();
+            await Promise.all([owner.dispose(), waiting.dispose()]);
+            await rm(directory, { recursive: true, force: true });
+        }
+    });
+
+    test('constructing another registry preserves the current process’s SQLite lock against another process', async () => {
+        const directory = await mkdtemp(join(tmpdir(), 'openrouter-lock-'));
+        const data = fixture();
+        const owner = new ConnectionRegistry(data.state, data.secrets, directory);
+        let other: ConnectionRegistry | undefined;
+        const probe = `
+            const { DatabaseSync } = require('node:sqlite');
+            const db = new DatabaseSync(process.argv[1]);
+            try { db.exec('BEGIN IMMEDIATE'); }
+            catch (error) { if (error.errcode !== 5) throw error; process.exitCode = 42; }
+            finally { db.close(); }
+        `;
+        try {
+            await owner.initialize();
+            await owner.stateFor(LEGACY_CONNECTION_ID).exclusive(async () => {
+                other = new ConnectionRegistry(data.state, data.secrets, directory);
+                const result = spawnSync(process.execPath, ['-e', probe, join(directory, 'coordination.sqlite')], {
+                    stdio: 'inherit', env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, timeout: 5000,
+                });
+                assert.ifError(result.error);
+                assert.strictEqual(result.status, 42, 'the second process must observe SQLITE_BUSY');
+            });
+        } finally {
+            await other?.dispose();
+            await owner.dispose();
+            await rm(directory, { recursive: true, force: true });
+        }
+    });
+
+    test('imports existing registry, credentials and scoped history before retiring Memento copies', async () => {
+        const directory = await mkdtemp(join(tmpdir(), 'openrouter-registry-upgrade-'));
+        const data = fixture('already-installed');
+        const previous = new ConnectionRegistry(data.state, data.secrets);
+        const upgraded = new ConnectionRegistry(data.state, data.secrets, directory);
+        try {
+            await previous.initialize();
+            const dormant = await previous.add({ name: 'Archived proxy', kind: 'gateway', baseUrl: 'https://proxy.test' });
+            await previous.stateFor(dormant.id).update('sessionCosts', [{ paid: 2 }]);
+            const definitions = previous.list();
+            const keys = [...data.credentials];
+            await upgraded.initialize();
+            assert.deepStrictEqual(upgraded.list(), definitions);
+            assert.deepStrictEqual([...data.credentials], keys);
+            assert.strictEqual(await upgraded.readKey(LEGACY_CONNECTION_ID), 'already-installed');
+            assert.deepStrictEqual(upgraded.stateFor(dormant.id).get('sessionCosts'), [{ paid: 2 }]);
+            assert.ok(!data.values.has(REGISTRY));
+            assert.ok(!data.values.has(`connections.${dormant.id}.sessionCosts`));
+        } finally {
+            await previous.dispose();
+            await upgraded.dispose();
+            await rm(directory, { recursive: true, force: true });
+        }
+    });
+
     test('migrates the existing key, preferences and history into only the default connection', async () => {
         const data = fixture('sk-existing');
         populateLegacy(data);

@@ -2,7 +2,7 @@
 
 **English** | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
 
-Use multiple OpenRouter API keys in Copilot Chat. Each named connection has its own key, request settings, model group, and spend history. Version 0.5.0 uses the fixed OpenRouter API at `https://openrouter.ai/api/v1`.
+Use multiple OpenRouter API keys in Copilot Chat. Each named connection has its own key, request settings, model group, and spend history. The extension uses the fixed OpenRouter API at `https://openrouter.ai/api/v1`.
 
 ## Install and quick start
 
@@ -16,7 +16,7 @@ When upgrading from 0.4.1, the extension imports your existing key, request sett
 
 ## Manage connections and requests
 
-- Use **Settings → Group management** to rename, enable, or disable a connection. Leave the key field blank to keep the saved key, or choose **Clear key** to remove it. After renaming, you may need to select the model again in Copilot.
+- Use **Settings → Group management** to rename, enable, or disable a connection. Leave the key field blank to keep the saved key, or choose **Clear key** to remove it. Select the model again in Copilot after replacing its key or re-enabling the connection. Renaming can also require reselection. If the group is missing or has been renamed in VS Code, select **Repair model group**.
 - Open a connection's tab to check credit usage and session spend, configure model availability, or choose an OpenRouter preset. Selecting a preset replaces that connection's saved request. The model you select in Copilot determines which connection sends the request.
 - Build a JSON request in the [OpenRouter Request Builder](https://openrouter.ai/request-builder), paste it into **Custom request** in the intended connection's tab, and select **Save request**. Options such as provider routing, sampling, and cache controls apply to that connection until you clear or replace the request. Copilot supplies the model, messages, and tools.
 
@@ -38,11 +38,11 @@ Under **Settings → Shared settings → Status bar shows**, choose **Remaining*
 - Compatible models support streamed replies, tool calls, image input, thinking traces, and native picker controls for reasoning and context size.
 - **Session spend** shows recent chat costs by provider and model for each connection. For upstream BYOK routes, the panel uses the upstream cost when OpenRouter reports zero and supplies that cost.
 
-Model availability depends on the Copilot harness and window type. In remote windows such as WSL, SSH, and Dev Containers, the Copilot harness may omit extension-provided models. [VS Code issue #348630](https://github.com/microsoft/vscode/issues/348630)
+Model availability depends on the Copilot harness and window type. In remote windows such as WSL, SSH, and Dev Containers, the Copilot harness may omit extension-provided models. [VS Code issue 348630](https://github.com/microsoft/vscode/issues/348630)
 
 ## Privacy
 
 - The extension sends inference requests to OpenRouter using the selected connection's key. Requests can include chat messages and context supplied by Copilot, attached images, tool definitions and results, and the applicable request settings. The extension uses the corresponding connection's key for account, model availability, credit, and preset lookups. OpenRouter routes inference to upstream model providers. [OpenRouter privacy policy](https://openrouter.ai/privacy)
-- Enter credentials in the API key field so VS Code stores them separately in SecretStorage. The extension saves request templates and spend records, including chat IDs used for attribution, in VS Code state. The panel reads Copilot chat titles from VS Code's local session files when available and uses them to label spend entries.
-- When Copilot supplies a chat ID, the extension derives an OpenRouter `session_id` from it. Some utility calls can use a recent chat ID from the same connection. Agent SDK calls can arrive without a usable chat ID. Calls without a chat to attribute are sent without `session_id`, and returned costs appear under **Unattributed**.
+- Enter credentials in the API key field so VS Code stores them separately in SecretStorage. The extension saves request templates and spend records, including chat IDs used for attribution, in a local database for the current VS Code profile. The panel reads Copilot chat titles from VS Code's local session files when available and uses them to label spend entries.
+- When Copilot supplies a chat ID, the extension derives an OpenRouter `session_id` from it. Some utility calls can use a recent chat ID from the same connection and workspace. Agent SDK calls can arrive without a usable chat ID. Calls without a chat to attribute are sent without `session_id`, and returned costs appear under **Unattributed**.
 - In the VS Code Extension Development Host only, setting `OPENROUTER_RC_DEBUG=1` writes request bodies to `openrouter-requests.jsonl` in the extension's log directory. These logs can contain sensitive prompts, tool content, and images.

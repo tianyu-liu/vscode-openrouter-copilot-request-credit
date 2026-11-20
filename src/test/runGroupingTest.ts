@@ -83,6 +83,7 @@ async function main(): Promise<void> {
         for (const phase of ["lifecycle", "reload"]) {
             console.log(`Running native grouping prototype: ${phase}`);
             await runTests({
+                version: 'stable',
                 ...(executableOverride ? { vscodeExecutablePath: path.resolve(executableOverride) } : {}),
                 extensionDevelopmentPath,
                 extensionTestsPath: path.join(__dirname, "grouping", "index.js"),

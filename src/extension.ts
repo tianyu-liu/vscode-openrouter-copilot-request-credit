@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import { profileDirectory } from './profileStorage';
+import { createHash } from 'node:crypto';
 import { promises as fsp } from 'fs';
 import { setTranslator, t } from './i18n';
 import { buildStatus, KeyInfo, maskKey, AccountCredits, parseSessionTitle } from './logic';
@@ -8,7 +10,7 @@ import {
     PanelDeps,
     PanelMessage,
     readConfig,
-    renderPanelHtml,
+    renderPanel,
     templatePresetSlug,
 } from './panel';
 import { readKey, resolveSecretStorage } from './storage';
@@ -31,7 +33,9 @@ let statusBarItem: vscode.StatusBarItem | undefined;
 let statusText = '';
 let refreshTimer: ReturnType<typeof setInterval> | undefined;
 let panel: vscode.WebviewPanel | undefined;
-let lastPanelHtml: string | undefined;
+type PanelContent = ReturnType<typeof renderPanel>['live'];
+let panelDocument: { id: string; connectionId?: string; layout: string; initial: PanelContent; live: PanelContent } | undefined;
+const presetSelectionResults = new Map<string | undefined, PanelMessage>();
 let provider: OpenRouterChatProvider | undefined;
 let sessionTitleDir: vscode.Uri | undefined;
 let registry: ConnectionRegistry | undefined;
@@ -44,7 +48,7 @@ let panelMessageQueue: Promise<void> = Promise.resolve();
 const CONNECTION_MESSAGES = new Set([
     'saveKey', 'clearKey', 'saveLimit', 'saveResetPeriod', 'saveIncludeByok', 'saveHideUnavailableModels',
     'saveShowBudgetInStatusBar',
-    'saveTemplate', 'clearTemplate', 'selectPreset', 'refresh', 'updateConnection', 'deleteConnection',
+    'saveTemplate', 'clearTemplate', 'selectPreset', 'refresh', 'updateConnection', 'deleteConnection', 'repairModelGroup',
     'setConnectionEnabled', 'saveManualModels',
 ]);
 
@@ -244,11 +248,32 @@ async function fetchApi<T>(apiKey: string, resource: string, signal?: AbortSigna
 
 let panelRenderSeq = 0;
 
-/** Normalize the per-render nonce so identical panel content compares equal. */
-export function panelHtmlComparable(html: string): string {
-    return html
-        .replace(/nonce-[0-9a-f]{32}/g, 'nonce')
-        .replace(/nonce="[0-9a-f]{32}"/g, 'nonce="n"');
+export async function sendPanelRefresh(
+    webview: Pick<vscode.Webview, 'postMessage'>, documentId: string, previous: PanelContent, current: PanelContent,
+    reopening = false
+): Promise<void> {
+    const content: Partial<PanelContent> = reopening ? {
+        templateBase: current.templateBase, templateDisplay: current.templateDisplay, preset: current.preset,
+    } : {};
+    for (const key of Object.keys(current) as (keyof PanelContent)[]) {
+        if (current[key] !== previous[key]) content[key] = current[key];
+    }
+    if (Object.keys(content).length) await webview.postMessage({ type: 'panelRefresh', documentId, content });
+}
+
+function finishPanelPresetSelection(connectionId: string | undefined, presetMutationId: string, preset?: string): void {
+    const result = { type: 'presetSelectionResult', connectionId, presetMutationId, value: preset };
+    presetSelectionResults.set(connectionId, result);
+    if (preset !== undefined && selectedConnectionId === connectionId) ++panelRenderSeq;
+    const current = panelDocument;
+    if (!current || current.connectionId !== connectionId) return;
+    if (preset !== undefined) {
+        const base = preset ? JSON.stringify({ preset }, null, 2) : '';
+        if (current.live.templateBase !== base) {
+            current.live = { ...current.live, templateBase: base, templateDisplay: base, preset };
+        }
+    }
+    void panel?.webview.postMessage(result);
 }
 
 async function updatePanel(
@@ -257,13 +282,14 @@ async function updatePanel(
     signal?: AbortSignal,
     storedKey?: string | null
 ): Promise<void> {
-    if (!panel) return;
+    const targetPanel = panel;
+    if (!targetPanel) return;
     const render = ++panelRenderSeq;
     const connection = selectedConnection();
     const id = connection?.id;
     const state = id ? creditState(id) : undefined;
     const activeProvider = id ? router?.getProvider(id) : provider;
-    const stale = (): boolean => render !== panelRenderSeq || (signal?.aborted ?? false) || !panel
+    const stale = (): boolean => render !== panelRenderSeq || (signal?.aborted ?? false) || panel !== targetPanel
         || (id !== undefined && (selectedConnectionId !== id || registry?.getOpenRouter(id)?.revision !== connection?.revision));
     const config = readConfig();
     const {
@@ -292,7 +318,7 @@ async function updatePanel(
     if (stale()) return;
     const sessions = await withSessionTitles(id ? router?.getSessionCosts(id) ?? [] : getSessionCosts());
     if (stale()) return;
-    const html = renderPanelHtml({
+    const view = renderPanel({
         connections: registry?.list(),
         selectedConnectionId: id,
         info: state ? state.info : info,
@@ -318,10 +344,15 @@ async function updatePanel(
         },
     });
     if (stale()) return;
-    const comparable = panelHtmlComparable(html);
-    if (comparable === lastPanelHtml) return;
-    lastPanelHtml = comparable;
-    panel.webview.html = html;
+    const current = panelDocument;
+    if (current?.layout === view.layout) {
+        const previous = current.live;
+        current.live = view.live;
+        await sendPanelRefresh(targetPanel.webview, current.id, previous, view.live);
+        return;
+    }
+    panelDocument = { id: view.documentId, connectionId: id, layout: view.layout, initial: view.live, live: view.live };
+    targetPanel.webview.html = view.html;
 }
 
 export function createPanelDeps(
@@ -340,18 +371,30 @@ export function createPanelDeps(
         clearKey: () => prov.clearKey(),
         syncPresetSelection: (slug) =>
             void panel?.webview.postMessage({ type: 'presetSelection', value: slug ?? '' }),
+        finishPresetSelection: (mutationId, preset) => finishPanelPresetSelection(undefined, mutationId, preset),
     };
 }
 
 async function selectConnection(id: string, secrets: vscode.SecretStorage): Promise<void> {
     const connection = registry?.getOpenRouter(id);
     if (!connection) throw new Error(t('Connection no longer exists.'));
+    const previousId = selectedConnectionId;
+    await extensionState?.update('selectedConnectionId', id);
     selectedConnectionId = id;
     provider = router?.getProvider(id);
     ++panelRenderSeq;
-    await extensionState?.update('selectedConnectionId', id);
-    await updatePanel(secrets, creditState(id).info);
-    await refresh(secrets, id);
+    try {
+        await updatePanel(secrets, creditState(id).info);
+    } catch (error) {
+        if (selectedConnectionId === id) {
+            selectedConnectionId = previousId;
+            provider = previousId ? router?.getProvider(previousId) : undefined;
+            ++panelRenderSeq;
+            await extensionState?.update('selectedConnectionId', previousId);
+        }
+        throw error;
+    }
+    void refresh(secrets, id).catch(showError);
 }
 
 export async function updateConnectionWithGroup(
@@ -376,7 +419,30 @@ export async function updateConnectionWithGroup(
                 await groups.update(before);
             } catch (rollbackError) {
                 throw new AggregateError([error, rollbackError],
-                    'Connection save failed and the native model group name could not be restored.');
+                    t('Connection save failed and the native model group name could not be restored.'));
+            }
+        }
+        throw error;
+    }
+}
+
+export async function removeConnectionWithGroup(
+    store: Pick<ConnectionRegistry, 'get' | 'remove'>,
+    groups: Pick<NativeGroupManager, 'remove'>,
+    id: string
+): Promise<void> {
+    const restoreGroup = await groups.remove(id);
+    try {
+        await store.remove(id);
+    } catch (error) {
+        if (restoreGroup && store.get(id)) {
+            try {
+                await restoreGroup();
+            } catch (rollbackError) {
+                throw new AggregateError([error, rollbackError], t(
+                    'Connection deletion failed and the native model group could not be restored. '
+                    + 'Review Language Models JSON, then choose Repair model group.'
+                ));
             }
         }
         throw error;
@@ -432,6 +498,7 @@ function createConnectionPanelDeps(secrets: vscode.SecretStorage, id: string | u
                 void panel?.webview.postMessage({ type: 'presetSelection', value: slug ?? '', connectionId: id });
             }
         },
+        finishPresetSelection: (mutationId, preset) => finishPanelPresetSelection(id, mutationId, preset),
         selectConnection: selected => selectConnection(selected, secrets),
         addConnection: async (input, apiKey) => {
             if (input.kind !== 'openrouter') throw new Error(t('Connection no longer exists.'));
@@ -463,6 +530,14 @@ function createConnectionPanelDeps(secrets: vscode.SecretStorage, id: string | u
             }
             await updatePanel(secrets, selectedConnectionId ? creditState(selectedConnectionId).info : undefined);
         },
+        repairModelGroup: async () => {
+            try {
+                await nativeGroups!.repair(requireConnection());
+                void vscode.window.showInformationMessage(`${APP_PREFIX}${t('Model group synchronized.')}`);
+            } finally {
+                panel?.reveal();
+            }
+        },
         deleteConnection: async connectionId => {
             const connection = store.getOpenRouter(connectionId);
             if (!connection) return;
@@ -472,8 +547,7 @@ function createConnectionPanelDeps(secrets: vscode.SecretStorage, id: string | u
             );
             if (confirmation !== t('Delete connection')) return;
             try {
-                await nativeGroups?.remove(connectionId);
-                await store.remove(connectionId);
+                await removeConnectionWithGroup(store, nativeGroups!, connectionId);
             } finally {
                 panel?.reveal();
             }
@@ -505,18 +579,41 @@ function openPanel(secrets: vscode.SecretStorage): void {
     if (panel) {
         panel.reveal();
     } else {
-        panel = vscode.window.createWebviewPanel(
+        const opened = vscode.window.createWebviewPanel(
             'openrouterCopilot',
             t('OpenRouter for Copilot'),
             vscode.ViewColumn.One,
             { enableScripts: true }
         );
-        panel.onDidDispose(() => {
+        panel = opened;
+        opened.onDidDispose(() => {
             panel = undefined;
-            lastPanelHtml = undefined;
+            panelDocument = undefined;
+            presetSelectionResults.clear();
         });
-        panel.webview.onDidReceiveMessage((msg) => {
+        const pendingSelections = new Set<string>();
+        const rejectSelection = (connectionId: string): void => {
+            void opened.webview.postMessage({ type: 'connectionSelectionFailed', connectionId });
+        };
+        opened.webview.onDidReceiveMessage((msg) => {
             const message = msg as PanelMessage;
+            if (message.type === 'panelReady') {
+                const current = panelDocument;
+                if (panel === opened && current && message.documentId === current.id) {
+                    // VS Code may recreate a hidden webview from its original HTML.
+                    void sendPanelRefresh(opened.webview, current.id, current.initial, current.live, true).catch(showError);
+                    const presetResult = presetSelectionResults.get(current.connectionId);
+                    if (presetResult && presetResult.presetMutationId === message.presetMutationId) {
+                        void opened.webview.postMessage(presetResult);
+                    }
+                    if (message.connectionId && !pendingSelections.has(message.connectionId)) {
+                        rejectSelection(message.connectionId);
+                    }
+                }
+                return;
+            }
+            const selection = message.type === 'selectConnection' ? message.connectionId : undefined;
+            if (selection) pendingSelections.add(selection);
             panelMessageQueue = panelMessageQueue.then(async () => {
                 if (registry && CONNECTION_MESSAGES.has(message.type) && !message.connectionId) {
                     throw new Error(t('Select a connection first.'));
@@ -524,7 +621,12 @@ function openPanel(secrets: vscode.SecretStorage): void {
                 const deps = registry ? createConnectionPanelDeps(secrets, message.connectionId)
                     : provider ? createPanelDeps(secrets, provider) : undefined;
                 if (deps) await handlePanelMessage(message, deps);
-            }).catch(showError);
+            }).catch(error => {
+                if (selection && panel === opened) rejectSelection(selection);
+                showError(error);
+            }).finally(() => {
+                if (selection) pendingSelections.delete(selection);
+            });
         });
     }
     updatePanel(secrets, selectedConnectionId ? creditState(selectedConnectionId).info : legacyCredits.info).catch(showError);
@@ -641,14 +743,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     extensionState = context.globalState;
     const secrets = resolveSecretStorage(context.secrets);
     const legacy = readConfig();
-    registry = new ConnectionRegistry(context.globalState, secrets);
-    await registry.initialize({
-        creditLimit: legacy.limit,
-        creditResetPeriod: legacy.resetPeriod,
-        creditIncludeByok: legacy.includeByok,
-        hideUnavailableModels: legacy.hideUnavailableModels,
-    });
-    router = new ConnectionChatProvider(registry);
+    const directory = await profileDirectory(context.globalStorageUri.fsPath, context.globalState,
+        vscode.commands, vscode.env.machineId);
+    const store = new ConnectionRegistry(context.globalState, secrets, directory, context.globalStorageUri.fsPath);
+    try {
+        await store.initialize({
+            creditLimit: legacy.limit,
+            creditResetPeriod: legacy.resetPeriod,
+            creditIncludeByok: legacy.includeByok,
+            hideUnavailableModels: legacy.hideUnavailableModels,
+        });
+    } catch (error) {
+        await store.dispose();
+        throw error;
+    }
+    registry = store;
+    const workspaceId = context.storageUri
+        && createHash('sha256').update(context.storageUri.toString()).digest('hex');
+    router = new ConnectionChatProvider(registry, false, workspaceId);
     nativeGroups = new NativeGroupManager();
     const savedSelection = context.globalState.get<string>('selectedConnectionId');
     selectedConnectionId = savedSelection && registry.getOpenRouter(savedSelection)
@@ -709,14 +821,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     const openAndRefresh = (): void => {
         openPanel(secrets);
-        if (selectedConnectionId) {
-            refresh(secrets, selectedConnectionId).catch(showError);
-            const initial = initialGroupConnection();
-            if (initial && !extensionState?.get<boolean>('nativeConnectionGroupInitialized')) {
-                void nativeGroups?.reconcileDefault(initial).then(async () => {
-                    await extensionState?.update('nativeConnectionGroupInitialized', true);
-                }).catch(showError).finally(() => panel?.reveal());
-            }
+        if (selectedConnectionId) refresh(secrets, selectedConnectionId).catch(showError);
+        if (!context.globalState.get<boolean>('nativeConnectionGroupInitialized')) {
+            panelMessageQueue = panelMessageQueue.then(async () => {
+                const initial = initialGroupConnection();
+                if (!initial || !nativeGroups || context.globalState.get<boolean>('nativeConnectionGroupInitialized')) {
+                    return;
+                }
+                try {
+                    await nativeGroups.repair(initial);
+                    await context.globalState.update('nativeConnectionGroupInitialized', true);
+                } finally {
+                    panel?.reveal();
+                }
+            }).catch(showError);
         }
     };
     const SHOW = 'openrouterCopilot.show';
@@ -736,7 +854,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                     void vscode.window.showErrorMessage(`${APP_PREFIX}${result.error}`);
                 }
             }
-            openPanel(secrets);
+            openAndRefresh();
         }),
         vscode.commands.registerCommand('openrouterCopilot.clearTemplate', async () => {
             const open = panel;
@@ -799,17 +917,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     );
 
     applyConfig();
-    if (!context.globalState.get<boolean>('nativeConnectionGroupInitialized')) {
-        const initial = initialGroupConnection();
-        if (initial) {
-            try {
-                const outcome = await nativeGroups.ensureDefault(initial);
-                if (outcome === 'added') await context.globalState.update('nativeConnectionGroupInitialized', true);
-            } catch (error) {
-                showError(error);
-            }
-        }
-    }
     for (const connection of registry.listOpenRouter()) {
         if (connection.id === selectedConnectionId || (connection.enabled
             && connection.settings.showBudgetInStatusBar !== false)) {

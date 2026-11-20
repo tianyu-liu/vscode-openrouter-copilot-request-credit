@@ -1,4 +1,5 @@
 import * as assert from 'assert';
+import * as vscode from 'vscode';
 import { connectionModelId } from '../../connectionProvider';
 import { DEFAULT_CONNECTION_NAME, LEGACY_CONNECTION_ID } from '../../connections';
 import { NativeGroupDocument, NativeGroupEdit, NativeGroupHost, NativeGroupManager } from '../../nativeGroups';
@@ -8,28 +9,30 @@ const vendor = 'test-vendor';
 class ConfigurationDocument implements NativeGroupDocument {
     version = 1;
     isDirty = false;
+    isClosed = false;
     saves = 0;
-    constructor(public text: string) {}
+    constructor(public text: string, readonly eol: vscode.EndOfLine) {}
     getText(): string { return this.text; }
     async save(): Promise<boolean> { this.saves++; this.isDirty = false; return true; }
 }
 
-function fixture(text: string) {
-    const document = new ConfigurationDocument(text);
-    const additions: unknown[] = [];
+function fixture(text: string, eol = text.includes('\r\n') ? vscode.EndOfLine.CRLF : vscode.EndOfLine.LF) {
+    const document = new ConfigurationDocument(text, eol);
     const host: NativeGroupHost = {
         async openConfiguration() { return document; },
         async applyEdits(_document: NativeGroupDocument, edits: readonly NativeGroupEdit[]) {
-            for (const edit of [...edits].sort((left, right) => right.start - left.start)) {
-                document.text = document.text.slice(0, edit.start) + edit.text + document.text.slice(edit.end);
+            const eolText = document.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
+            // VS Code preserves insertion order for edits at the same offset and normalizes their line endings.
+            for (const edit of [...edits].reverse().sort((left, right) => right.start - left.start)) {
+                const text = edit.text.replace(/\r?\n/g, eolText);
+                document.text = document.text.slice(0, edit.start) + text + document.text.slice(edit.end);
             }
             document.version++;
             document.isDirty = true;
             return true;
         },
-        async addGroup(group) { additions.push(group); },
     };
-    return { document, host, additions, manager: new NativeGroupManager(host, vendor) };
+    return { document, host, manager: new NativeGroupManager(host, vendor) };
 }
 
 suite('Native connection group synchronization', () => {
@@ -62,6 +65,21 @@ suite('Native connection group synchronization', () => {
         assert.strictEqual(document.saves, saves);
     });
 
+    test('add places the comma before the new group in compact JSON', async () => {
+        const original = [{ vendor: 'other', name: 'Other' }];
+        const { manager, document } = fixture(JSON.stringify(original));
+        await manager.add({ id: 'a', name: 'Work' });
+        assert.deepStrictEqual(JSON.parse(document.text), [...original, { vendor, name: 'Work', connectionId: 'a' }]);
+        assert.strictEqual(document.saves, 1);
+    });
+
+    test('add follows the editor line endings when the existing profile is on one line', async () => {
+        const { manager, document } = fixture('[]', vscode.EndOfLine.CRLF);
+        await manager.add({ id: 'a', name: 'Work' });
+        assert.strictEqual(document.text, '[\r\n\t{"vendor":"test-vendor","name":"Work","connectionId":"a"}\r\n]');
+        assert.strictEqual(document.saves, 1);
+    });
+
     test('remove handles the first, last, only, and duplicated matching groups', async () => {
         const group = (id: string) => `{"vendor":"test-vendor","name":"${id}","connectionId":"${id}"}`;
         for (const groups of [group('a'), `${group('a')},${group('b')}`, `${group('b')},${group('a')}`,
@@ -73,6 +91,47 @@ suite('Native connection group synchronization', () => {
                 assert.ok(document.text.includes('"connectionId":"b"'));
             }
         }
+    });
+
+    test('a deleted group can be restored with its exact settings and comments', async () => {
+        const initial = '[\n // Keep\n {"vendor":"test-vendor","name":"Work","connectionId":"a",' +
+            '"settings":{/* model preference */"model":{"effort":"high"}}},\n]';
+        const { manager, document } = fixture(initial);
+        const restore = await manager.remove('a');
+        assert.ok(restore);
+        assert.ok(!document.text.includes('model preference'));
+        await restore();
+        assert.strictEqual(document.text, initial);
+        assert.strictEqual(document.saves, 2);
+    });
+
+    test('restoring a deleted group does not overwrite newer profile changes', async () => {
+        const { manager, document } = fixture('[{"vendor":"test-vendor","name":"Work","connectionId":"a"}]');
+        const restore = await manager.remove('a');
+        assert.ok(restore);
+        const edited = '// unrelated change\n' + document.text;
+        document.text = edited;
+        await assert.rejects(restore, /changed before.*could be restored/);
+        assert.strictEqual(document.text, edited);
+        assert.strictEqual(document.saves, 1);
+    });
+
+    test('restoring a deleted group does not overwrite a change saved during deletion', async () => {
+        const initial = '[{"vendor":"test-vendor","name":"Work","connectionId":"a"},' +
+            '{"vendor":"other","name":"Other"}]';
+        const { manager, document } = fixture(initial);
+        const save = document.save.bind(document);
+        document.save = async () => {
+            document.text = document.text.replace('"Other"', '"Renamed by user"');
+            document.version++;
+            return save();
+        };
+        const restore = await manager.remove('a');
+        assert.ok(restore);
+        assert.strictEqual(document.isDirty, false);
+        await assert.rejects(restore, /changed before.*could be restored/);
+        assert.deepStrictEqual(JSON.parse(document.text), [{ vendor: 'other', name: 'Renamed by user' }]);
+        assert.strictEqual(document.saves, 1);
     });
 
     test('duplicate native names and connection identities fail without changing the profile', async () => {
@@ -104,7 +163,7 @@ suite('Native connection group synchronization', () => {
             document.text += '\n// simultaneous user edit';
             return true;
         };
-        await assert.rejects(manager.add({ id: 'a', name: 'Work' }), /Review and save/);
+        await assert.rejects(manager.add({ id: 'a', name: 'Work' }), /Review the open file/);
         assert.strictEqual(document.saves, 0);
     });
 
@@ -118,17 +177,12 @@ suite('Native connection group synchronization', () => {
         assert.ok(document.text.includes('"name":"Office"'));
     });
 
-    test('migration uses native add without opening a profile editor and only recognizes the exact duplicate error', async () => {
-        const { manager, host, additions } = fixture('[]');
-        host.openConfiguration = async () => { throw new Error('migration must not open the editor'); };
-        assert.strictEqual(await manager.ensureDefault({ id: 'a', name: 'Personal' }), 'added');
-        assert.deepStrictEqual(additions, [{ vendor, name: 'Personal', connectionId: 'a' }]);
-        host.addGroup = async () => {
-            throw new Error('Language model group with name Personal already exists for vendor test-vendor');
-        };
-        assert.strictEqual(await manager.ensureDefault({ id: 'a', name: 'Personal' }), 'exists');
-        host.addGroup = async () => { throw new Error('Unsupported command'); };
-        await assert.rejects(manager.ensureDefault({ id: 'a', name: 'Personal' }), /Unsupported command/);
+    test('initial setup adds its group without rewriting existing JSONC', async () => {
+        const original = '[\n // Keep the other group\n {"vendor":"other", "name":"Other",},\n]';
+        const { manager, document } = fixture(original);
+        await manager.repair({ id: LEGACY_CONNECTION_ID, name: DEFAULT_CONNECTION_NAME });
+        const added = JSON.stringify({ vendor, name: DEFAULT_CONNECTION_NAME, connectionId: LEGACY_CONNECTION_ID });
+        assert.strictEqual(document.text, original.slice(0, -1) + `\n\t${added}\n]`);
     });
 
     test('explicit migration adopts the original group and preserves all existing JSONC', async () => {
@@ -141,12 +195,12 @@ suite('Native connection group synchronization', () => {
         const { manager, document } = fixture(initial);
         const connection = { id: LEGACY_CONNECTION_ID, name: DEFAULT_CONNECTION_NAME };
         await assert.rejects(manager.update(connection), /already exists/);
-        await manager.reconcileDefault(connection);
+        await manager.repair(connection);
         const scopedId = connectionModelId(LEGACY_CONNECTION_ID, modelId);
         assert.strictEqual(document.text, initial
             .replace('  {\r\n', `  {\r\n    "connectionId": "${LEGACY_CONNECTION_ID}",\r\n`)
             .replace('"settings": {', `"settings": {"${scopedId}": ${modelSettings},`));
-        await manager.reconcileDefault(connection);
+        await manager.repair(connection);
         assert.strictEqual(document.saves, 1);
     });
 
@@ -156,7 +210,7 @@ suite('Native connection group synchronization', () => {
         const settings = { [modelId]: { context: 65536 }, [scopedId]: { context: 32768 } };
         const group = { vendor, name: DEFAULT_CONNECTION_NAME, settings };
         const { manager, document } = fixture(JSON.stringify([group]));
-        await manager.reconcileDefault({ id: LEGACY_CONNECTION_ID, name: DEFAULT_CONNECTION_NAME });
+        await manager.repair({ id: LEGACY_CONNECTION_ID, name: DEFAULT_CONNECTION_NAME });
         assert.deepStrictEqual(JSON.parse(document.text), [{ ...group, connectionId: LEGACY_CONNECTION_ID }]);
     });
 
@@ -173,7 +227,7 @@ suite('Native connection group synchronization', () => {
         ] as const) {
             const initial = JSON.stringify(groups);
             const { manager, document } = fixture(initial);
-            await assert.rejects(manager.reconcileDefault(target), /already exists/);
+            await assert.rejects(manager.repair(target), /already exists/);
             assert.strictEqual(document.text, initial);
             assert.strictEqual(document.saves, 0);
         }

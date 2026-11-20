@@ -2,6 +2,23 @@
 
 ## What is verified
 
+The November 20, 2026 review build passed strict compilation, 628 integration tests, and seven
+native model-group checks on Linux VS Code Stable 1.147.0. Separate checks covered
+cross-process spend updates, recovery after killing a lock holder, default and named profile
+isolation, and panel editing during background refreshes. The locked development dependency
+tree returned zero findings in `npm audit`.
+
+On 1.147.0, an isolated desktop profile first ran the packaged 0.5.0 baseline, saved a
+synthetic credential and template, and recorded spend. Replacing its extracted extension with
+the review build migrated the registry and spend to SQLite, retained the credential reference,
+and streamed through the same route before and after restarting VS Code. The smoke intercepted
+SecretStorage and OpenRouter requests and used the same extension version for both packages.
+
+The versioned 0.5.1 candidate also passed an upgrade through the desktop installer's
+`--install-extension` command in an isolated Linux 1.147.0 profile. The 0.5.0 input VSIX
+was byte-identical to the Marketplace package. The candidate retained the synthetic key
+reference and request template, carried spend forward, and streamed another request after restart.
+
 **Direct-only 0.5.0, 2026-11-18:** strict compilation and **577 integration tests** passed on
 Linux with VS Code Stable 1.146.0. The suite uses stubbed extension requests and credentials.
 Coverage includes credential migration and recovery, named-connection routing, stale handles,

@@ -63,13 +63,15 @@ npm run preview:serve # serve only (pair with `npm run watch`); live-reloads on 
 npm run package      # vsce package → openrouter-copilot-request-credit-<ver>.vsix (no marketplace publish; install from VSIX)
 ```
 
+Marketplace releases use the [GitHub Actions publishing workflow](docs/agent/publishing.md).
+
 No lint setup exists for this TypeScript project; `tsc --strict` is the gate.
 Run `npm run compile` (and `npm test` when behavior changed) before committing.
 
-VS Code compatibility is an open-ended minimum in `engines.vscode`, not a pin to the current client.
-Keep API types on a compatible dependency range; the lockfile records the resolved build dependency.
-The integration runner uses the latest stable VS Code by default. Describe runtime capabilities in
-plans/docs and verify them on the installed client instead of assuming a particular release number.
+Target the latest VS Code Stable release for development, reviews, and release verification.
+Run the integration and native model-group suites on that release and record the version tested.
+`engines.vscode` declares the minimum version that can install the extension. Raise it when a
+required API changes that minimum. Keep API types on a compatible range in the manifest.
 
 **Panel preview (dev UI).** `scripts/panel-preview.mjs` (excluded from the VSIX) renders the panel
 and the picker's model cards in a normal browser, so their markup/styles can be debugged, reviewed,
@@ -90,10 +92,11 @@ The log contains the serialized `/chat/completions` body, including prompt text,
 images supplied to the model. Keep it private. Each body is recorded before transmission and after
 prompt sanitization. A guardrail retry with a new body gets its own entry.
 
-For settings and attribution evidence, the extension's VS Code global state contains
-`connectionRegistry.v1` and scoped keys under `connections.<id>.*`. These include `sessionCosts`,
-`parentSession`, `requestTemplate`, and `contextCaps`. The registry holds credential slot references.
-Read a copy of the state database with a read-only SQLite connection to avoid the active VS Code lock.
+For settings and attribution evidence, the profile's `connections.sqlite` in the extension's global
+storage contains `connectionRegistry.v1` and scoped keys under `connections.<id>.*`. These include
+`sessionCosts`, workspace-keyed `parentSessions`, `requestTemplate`, and `contextCaps`. Credentials
+stay in SecretStorage. The registry contains slot references. Older builds kept the registry and
+scoped records in VS Code global state. See [Storage and migration](docs/agent/architecture.md#storage-and-migration).
 
 ## Architecture
 

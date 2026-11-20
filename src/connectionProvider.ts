@@ -8,16 +8,23 @@ interface ProviderEntry {
     subscription: vscode.Disposable;
 }
 
-/** IDs remain stable across edits; the standard version field carries the routing revision. */
-export function connectionModelId(connectionId: string, upstreamModelId: string): string {
-    return `rc:${Buffer.from(JSON.stringify([connectionId, upstreamModelId])).toString('base64url')}`;
+/** Older connections retain their original picker IDs until their credentials or routing boundary changes. */
+export function connectionModelId(connectionId: string, upstreamModelId: string, routingRevision?: number): string {
+    const identity = routingRevision === undefined ? [connectionId, upstreamModelId]
+        : [connectionId, upstreamModelId, routingRevision];
+    return `rc:${Buffer.from(JSON.stringify(identity)).toString('base64url')}`;
 }
-export function decodeModelId(id: string): [string, string] | undefined {
+export function decodeModelId(id: string): [string, string, number?] | undefined {
     try {
         if (!id.startsWith('rc:')) { return undefined; }
         const value: unknown = JSON.parse(Buffer.from(id.slice(3), 'base64url').toString());
-        return Array.isArray(value) && value.length === 2 && value.every(v => typeof v === 'string' && v !== '')
-            ? value as [string, string] : undefined;
+        if (!Array.isArray(value) || typeof value[0] !== 'string' || !value[0]
+            || typeof value[1] !== 'string' || !value[1]) return undefined;
+        if (value.length === 2) return [value[0], value[1]];
+        if (value.length === 3 && Number.isSafeInteger(value[2]) && value[2] > 0) {
+            return [value[0], value[1], value[2]];
+        }
+        return undefined;
     } catch { return undefined; }
 }
 function modelVersion(upstreamModelId: string, revision: number): string {
@@ -34,7 +41,11 @@ export class ConnectionChatProvider implements vscode.LanguageModelChatProvider,
     readonly onDidChangeLanguageModelChatInformation = this.changes.event;
     readonly onTurnCost = this.costs.event;
 
-    constructor(private readonly registry: ConnectionRegistry, private readonly allowProxyConnections = false) {
+    constructor(
+        private readonly registry: ConnectionRegistry,
+        private readonly allowProxyConnections = false,
+        private readonly workspaceId?: string,
+    ) {
         this.subscriptions = [
             registry.onDidChange(() => {
                 for (const [id, entry] of this.entries) {
@@ -70,7 +81,7 @@ export class ConnectionChatProvider implements vscode.LanguageModelChatProvider,
             this.registry.secretsFor(connectionId), this.registry.stateFor(connectionId), {
                 connectionId, kind: connection.kind, baseUrl: connection.baseUrl,
                 hideUnavailableModels: connection.settings.hideUnavailableModels,
-                manualModels: connection.models, accounting: previous,
+                manualModels: connection.models, accounting: previous, workspaceId: this.workspaceId,
                 readKey: () => this.registry.readKey(connectionId),
                 isCurrent: () => {
                     const current = this.getConnection(connectionId);
@@ -104,7 +115,8 @@ export class ConnectionChatProvider implements vscode.LanguageModelChatProvider,
         const current = this.getConnection(id);
         if (this.disposed || !current?.enabled || current.revision !== connection.revision) { return []; }
         return models.map(model => ({
-            ...model, id: connectionModelId(id, model.id), version: modelVersion(model.id, connection.revision),
+            ...model, id: connectionModelId(id, model.id, connection.routingRevision),
+            version: modelVersion(model.id, connection.revision),
             connectionId: id, upstreamModelId: model.id, connectionRevision: connection.revision,
         }));
     }
@@ -114,7 +126,7 @@ export class ConnectionChatProvider implements vscode.LanguageModelChatProvider,
     } {
         const identity = decodeModelId(model.id);
         const connection = identity ? this.getConnection(identity[0]) : undefined;
-        if (this.disposed || !identity || !connection?.enabled
+        if (this.disposed || !identity || !connection?.enabled || identity[2] !== connection.routingRevision
             || model.version !== modelVersion(identity[1], connection.revision)) {
             throw vscode.LanguageModelError.NotFound('This connection changed or is unavailable. Select its model again.');
         }

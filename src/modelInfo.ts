@@ -125,7 +125,7 @@ function effortProperty(
 }
 
 function listedEfforts(reasoning: ModelReasoning): string[] | undefined {
-    const listed = reasoning.supported_efforts?.filter((e) => e.length > 0);
+    const listed = reasoning.supported_efforts?.filter((e) => e.length > 0 && !(reasoning.mandatory && e === 'none'));
     return listed && listed.length > 0 ? listed : undefined;
 }
 
@@ -142,6 +142,13 @@ function pickEffort(
     fallback: string
 ): string {
     return defaultEffort && efforts.includes(defaultEffort) ? defaultEffort : fallback;
+}
+
+function defaultReasoningEffort(reasoning: ModelReasoning, efforts: string[], fallback: string): string {
+    if (!reasoning.mandatory && reasoning.default_enabled === false && efforts.includes('none')) {
+        return 'none';
+    }
+    return pickEffort(efforts, reasoning.default_effort, fallback);
 }
 
 /**
@@ -161,13 +168,12 @@ export function buildReasoningSchema(
     const listed = listedEfforts(reasoning);
     if (listed) {
         const efforts = withOptionalNone(listed, reasoning.mandatory);
-        return effortProperty(efforts, pickEffort(efforts, reasoning.default_effort, efforts[0]));
+        return effortProperty(efforts, defaultReasoningEffort(reasoning, efforts, efforts[0]));
     }
     if (reasoning.supported_efforts === null) {
         const mandatory = reasoning.mandatory === true;
         const efforts = mandatory ? FULL_EFFORTS.filter((e) => e !== 'none') : FULL_EFFORTS;
-        const fallback = !mandatory && reasoning.default_enabled === false ? 'none' : 'medium';
-        return effortProperty(efforts, pickEffort(efforts, reasoning.default_effort, fallback));
+        return effortProperty(efforts, defaultReasoningEffort(reasoning, efforts, 'medium'));
     }
     if (reasoning.mandatory) {
         return undefined;
@@ -260,6 +266,9 @@ export function longContextTiers(m: ModelCatalogEntry): LongContextTier[] {
     const baseCompletion = parsePrice(m.pricing?.completion);
     const tiers: LongContextTier[] = [];
     for (const override of overrides) {
+        if (!override || Object.keys(override).some((key) => !contextOverrideKeys.has(key))) {
+            continue;
+        }
         const threshold = finitePositive(override.min_prompt_tokens);
         if (threshold === undefined) {
             continue;
@@ -506,20 +515,19 @@ function reasoningSummary(reasoning: ModelReasoning): string {
     if (listed) {
         return renderEffortList(
             withOptionalNone(listed, reasoning.mandatory),
-            reasoning.default_effort,
+            defaultReasoningEffort(reasoning, withOptionalNone(listed, reasoning.mandatory), listed[0]),
             reasoning.mandatory === true
         );
     }
     if (reasoning.supported_efforts === null) {
         const mandatory = reasoning.mandatory === true;
         const efforts = mandatory ? FULL_EFFORTS.filter((e) => e !== 'none') : FULL_EFFORTS;
-        const fallback = !mandatory && reasoning.default_enabled === false ? 'none' : 'medium';
-        return renderEffortList(efforts, reasoning.default_effort, mandatory, fallback);
+        return renderEffortList(efforts, defaultReasoningEffort(reasoning, efforts, 'medium'), mandatory);
     }
     if (reasoning.mandatory) {
         return t('required');
     }
-    if (reasoning.default_effort) {
+    if (reasoning.default_effort && reasoning.default_enabled !== false) {
         return `**${effortLabel(reasoning.default_effort)}**`;
     }
     const chosen = reasoning.default_enabled === false ? 'none' : 'enabled';

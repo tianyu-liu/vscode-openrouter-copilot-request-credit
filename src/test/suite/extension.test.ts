@@ -8,13 +8,13 @@ import {
     createPanelDeps,
     doRefresh,
     getStatusText,
-    panelHtmlComparable,
     pasteTemplateFromClipboard,
     readSessionTitleFromDisk,
     refresh,
+    sendPanelRefresh,
     stopRefreshTimerForTesting,
 } from "../../extension";
-import { handlePanelMessage, renderPanelHtml } from "../../panel";
+import { handlePanelMessage, renderPanel } from "../../panel";
 import { OUTPUT_RESERVE_PERCENT_MAX, OUTPUT_RESERVE_PERCENT_MIN } from "../../modelInfo";
 import { setSecretStorageForTesting } from "../../storage";
 
@@ -398,14 +398,21 @@ suite("pasteTemplateFromClipboard", () => {
     });
 });
 
-suite("panel html replacement", () => {
-    test("dedupe ignores the per-render nonce but not content changes", () => {
-        const a = panelHtmlComparable(renderPanelHtml({ limit: 1 }));
-        const b = panelHtmlComparable(renderPanelHtml({ limit: 1 }));
-        const c = panelHtmlComparable(renderPanelHtml({ limit: 2 }));
-        assert.strictEqual(a, b, "identical content compares equal despite fresh nonces");
-        assert.notStrictEqual(a, c, "a content change still compares different");
-        assert.ok(!panelHtmlComparable(renderPanelHtml({ limit: 1 })).includes("nonce-"), "nonces are normalized away");
+suite("panel refresh delivery", () => {
+    test("live updates retain the layout and send only changed content to the current document", async () => {
+        const initial = renderPanel({});
+        const refreshed = renderPanel({ fetchedAt: new Date("2026-09-22T01:30:05Z"), errorMessage: "Refresh failed" });
+        assert.notStrictEqual(initial.documentId, refreshed.documentId);
+        assert.strictEqual(initial.layout, refreshed.layout);
+        assert.notStrictEqual(initial.layout, renderPanel({ refreshIntervalMinutes: 10 }).layout);
+        const messages: unknown[] = [];
+        const webview = { postMessage: async (message: unknown) => { messages.push(message); return true; } };
+        await sendPanelRefresh(webview, initial.documentId, initial.live, initial.live);
+        await sendPanelRefresh(webview, initial.documentId, initial.live, refreshed.live);
+        assert.deepStrictEqual(messages, [{
+            type: "panelRefresh", documentId: initial.documentId,
+            content: { errorBanner: refreshed.live.errorBanner, creditUpdated: refreshed.live.creditUpdated },
+        }]);
     });
 });
 

@@ -4,11 +4,13 @@
 
 Each named connection owns its template. The selected panel tab chooses which template is edited;
 the model selected in Copilot chooses the connection used for a request. The router's public `rc:`
-model ID encodes connection and upstream IDs, while its version carries the connection revision.
+model ID encodes connection and upstream IDs plus the routing revision after a credential or
+endpoint change or an enabled-state transition. Its version carries the connection revision.
 The upstream API receives the original model ID. At request start the child clones the template,
 captures its credential and endpoint, and verifies its revision; a later panel edit cannot reroute
-an operation already sending requests. Retries retain the same captured endpoint/key/body and use
-`redirect: 'error'`.
+an operation already sending requests. Requests use `redirect: 'error'`. HTTP 429 can trigger
+a retry of the same inference POST with the captured endpoint, key and body. A transport failure
+or HTTP 5xx ends the attempt because OpenRouter may already have accepted the generation.
 
 - The pasted body's **`messages`/`prompt` fields are ignored** — Copilot supplies the live conversation and tools each turn; they are merged with the saved template.
 - The template applies to that connection's requests until cleared/replaced. With an empty template,
@@ -27,10 +29,10 @@ request carries `tools` (Copilot agent mode always sends tools), all prior turns
 preserves only what we emit, so the round-trip is symmetric: report `LanguageModelThinkingPart`
 from `delta.reasoning`, and collect prior thinking parts in `toOpenAI` into a `reasoning`
 string on the outgoing assistant message. As a display fallback, when `delta.reasoning` is
-absent, flatten `delta.reasoning_details` by type (`reasoning.*`/`summary`/`text`/`final` →
-thinking; `response.*` → text). Raw `reasoning_details` blocks (e.g. Claude's encrypted ones)
-cannot round-trip through Copilot's flattened ThinkingPart — string echo is the mechanism;
-never accumulate raw blocks for echo. P6 (`cache_control` for Claude) is applied:
+absent, flatten thinking from `delta.reasoning_details` by type (`reasoning.*`/`summary`/`text`/`final`).
+Distinct `response.*` answer text in the details is emitted even when a thinking delta is present
+or the host lacks thinking-part support. The extension currently echoes the thinking string and drops raw
+`reasoning_details` blocks, including encrypted ones. P6 (`cache_control` for Claude) is applied:
 anthropic-family models (`anthropic/*`, incl. `~anthropic/*`) get a top-level
 `cache_control: {type:"ephemeral"}` in `buildRequestBody` unless the template already sets
 its own `cache_control` (a template value wins, incl. an opt-out via `null`). It is a
@@ -46,6 +48,12 @@ These are not user-configurable; the escape hatch, where one exists, is the past
 The panel's short, context-specific notes are the user-facing version of this list.
 
 - `stream: true` on every request (the provider API is progress-callback based).
+- The stream must carry model output, a successful stop, or recognizable usage. A terminator
+  alone cannot complete an empty reply. Tool calls must carry a name, a unique ID and a complete
+  JSON object for their arguments. A batch needs `[DONE]` or an explicit successful finish reason.
+  Truncated or malformed parallel batches fail before any pending tool reaches Copilot.
+- Image captions and attachments retain their order. Images returned by tools are sent in user
+  messages after the consecutive tool results from that round.
 - On direct OpenRouter, `session_id` = `copilot-chat:<Copilot chat-session id>` so sticky routing and
 the Sessions view follow the Copilot chat session, not the window (cache warmth + grouping;
 no content). With no known parent (an internal/utility call before any chat turn, or one long after

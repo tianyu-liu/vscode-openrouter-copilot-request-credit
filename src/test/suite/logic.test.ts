@@ -126,6 +126,18 @@ suite("logic.buildStatus", () => {
         assert.strictEqual(buildStatus(info, 0, "daily", true, account, "usage").text, "$2.35");
     });
 
+    test("missing key usage leaves a local budget unknown", () => {
+        const info: KeyInfo = {
+            limit: null, limit_remaining: null, limit_reset: null,
+            usage: 40, usage_daily: NaN, usage_weekly: 18, usage_monthly: 20, is_free_tier: false,
+        };
+        assert.strictEqual(buildStatus(info, 15, "daily", true, undefined, "usage").text, "n/a");
+        assert.strictEqual(buildStatus(info, 15, "daily", true, undefined, "remaining").text, "n/a");
+        assert.strictEqual(buildDetail(info, 15, "daily", true).remaining, "n/a");
+        assert.strictEqual(buildStatus({ ...info, usage_daily: 0 }, 15, "daily", true, undefined, "remaining").text,
+            "$15.00");
+    });
+
     test("key has a configured limit -> shows remaining from limit_remaining", () => {
         const info: KeyInfo = {
             limit: 10,
@@ -1082,13 +1094,13 @@ suite("logic.used* helpers", () => {
         is_free_tier: false,
         ...overrides,
     });
-    test("string-typed usage values are coerced; missing/NaN counts as 0", () => {
+    test("string-typed usage values are coerced and missing OpenRouter usage stays unknown", () => {
         const info = mk({ usage_daily: "1.5" as unknown as number });
         assert.strictEqual(usedDaily(info, false), 1.5);
         const missing: KeyInfo = mk({ usage_weekly: undefined as unknown as number });
-        assert.strictEqual(usedWeekly(missing, true), 0);
+        assert.ok(Number.isNaN(usedWeekly(missing, true)));
         const nan: KeyInfo = mk({ usage_monthly: NaN });
-        assert.strictEqual(usedMonthly(nan, true), 0);
+        assert.ok(Number.isNaN(usedMonthly(nan, true)));
     });
     test("BYOK is only added when included", () => {
         const info = mk({ usage_daily: 1, byok_usage_daily: 0.5 });

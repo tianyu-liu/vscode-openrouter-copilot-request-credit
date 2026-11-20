@@ -2,7 +2,8 @@ import * as assert from "assert";
 import * as vscode from "vscode";
 import { runInNewContext } from "vm";
 import type { ConnectionDefinition } from "../../connections";
-import { handlePanelMessage, PanelDeps, PanelRenderOptions, renderPanelHtml, renderSessionCosts } from "../../panel";
+import { handlePanelMessage, PanelDeps, PanelRenderOptions, renderPanel, renderPanelHtml, renderSessionCosts } from "../../panel";
+import { resetTranslator, setTranslator } from "../../i18n";
 import { SessionCost, stripTemplateComments, UNATTRIBUTED_SESSION_ID } from "../../provider";
 import { KEY_SECRET } from "../../storage";
 import { KeyInfo } from "../../logic";
@@ -265,10 +266,13 @@ suite("renderPanelHtml", () => {
     });
 
     test("restores the active tab from VS Code webview state, falling back to the first tab", () => {
-        const html = render();
-        assert.match(html, /const initialTab = tabs\.find\(\(tab\) => tab\.id === draft\.activeTab\) \|\| tabs\[0\]/);
-        assert.match(html, /draft\.activeTab = tab\.id/);
-        assert.match(html, /vsc\.setState\(\{/);
+        const connections = [connectionFixture('a')];
+        const settings = webviewHarness({ connections });
+        settings.element('tab-connection-a').fire('click');
+        const reopened = webviewHarness({ connections }, settings.state);
+        assert.strictEqual(reopened.element('panel-connection').hidden, false);
+        const removed = webviewHarness({ connections: [] }, settings.state);
+        assert.strictEqual(removed.element('panel-settings').hidden, false);
     });
 
     test("ships a per-render nonce CSP and escapes the saved key summary", () => {
@@ -352,16 +356,22 @@ suite("renderPanelHtml", () => {
     });
 
     test("persists unsaved drafts through webview state, debounced, and restores them", () => {
-        const html = render();
-        for (const field of ["connectionDrafts", "sharedDraft", "templateBase", "presetBase", "reservePercent", "reserveMin", "reserveMax"]) {
-            assert.ok(html.includes(field), `${field} is persisted`);
-        }
-        assert.ok(!html.includes("draftKey"), "the unsaved key is never persisted into webview state");
-        assert.match(html, /setTimeout\(persistState, 250\)/, "draft persistence is debounced");
-        assert.ok(html.includes("templateEl.value = draft.template"), "the template draft is restored");
-        assert.ok(html.includes("restorePreset(draft.preset)"), "the preset draft is restored");
-        assert.ok(html.includes("el.value = draft[prop]"), "reserve drafts are restored");
-        assert.ok(html.includes("m.type === 'templateCleared'"), "the clear-template command clears the textarea draft");
+        const options = { presets: [{ slug: 'alpha', name: 'Alpha' }] };
+        const view = webviewHarness(options);
+        const template = '{"temperature":0.6}';
+        view.element('template').value = template;
+        view.element('template').fire('input');
+        assert.ok(!JSON.stringify(view.state).includes('temperature'));
+        view.element('outputReservePercent').value = '20';
+        view.element('outputReservePercent').fire('input');
+        view.flush();
+        assert.ok(JSON.stringify(view.state).includes('temperature'));
+        view.element('presetSelect').value = 'alpha';
+        view.element('presetSelect').fire('change');
+        const reopened = webviewHarness(options, view.state);
+        assert.strictEqual(reopened.element('template').value, template);
+        assert.strictEqual(reopened.element('presetSelect').value, 'alpha');
+        assert.strictEqual(reopened.element('outputReservePercent').value, '20');
     });
 
     test("the output-reserve row uses a well-formed class attribute", () => {
@@ -416,7 +426,7 @@ suite("renderPanelHtml", () => {
         assert.ok(html.includes(">Custom request</div>"), "custom request section present");
         assert.ok(html.includes('id="saveTemplate" class="primary" type="button">Save request</button>'), "Save request button present");
         assert.ok(!html.includes('id="clearTemplate"'), "Clear button removed");
-        const prefill = html.match(/templateEl\.value = (.*);/);
+        const prefill = html.match(/templateDisplay: (.*),/);
         assert.ok(prefill, "template textarea is populated via script");
         assert.ok(JSON.parse(prefill![1]).includes('"quantizations"'), "saved template JSON is pre-filled");
     });
@@ -472,7 +482,8 @@ suite("renderPanelHtml", () => {
             "saveConnection", "saveTemplate",
         ]);
         assert.deepStrictEqual(buttons.filter(match => match[2] === "secondary").map(match => match[1]), [
-            "addConnection", "clearKey", "cancelConnection", "deleteConnection", "resetOutputReserve", "refresh",
+            "addConnection", "clearKey", "cancelConnection", "repairModelGroup", "deleteConnection", "resetOutputReserve",
+            "refresh",
         ]);
         assert.ok(html.includes('<p class="helptext">VS Code stores your API key in SecretStorage.</p>'));
         assert.ok(html.includes('<p class="helptext">Refresh to load credit usage.</p>'));
@@ -770,6 +781,21 @@ suite("handlePanelMessage", () => {
         assert.deepStrictEqual(s.setKeys, []);
     });
 
+    test("clear confirmations use the active translation", async () => {
+        const s = spyDeps();
+        setTranslator(message => ({
+            "API key cleared.": "API キーをクリアしました。",
+            "Custom request cleared.": "カスタムリクエストをクリアしました。",
+        })[message] ?? message);
+        try {
+            await handlePanelMessage({ type: "clearKey" }, s.deps);
+            await handlePanelMessage({ type: "clearTemplate" }, s.deps);
+            assert.deepStrictEqual(s.infos, ["API キーをクリアしました。", "カスタムリクエストをクリアしました。"]);
+        } finally {
+            resetTranslator();
+        }
+    });
+
     test("saveTemplate passes the pasted JSON to the provider and confirms on success", async () => {
         const s = spyDeps();
         await handlePanelMessage({ type: "saveTemplate", value: '{"temperature":0.2}' }, s.deps);
@@ -948,7 +974,7 @@ suite("renderPanelHtml presets section", () => {
     test("prefills the textarea with the JSON first and the resolved preset config as comments after it", () => {
         const config = { model: "z-ai/glm-5.3-flash-20260826", provider: { order: ["baseten", "makora"] } };
         const html = render({ template: { preset: "faster-glm-flash" }, presets: PRESETS, presetConfig: config });
-        const prefill = html.match(/templateEl\.value = (.*);/);
+        const prefill = html.match(/templateDisplay: (.*),/);
         assert.ok(prefill, "template textarea is populated via script");
         const value = JSON.parse(prefill![1]) as string;
         const lines = value.split("\n");
@@ -966,10 +992,10 @@ suite("renderPanelHtml presets section", () => {
 
     test("no comment block without a preset reference or without a resolved config", () => {
         const plain = render({ template: { temperature: 0.2 }, presets: PRESETS, presetConfig: { model: "x" } });
-        const plainValue = JSON.parse(plain.match(/templateEl\.value = (.*);/)![1]) as string;
+        const plainValue = JSON.parse(plain.match(/templateDisplay: (.*),/)![1]) as string;
         assert.ok(!plainValue.includes("//"), "no comments when the template has no preset reference");
         const unresolved = render({ template: { preset: "faster-glm-flash" }, presets: PRESETS });
-        const unresolvedValue = JSON.parse(unresolved.match(/templateEl\.value = (.*);/)![1]) as string;
+        const unresolvedValue = JSON.parse(unresolved.match(/templateDisplay: (.*),/)![1]) as string;
         assert.ok(!unresolvedValue.includes("//"), "no comments when the preset config could not be resolved");
         assert.strictEqual(JSON.parse(unresolvedValue).preset, "faster-glm-flash");
     });
@@ -1004,7 +1030,10 @@ function connectionFixture(id: string, kind: ConnectionDefinition['kind'] = 'ope
 }
 
 /** Run the actual webview script with a small DOM seam; no extension host messages leave this harness. */
-function webviewHarness(options: Partial<PanelRenderOptions>, savedState: unknown = {}, allowProxyConnections = false) {
+function webviewHarness(
+    options: Partial<PanelRenderOptions>, savedState: unknown = {}, allowProxyConnections = false,
+    html = render(options, allowProxyConnections)
+) {
     class Element {
         value = '';
         type = '';
@@ -1020,7 +1049,13 @@ function webviewHarness(options: Partial<PanelRenderOptions>, savedState: unknow
         options: Element[] = [];
         listeners: Record<string, Array<(event: unknown) => void>> = {};
         textContent = '';
+        private markup = '';
         constructor(readonly id: string) {}
+        get innerHTML() { return this.markup; }
+        set innerHTML(value: string) {
+            this.markup = value;
+            readElements(value);
+        }
         addEventListener(type: string, fn: (event: unknown) => void) {
             (this.listeners[type] ??= []).push(fn);
         }
@@ -1032,40 +1067,51 @@ function webviewHarness(options: Partial<PanelRenderOptions>, savedState: unknow
         reportValidity() { return this.validationMessage === ''; }
         fire(type: string, event = {}) { for (const listener of this.listeners[type] ?? []) listener(event); }
     }
-    const html = render(options, allowProxyConnections);
+    const script = html.match(/<script nonce="([^"]+)">([\s\S]*?)<\/script>/)!;
     const elements = new Map<string, Element>();
     const decode = (text: string) => text.replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
-    for (const match of html.matchAll(/<\w+\b([^>]*?\sid="([^"]+)"[^>]*)>/g)) {
-        const element = new Element(match[2]);
-        for (const attr of match[1].matchAll(/([\w-]+)="([^"]*)"/g)) element.attributes[attr[1]] = decode(attr[2]);
-        element.value = element.attributes.value ?? '';
-        element.type = element.attributes.type ?? '';
-        element.placeholder = element.attributes.placeholder ?? '';
-        element.checked = /(?:^|\s)checked(?:\s|$)/.test(match[1]);
-        element.disabled = /(?:^|\s)disabled(?:\s|$)/.test(match[1]);
-        element.hidden = /(?:^|\s)hidden(?:\s|$)/.test(match[1]);
-        element.required = /(?:^|\s)required(?:\s|$)/.test(match[1]);
-        if (element.attributes['data-connection-id']) element.dataset.connectionId = element.attributes['data-connection-id'];
-        elements.set(element.id, element);
+    function readElements(markup: string) {
+        for (const match of markup.matchAll(/<\w+\b([^>]*?\sid="([^"]+)"[^>]*)>/g)) {
+            const element = new Element(match[2]);
+            for (const attr of match[1].matchAll(/([\w-]+)="([^"]*)"/g)) element.attributes[attr[1]] = decode(attr[2]);
+            element.value = element.attributes.value ?? '';
+            element.type = element.attributes.type ?? '';
+            element.placeholder = element.attributes.placeholder ?? '';
+            element.checked = /(?:^|\s)checked(?:\s|$)/.test(match[1]);
+            element.disabled = /(?:^|\s)disabled(?:\s|$)/.test(match[1]);
+            element.hidden = /(?:^|\s)hidden(?:\s|$)/.test(match[1]);
+            element.required = /(?:^|\s)required(?:\s|$)/.test(match[1]);
+            if (element.attributes['data-connection-id']) element.dataset.connectionId = element.attributes['data-connection-id'];
+            elements.set(element.id, element);
+        }
+        for (const match of markup.matchAll(/<select\b[^>]*id="([^"]+)"[^>]*>([\s\S]*?)<\/select>/g)) {
+            const select = elements.get(match[1])!;
+            select.options = [...match[2].matchAll(/<option\b([^>]*)>/g)].map((option) => {
+                const item = new Element('');
+                item.value = decode(option[1].match(/value="([^"]*)"/)?.[1] ?? '');
+                item.checked = /\bselected\b/.test(option[1]);
+                return item;
+            });
+            select.value = (select.options.find(option => option.checked) ?? select.options[0])?.value ?? '';
+        }
     }
+    readElements(html);
     const tabs = [...elements.values()].filter(element => element.attributes.role === 'tab');
-    for (const match of html.matchAll(/<select\b[^>]*id="([^"]+)"[^>]*>([\s\S]*?)<\/select>/g)) {
-        const options = [...match[2].matchAll(/<option\b([^>]*)>/g)];
-        const selected = options.find(option => /\bselected\b/.test(option[1])) ?? options[0];
-        if (selected) elements.get(match[1])!.value = decode(selected[1].match(/value="([^"]*)"/)?.[1] ?? '');
-    }
     const messages: Array<Record<string, unknown>> = [];
     const timers = new Map<number, () => void>();
     const incomingListeners: Array<(event: unknown) => void> = [];
     let state = savedState;
     let timerId = 0;
-    runInNewContext(html.match(/<script nonce="[^"]+">([\s\S]*?)<\/script>/)![1], {
+    runInNewContext(script[2], {
         acquireVsCodeApi: () => ({
             getState: () => state,
             setState: (value: unknown) => { state = JSON.parse(JSON.stringify(value)); },
-            postMessage: (value: Record<string, unknown>) => messages.push(JSON.parse(JSON.stringify(value))),
+            postMessage: (value: Record<string, unknown>) => {
+                if (value.type !== 'panelReady') messages.push(JSON.parse(JSON.stringify(value)));
+            },
         }),
         document: {
+            currentScript: { nonce: script[1] },
             getElementById: (id: string) => elements.get(id),
             querySelectorAll: () => tabs,
             createElement: () => new Element(''),
@@ -1078,6 +1124,8 @@ function webviewHarness(options: Partial<PanelRenderOptions>, savedState: unknow
     });
     return {
         get state() { return state; },
+        documentId: script[1],
+        html,
         messages,
         receive: (data: unknown) => { for (const listener of incomingListeners) listener({ data }); },
         element: (id: string) => elements.get(id)!,
@@ -1158,15 +1206,42 @@ suite('connection panel', () => {
         })));
     });
 
-    test('per-connection messages retain their rendered origin after selecting another tab', () => {
+    test('navigation pauses connection mutations while shared settings remain usable', () => {
         const view = webviewHarness({ connections, selectedConnectionId: 'a' });
         view.element('tab-connection-b').fire('click');
         view.element('saveTemplate').fire('click');
         view.element('outputReservePercent').fire('change');
         assert.deepStrictEqual(view.messages[0], { type: 'selectConnection', connectionId: 'b' });
-        assert.deepStrictEqual(view.messages[1], { type: 'saveTemplate', value: '', connectionId: 'a' });
-        assert.strictEqual(view.messages[2].type, 'saveOutputReservePercent');
-        assert.ok(!('connectionId' in view.messages[2]), 'shared setting does not carry a connection scope');
+        assert.deepStrictEqual(view.messages.slice(1), [{ type: 'saveOutputReservePercent', value: '12.5' }]);
+    });
+
+    test('rapid tab changes render the latest requested connection', () => {
+        const first = webviewHarness({ connections, selectedConnectionId: 'a' });
+        first.element('tab-connection-b').fire('click');
+        first.element('tab-connection-a').fire('click');
+        assert.deepStrictEqual(first.messages, [{ type: 'selectConnection', connectionId: 'b' }]);
+        assert.strictEqual(first.element('connectionLoading').hidden, false);
+
+        const intermediate = webviewHarness({ connections, selectedConnectionId: 'b' }, first.state);
+        assert.deepStrictEqual(intermediate.messages, [{ type: 'selectConnection', connectionId: 'a' }]);
+        assert.strictEqual(intermediate.element('panel-connection').hidden, true);
+        assert.strictEqual(intermediate.element('connectionLoading').hidden, false);
+
+        const final = webviewHarness({ connections, selectedConnectionId: 'a' }, intermediate.state);
+        assert.deepStrictEqual(final.messages, []);
+        assert.strictEqual(final.element('panel-connection').hidden, false);
+        assert.strictEqual(final.element('connectionLoading').hidden, true);
+        assert.strictEqual(final.element('panel-connection').attributes['aria-labelledby'], 'tab-connection-a');
+    });
+
+    test('a failed selection restores the current connection editor', () => {
+        const view = webviewHarness({ connections, selectedConnectionId: 'a' });
+        view.element('connectionSelect').value = 'b';
+        view.element('connectionSelect').fire('change');
+        view.receive({ type: 'connectionSelectionFailed', connectionId: 'b' });
+        assert.strictEqual(view.element('connectionSelect').value, 'a');
+        assert.strictEqual(view.element('connectionForm').hidden, false);
+        assert.strictEqual(view.element('connectionLoading').hidden, true);
     });
 
     test('resetting output reserve discards all reserve drafts and removes the shared overrides', async () => {
@@ -1210,6 +1285,137 @@ suite('connection panel', () => {
         assert.strictEqual(restored.element('template').value, '{"temperature":0.8}');
         const updated = webviewHarness({ connections, selectedConnectionId: 'a', template: { temperature: 0.3 } }, b.state);
         assert.ok(updated.element('template').value.includes('0.3'), 'new saved template replaces a stale draft');
+    });
+
+    test('live usage updates preserve the active editor and its transient key', () => {
+        const options = { connections, selectedConnectionId: 'a', template: { temperature: 0.2 } };
+        const view = webviewHarness(options);
+        const before = renderPanel(options);
+        const after = renderPanel({
+            ...options, info: BASE_INFO, fetchedAt: new Date('2026-09-22T01:30:05Z'), sessions: [sessionFixture()],
+        });
+        assert.strictEqual(after.layout, before.layout);
+        view.element('addConnection').fire('click');
+        view.element('connectionName').value = 'New model group';
+        view.element('connectionName').fire('input');
+        view.element('key').value = 'transient-credential';
+        view.element('template').value = '{"temperature":0.6}';
+        view.element('template').fire('input');
+        const refresh = { type: 'panelRefresh', content: after.live };
+        view.receive({ ...refresh, documentId: 'stale-document' });
+        assert.strictEqual(view.element('creditUpdated').innerHTML, '');
+        view.receive({ ...refresh, documentId: view.documentId });
+        assert.match(view.element('creditUpdated').innerHTML, /Updated/);
+        assert.match(view.element('sessionSpend').innerHTML, /2 calls/);
+        assert.strictEqual(view.element('connectionName').value, 'New model group');
+        assert.strictEqual(view.element('newConnectionHint').hidden, false);
+        assert.strictEqual(view.element('key').value, 'transient-credential');
+        assert.strictEqual(view.element('template').value, '{"temperature":0.6}');
+        assert.ok(!JSON.stringify(view.state).includes('transient-credential'));
+        view.element('refresh').fire('click');
+        assert.deepStrictEqual(view.messages.at(-1), { type: 'refresh', connectionId: 'a' });
+
+        const remounted = webviewHarness(options, view.state);
+        assert.strictEqual(remounted.element('connectionName').value, 'New model group');
+        assert.strictEqual(remounted.element('newConnectionHint').hidden, false);
+        assert.strictEqual(remounted.element('key').value, '');
+    });
+
+    test('preset comments preserve draft JSON and a replaced request invalidates the old draft', () => {
+        const presets = [{ slug: 'alpha', name: 'Alpha' }, { slug: 'beta', name: 'Beta' }];
+        const options = { connections, selectedConnectionId: 'a', template: { preset: 'alpha' }, presets };
+        const view = webviewHarness(options);
+        view.element('template').value = '{"preset":"alpha","temperature":0.6}';
+        view.element('template').fire('input');
+        const alphaWithConfig = renderPanel({ ...options, presetConfig: { model: 'provider/model' } });
+        const refresh = (content: typeof alphaWithConfig.live) =>
+            view.receive({ type: 'panelRefresh', documentId: view.documentId, content });
+        refresh(alphaWithConfig.live);
+        assert.strictEqual(view.element('template').value, '{"preset":"alpha","temperature":0.6}');
+        view.element('presetSelect').value = 'beta';
+        view.element('presetSelect').fire('change');
+        view.receive({
+            type: 'presetSelectionResult', connectionId: 'a',
+            presetMutationId: view.messages.at(-1)?.presetMutationId, value: 'beta',
+        });
+        refresh(renderPanel({ ...options, template: { preset: 'beta' } }).live);
+        assert.deepStrictEqual(JSON.parse(view.element('template').value), { preset: 'beta' });
+        view.element('presetSelect').value = 'alpha';
+        view.element('presetSelect').fire('change');
+        view.receive({
+            type: 'presetSelectionResult', connectionId: 'a',
+            presetMutationId: view.messages.at(-1)?.presetMutationId, value: 'alpha',
+        });
+        refresh(alphaWithConfig.live);
+        assert.deepStrictEqual(JSON.parse(stripTemplateComments(view.element('template').value)), { preset: 'alpha' });
+        assert.match(view.element('template').value, /provider\/model/);
+        assert.ok(!JSON.stringify(view.state).includes('temperature'));
+    });
+
+    test('request drafts from earlier versions retain their generated preset-comment baseline', () => {
+        const template = { preset: 'alpha' };
+        const base = JSON.stringify(template, null, 2);
+        const typed = '{"preset":"alpha","temperature":0.4}';
+        const state = { connectionDrafts: { a: {
+            template: typed, templateBase: base + '\n// {\n//   "model": "original/model"\n// }',
+        } } };
+        const view = webviewHarness({
+            connections, selectedConnectionId: 'a', template, presetConfig: { model: 'changed/model' },
+        }, state);
+        assert.strictEqual(view.element('template').value, typed);
+        assert.ok(!JSON.stringify(view.state).includes('original/model'));
+    });
+
+    test('a successful preset selection invalidates drafts even when an intermediate render was skipped', async () => {
+        const options = {
+            connections, selectedConnectionId: 'a', template: { preset: 'alpha' },
+            presets: [{ slug: 'alpha', name: 'Alpha' }, { slug: 'beta', name: 'Beta' }],
+        };
+        const view = webviewHarness(options);
+        view.element('template').value = '{"preset":"alpha","temperature":0.4}';
+        view.element('template').fire('input');
+        const select = (slug: string) => {
+            view.element('presetSelect').value = slug;
+            view.element('presetSelect').fire('change');
+            return view.messages.at(-1)! as unknown as Parameters<typeof handlePanelMessage>[0];
+        };
+        const respond = async (message: Parameters<typeof handlePanelMessage>[0], fail = false) => {
+            const s = spyDeps();
+            s.deps.finishPresetSelection = (presetMutationId, value) => view.receive({
+                type: 'presetSelectionResult', connectionId: 'a', presetMutationId, value,
+            });
+            if (fail) s.deps.saveTemplate = async () => ({ ok: false });
+            await handlePanelMessage(message, s.deps);
+        };
+
+        const beta = select('beta');
+        assert.strictEqual(view.element('presetSelect').disabled, true);
+        select('alpha');
+        assert.strictEqual(view.messages.length, 1);
+        await respond(beta);
+        assert.deepStrictEqual(JSON.parse(view.element('template').value), { preset: 'beta' });
+        const failed = select('alpha');
+        await respond(failed, true);
+        assert.strictEqual(view.element('presetSelect').value, 'beta');
+        const alpha = select('alpha');
+        await respond(alpha);
+        assert.deepStrictEqual(JSON.parse(view.element('template').value), { preset: 'alpha' });
+        assert.ok(!JSON.stringify(view.state).includes('temperature'));
+
+        const pending = select('beta');
+        const fresh = '{"preset":"beta","temperature":0.8}';
+        view.element('template').value = fresh;
+        view.element('template').fire('input');
+        await respond(alpha);
+        view.receive({
+            type: 'presetSelectionResult', connectionId: 'b', presetMutationId: pending.presetMutationId, value: 'alpha',
+        });
+        await respond(pending);
+        assert.strictEqual(view.element('template').value, fresh);
+        const latest = renderPanel({ ...options, template: { preset: 'beta' } }).live;
+        const reopened = webviewHarness(options, view.state, false, view.html);
+        reopened.receive({ type: 'panelRefresh', documentId: reopened.documentId, content: latest });
+        assert.strictEqual(reopened.element('template').value, fresh);
     });
 
     test('incoming clear and preset events cannot change another connection’s request draft', () => {
@@ -1327,12 +1533,38 @@ suite('connection panel', () => {
         assert.strictEqual(view.messages.at(-1)!.type, 'updateConnection');
     });
 
-    test('Settings connection selector stays in Settings and identifies the connection being edited', () => {
-        const view = webviewHarness({ connections, selectedConnectionId: 'a' });
+    test('Settings selector hides the previous editor until the selected connection mounts', () => {
+        const view = webviewHarness({ connections, selectedConnectionId: 'a', maskedKey: 'a-mask' });
+        view.element('key').value = 'unsubmitted';
         view.element('connectionSelect').value = 'b';
         view.element('connectionSelect').fire('change');
-        assert.deepStrictEqual(view.messages.at(-1), { type: 'selectConnection', connectionId: 'b', value: 'settings' });
-        assert.strictEqual((view.state as { activeTab: string }).activeTab, 'tab-settings');
+        assert.strictEqual(view.element('key').value, '');
+        assert.strictEqual(view.element('connectionForm').hidden, true);
+        assert.strictEqual(view.element('addConnection').disabled, true);
+        assert.strictEqual(view.element('connectionLoading').hidden, false);
+        view.element('connectionForm').fire('submit', { preventDefault() {} });
+        view.element('clearKey').fire('click');
+        view.element('repairModelGroup').fire('click');
+        view.element('deleteConnection').fire('click');
+        assert.deepStrictEqual(view.messages, [{ type: 'selectConnection', connectionId: 'b' }]);
+        const selected = webviewHarness({ connections, selectedConnectionId: 'b' }, view.state);
+        assert.strictEqual(selected.element('panel-settings').hidden, false);
+        assert.strictEqual(selected.element('connectionForm').hidden, false);
+        assert.strictEqual(selected.element('connectionLoading').hidden, true);
+        selected.element('connectionForm').fire('submit', { preventDefault() {} });
+        assert.strictEqual(selected.messages.at(-1)?.connectionId, 'b');
+    });
+
+    test('model group repair targets only the saved connection', () => {
+        const view = webviewHarness({ connections, selectedConnectionId: 'b' });
+        view.element('repairModelGroup').fire('click');
+        assert.strictEqual(view.messages.at(-1)?.type, 'repairModelGroup');
+        assert.strictEqual(view.messages.at(-1)?.connectionId, 'b');
+        view.element('addConnection').fire('click');
+        assert.strictEqual(view.element('repairModelGroup').disabled, true);
+        const messageCount = view.messages.length;
+        view.element('repairModelGroup').fire('click');
+        assert.strictEqual(view.messages.length, messageCount);
     });
 
     test('one form submission saves connection details, enabled state and a new key together', () => {
@@ -1582,25 +1814,28 @@ suite('connection panel', () => {
         const actions: unknown[] = [];
         state.deps.addConnection = async input => { actions.push(['add', input]); };
         state.deps.updateConnection = async (id, patch) => { actions.push(['update', id, patch]); };
+        state.deps.repairModelGroup = async id => { actions.push(['repair', id]); };
         state.deps.deleteConnection = async id => { actions.push(['delete', id]); };
         state.deps.selectConnection = async id => { actions.push(['select', id]); };
         await handlePanelMessage({ type: 'addConnection', value: { name: ' Local ', kind: 'gateway',
             baseUrl: 'http://localhost:1234/v1' } }, state.deps, true);
         await handlePanelMessage({ type: 'setConnectionEnabled', connectionId: 'a', value: false }, state.deps);
         await handlePanelMessage({ type: 'saveManualModels', connectionId: 'b', value: '[{"id":"m","contextLength":32768,"toolCalling":true}]' }, state.deps, true);
+        await handlePanelMessage({ type: 'repairModelGroup', connectionId: 'b' }, state.deps);
+        await handlePanelMessage({ type: 'repairModelGroup' }, state.deps);
         await handlePanelMessage({ type: 'deleteConnection', connectionId: 'a' }, state.deps);
         await handlePanelMessage({ type: 'selectConnection', connectionId: 'b' }, state.deps);
         assert.deepStrictEqual(actions, [
             ['add', { name: 'Local', kind: 'gateway', baseUrl: 'http://localhost:1234/v1' }],
             ['update', 'a', { enabled: false }],
             ['update', 'b', { models: [{ id: 'm', contextLength: 32768, toolCalling: true }] }],
-            ['delete', 'a'], ['select', 'b'],
+            ['repair', 'b'], ['delete', 'a'], ['select', 'b'],
         ]);
         for (const value of ['{}', '[{"id":"m"},{"id":"m"}]', '[{"id":"m","contextLength":-1}]', '[{"id":"m","toolCalling":"yes"}]']) {
             await handlePanelMessage({ type: 'saveManualModels', connectionId: 'b', value }, state.deps, true);
         }
         await handlePanelMessage({ type: 'addConnection', value: { name: 'bad', kind: 'gateway', baseUrl: 'https://user:pass@example.com/v1' } }, state.deps, true);
-        assert.strictEqual(actions.length, 5, 'invalid input never reaches persistence');
+        assert.strictEqual(actions.length, 6, 'invalid input never reaches persistence');
         assert.strictEqual(state.errors.length, 5);
     });
 

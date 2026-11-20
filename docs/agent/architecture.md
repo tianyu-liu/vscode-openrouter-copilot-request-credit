@@ -24,14 +24,17 @@ and [font generator](../../scripts/build-status-icons.py).
   for new ones), independent of names. Definitions include kind, normalized base URL, enabled state,
   revision, connection settings, and legacy manual models. Names are
   nonempty and unique ignoring case; snapshots are cloned. Definitions and credential commits advance revisions and emit changes;
-  scoped state updates do neither. Mutations use a serial queue that remains usable after rejection.
+  scoped state updates do neither. A per-host queue and a cross-process SQLite writer lock serialize
+  mutations. Reads check the committed registry revision before routing. A timer picks up changes
+  for an idle window's UI.
 - [connectionProvider.ts](../../src/connectionProvider.ts) — the registered router resolves discovery
   only from the native group's `configuration.connectionId`. It maintains one child provider per current
   connection revision, rejects disabled/deleted/stale model handles, and wraps upstream IDs with stable
   connection identity. See [provider.md](provider.md).
-- [nativeGroups.ts](../../src/nativeGroups.ts) — the initial default group uses
-  `lm.addLanguageModelsProviderGroup`. An existing same-name group requires explicit reconciliation when
-  the user opens management. Explicit panel add/rename/remove actions open the **active UI client's**
+- [nativeGroups.ts](../../src/nativeGroups.ts) — the first management action creates or adopts the initial
+  default group using comment-preserving JSONC edits. **Repair model group** restores an existing
+  connection's group after it is renamed or removed in VS Code. These actions and explicit panel
+  add/rename/remove open the **active UI client's**
   `chatLanguageModels.json` using `workbench.action.openLanguageModelsJson`; remote extension-host paths
   are never guessed. JSONC edits retain unrelated entries, comments, native model preferences, and
   connection IDs. Dirty documents, duplicate properties/groups, concurrent document changes, failed
@@ -49,7 +52,8 @@ and [font generator](../../scripts/build-status-icons.py).
   Nonsecret connection edits survive key-clear refreshes when saved metadata is unchanged; Cancel or
   a changed saved definition discards those drafts.
   Settings also holds the shared refresh interval, status-bar budget display mode, prompt safeguard, and output reserve.
-  A named OpenRouter tab shows key credit details, the status-bar visibility option, the model availability filter,
+  Live credit, preset and spend updates patch the mounted webview. Switching connections disables the
+  outgoing form until the selected connection is ready. A named OpenRouter tab shows key credit details, the status-bar visibility option, the model availability filter,
   session spend, presets, and custom request JSON. Output reserve uses a target percentage and
   lower/upper limits in decimal K (1 K = 1000 tokens). Per-model context-size choices remain in the
   model picker. Drafts and asynchronous panel messages are scoped by connection ID; stale renders are
@@ -68,8 +72,16 @@ and [font generator](../../scripts/build-status-icons.py).
 
 ## Storage and migration
 
+[profileStorage.ts](../../src/profileStorage.ts) keeps registry metadata and scoped state in
+`connections.sqlite` under a profile namespace in the extension's global storage directory.
+VS Code can return the same global storage directory for multiple named profiles. On first use,
+the extension probes the Command Palette's active profile and derives a directory name from the
+machine and profile IDs. It retains that name in the profile's machine-local Memento. If the host
+lacks these commands, it stores a generated directory name in the Memento instead.
+The companion lock database serializes multi-stage updates across extension hosts. SQLite releases
+the writer lock when a host exits. Existing Memento records are imported before cleanup.
 Each connection owns state under `connections.<id>.*`, including `requestTemplate`, `contextCaps`,
-`sessionCosts`, and `parentSession`. Rename leaves these keys intact. Deleted connection wrappers reject
+`sessionCosts`, and the workspace-keyed `parentSessions`. Rename leaves these keys intact. Deleted connection wrappers reject
 writes and credential reads; state snapshots become empty so stale callbacks cannot revive removed data.
 
 Credentials live only in SecretStorage. A rotation records a unique staging slot before storing the key,

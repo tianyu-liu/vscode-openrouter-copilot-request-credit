@@ -2,6 +2,7 @@ import { randomUUID } from 'crypto';
 import * as vscode from 'vscode';
 import { KEY_SECRET } from './storage';
 import { assertConnectionCredential } from './connectionCredentials';
+import { ProfileStorage } from './profileStorage';
 
 export type ConnectionKind = 'openrouter' | 'gateway' | 'openai-compatible';
 export interface ConnectionSettings {
@@ -26,6 +27,7 @@ export interface ConnectionDefinition {
     baseUrl: string;
     enabled: boolean;
     revision: number;
+    routingRevision?: number;
     settings: ConnectionSettings;
     models?: ManualModel[];
 }
@@ -38,6 +40,10 @@ export interface ConnectionInput {
     models?: ManualModel[];
 }
 export type ConnectionPatch = Partial<ConnectionInput>;
+export interface AtomicConnectionState extends vscode.Memento {
+    mutate<T>(key: string, transform: (current: T | undefined) => T | undefined): Promise<T | undefined>;
+    exclusive<T>(operation: (state: Pick<vscode.Memento, 'get' | 'update'>) => Promise<T>): Promise<T>;
+}
 
 export const LEGACY_CONNECTION_ID = 'default-openrouter';
 export const DEFAULT_CONNECTION_NAME = 'OpenRouter: RC';
@@ -159,16 +165,23 @@ export class ConnectionRegistry implements vscode.Disposable {
     private data: RegistryData | undefined;
     private ready = false;
     private disposed = false;
+    private readonly lifetime = new AbortController();
     private queue: Promise<unknown> = Promise.resolve();
+    private readonly profile?: ProfileStorage;
+    private profileRevision = 0;
+    private observer?: ReturnType<typeof setInterval>;
     private readonly changed = new vscode.EventEmitter<void>();
     readonly onDidChange = this.changed.event;
 
-    constructor(private readonly state: vscode.Memento, private readonly secrets: vscode.SecretStorage) { }
+    constructor(private readonly state: vscode.Memento, private readonly secrets: vscode.SecretStorage,
+        directory?: string, coordinationDirectory?: string) {
+        if (directory !== undefined) this.profile = new ProfileStorage(directory, coordinationDirectory);
+    }
 
     private enqueue<T>(operation: () => Promise<T>): Promise<T> {
         const result = this.queue.then(() => {
             if (this.disposed) throw new Error('Connection registry is disposed.');
-            return operation();
+            return this.profile ? this.profile.exclusive(operation, this.lifetime.signal) : operation();
         });
         this.queue = result.catch(() => undefined);
         return result;
@@ -176,15 +189,36 @@ export class ConnectionRegistry implements vscode.Disposable {
 
     private require(id?: string): RegistryData {
         if (!this.ready || !this.data) throw new Error('Connection registry is not initialized.');
+        this.refreshProfile();
         if (id !== undefined && !this.data.connections.some(item => item.id === id)) {
             throw new Error('Connection no longer exists.');
         }
         return this.data;
     }
 
+    private refreshProfile(): void {
+        if (!this.profile || this.disposed || !this.ready) return;
+        const current = this.profile.getChanged<RegistryData>(REGISTRY_KEY, this.profileRevision);
+        if (!current) return;
+        const previous = this.data!;
+        this.data = current.value;
+        this.profileRevision = current.revision;
+        if (JSON.stringify(previous.connections) !== JSON.stringify(current.value.connections)) this.changed.fire();
+    }
+
     private async persist(next: RegistryData): Promise<void> {
-        await this.state.update(REGISTRY_KEY, clone(next));
+        if (this.profile) this.profileRevision = this.profile.update(REGISTRY_KEY, next);
+        else await this.state.update(REGISTRY_KEY, clone(next));
         this.data = next;
+    }
+
+    private scopedGet<T>(key: string): T | undefined {
+        return this.profile ? this.profile.get<T>(key) : this.state.get<T>(key);
+    }
+
+    private async scopedUpdate(key: string, value: unknown): Promise<void> {
+        if (this.profile) this.profile.update(key, value);
+        else await this.state.update(key, value);
     }
 
     private async strictSecret(key: string): Promise<string | undefined> {
@@ -203,15 +237,15 @@ export class ConnectionRegistry implements vscode.Disposable {
     }
 
     private async cleanup(): Promise<void> {
-        const current = this.data!;
+        const current = this.ready ? this.require() : this.data!;
         if (current.legacyCleanup) {
             for (const key of [KEY_SECRET, LEGACY_SECRET]) await this.secrets.delete(key);
             for (const key of LEGACY_STATE_KEYS) await this.state.update(key, undefined);
         }
         for (const slot of current.garbageSecrets) await this.secrets.delete(slot);
         for (const id of current.garbageConnections) {
-            for (const key of this.state.keys().filter(key => key.startsWith(prefix(id)))) {
-                await this.state.update(key, undefined);
+            for (const key of (this.profile ?? this.state).keys().filter(key => key.startsWith(prefix(id)))) {
+                await this.scopedUpdate(key, undefined);
             }
         }
         if (current.legacyCleanup || current.garbageSecrets.length || current.garbageConnections.length) {
@@ -222,7 +256,8 @@ export class ConnectionRegistry implements vscode.Disposable {
     initialize(legacySettings?: Partial<ConnectionSettings>): Promise<void> {
         return this.enqueue(async () => {
             if (this.ready) { await this.cleanup(); return; }
-            const saved = this.state.get<RegistryData>(REGISTRY_KEY);
+            this.profile?.importMemento(this.state, REGISTRY_KEY);
+            const saved = this.scopedGet<RegistryData>(REGISTRY_KEY);
             if (saved !== undefined) {
                 if (saved.version !== 1 || !Array.isArray(saved.connections)
                     || !saved.credentials || !Array.isArray(saved.garbageSecrets)
@@ -233,7 +268,9 @@ export class ConnectionRegistry implements vscode.Disposable {
                 const names = new Set<string>();
                 for (const item of saved.connections) {
                     if (!item || typeof item.id !== 'string' || !/^[a-zA-Z0-9-]+$/.test(item.id)
-                        || ids.has(item.id) || !Number.isSafeInteger(item.revision) || item.revision < 1) {
+                        || ids.has(item.id) || !Number.isSafeInteger(item.revision) || item.revision < 1
+                        || (item.routingRevision !== undefined && (!Number.isSafeInteger(item.routingRevision)
+                            || item.routingRevision < 1 || item.routingRevision > item.revision))) {
                         throw new Error('Invalid saved connection.');
                     }
                     definition(item, item.id, item.revision);
@@ -252,23 +289,35 @@ export class ConnectionRegistry implements vscode.Disposable {
                     throw new Error('Invalid saved connection cleanup data.');
                 }
                 this.data = clone(saved);
+                if (this.profile) this.profileRevision = this.profile.getChanged(REGISTRY_KEY, 0)!.revision;
             } else {
-                const primary = await this.strictSecret(KEY_SECRET);
-                const credential = primary ?? await this.strictSecret(LEGACY_SECRET);
+                const staged = this.profile?.get<string>('migrationSecretSlot');
+                const stagedKey = staged ? await this.strictSecret(staged) : undefined;
+                const credential = stagedKey ?? await this.strictSecret(KEY_SECRET) ?? await this.strictSecret(LEGACY_SECRET);
                 const initial = definition({ name: DEFAULT_CONNECTION_NAME, kind: 'openrouter', settings: legacySettings },
                     LEGACY_CONNECTION_ID, 1);
-                const slot = `connection.${LEGACY_CONNECTION_ID}.key.migration`;
+                const slot = staged ?? (this.profile ? secretSlot(initial.id) : `connection.${initial.id}.key.migration`);
                 for (const key of LEGACY_STATE_KEYS) {
-                    await this.state.update(prefix(initial.id) + key, clone(this.state.get(key)));
+                    await this.scopedUpdate(prefix(initial.id) + key, clone(this.state.get(key)));
                 }
-                if (credential !== undefined) await this.secrets.store(slot, credential);
+                if (credential !== undefined && stagedKey === undefined) {
+                    if (this.profile && !staged) this.profile.update('migrationSecretSlot', slot);
+                    await this.secrets.store(slot, credential);
+                }
                 await this.persist({
                     version: 1, connections: [initial], credentials: credential === undefined ? {} : { [initial.id]: slot },
-                    legacyCleanup: true, garbageSecrets: [], garbageConnections: [],
+                    legacyCleanup: true, garbageSecrets: credential === undefined && staged ? [staged] : [],
+                    garbageConnections: [],
                 });
             }
             await this.cleanup();
+            await this.profile?.finishImport(this.state, REGISTRY_KEY);
+            this.profile?.update('migrationSecretSlot', undefined);
             this.ready = true;
+            if (this.profile && !this.disposed) {
+                this.observer = setInterval(() => this.refreshProfile(), 1000);
+                this.observer.unref();
+            }
         });
     }
 
@@ -351,6 +400,12 @@ export class ConnectionRegistry implements vscode.Disposable {
                 models: snapshot.models === undefined ? inheritedModels : snapshot.models,
                 settings: { ...previous.settings, ...snapshot.settings },
             }, id, previous.revision + 1);
+            if (apiKey !== undefined || next.enabled !== previous.enabled || kind !== previous.kind
+                || next.baseUrl !== previous.baseUrl) {
+                next.routingRevision = next.revision;
+            } else if (previous.routingRevision !== undefined) {
+                next.routingRevision = previous.routingRevision;
+            }
             if (next.baseUrl !== previous.baseUrl && current.credentials[id] && apiKey === undefined) {
                 throw new Error('Clear or replace the connection credential when changing its endpoint.');
             }
@@ -411,7 +466,8 @@ export class ConnectionRegistry implements vscode.Disposable {
             const oldSlot = staged.credentials[id];
             await this.persist({
                 ...staged, credentials: { ...staged.credentials, [id]: slot },
-                connections: staged.connections.map(item => item.id === id ? { ...item, revision: item.revision + 1 } : item),
+                connections: staged.connections.map(item => item.id === id
+                    ? { ...item, revision: item.revision + 1, routingRevision: item.revision + 1 } : item),
                 garbageSecrets: [...staged.garbageSecrets.filter(item => item !== slot), ...(oldSlot ? [oldSlot] : [])],
             });
             this.changed.fire();
@@ -427,7 +483,8 @@ export class ConnectionRegistry implements vscode.Disposable {
             delete credentials[id];
             await this.persist({
                 ...current, credentials,
-                connections: current.connections.map(item => item.id === id ? { ...item, revision: item.revision + 1 } : item),
+                connections: current.connections.map(item => item.id === id
+                    ? { ...item, revision: item.revision + 1, routingRevision: item.revision + 1 } : item),
                 garbageSecrets: [...current.garbageSecrets, ...(slot ? [slot] : [])],
             });
             this.changed.fire();
@@ -435,21 +492,37 @@ export class ConnectionRegistry implements vscode.Disposable {
         });
     }
 
-    stateFor(id: string): vscode.Memento {
+    stateFor(id: string): AtomicConnectionState {
         this.require(id);
-        const active = () => this.ready && !this.disposed && this.data!.connections.some(item => item.id === id);
+        const active = () => this.ready && !this.disposed && this.require().connections.some(item => item.id === id);
         return {
-            keys: () => active() ? this.state.keys().filter(key => key.startsWith(prefix(id)))
+            keys: () => active() ? (this.profile ?? this.state).keys().filter(key => key.startsWith(prefix(id)))
                 .map(key => key.slice(prefix(id).length)) : [],
             get: (<T>(key: string, fallback?: T): T | undefined => active()
-                ? clone(this.state.get<T>(prefix(id) + key) ?? fallback) : fallback) as vscode.Memento['get'],
+                ? clone(this.scopedGet<T>(prefix(id) + key) ?? fallback) : fallback) as vscode.Memento['get'],
             update: (key: string, value: unknown) => {
                 const snapshot = clone(value);
                 return this.enqueue(async () => {
                     this.require(id);
-                    await this.state.update(prefix(id) + key, snapshot);
+                    await this.scopedUpdate(prefix(id) + key, snapshot);
                 });
             },
+            mutate: <T>(key: string, transform: (current: T | undefined) => T | undefined) =>
+                this.enqueue(async () => {
+                    this.require(id);
+                    const fullKey = prefix(id) + key;
+                    const next = transform(clone(this.scopedGet<T>(fullKey)));
+                    await this.scopedUpdate(fullKey, next);
+                    return clone(next);
+                }),
+            exclusive: operation => this.enqueue(async () => {
+                this.require(id);
+                return operation({
+                    get: (<T>(key: string, fallback?: T) =>
+                        clone(this.scopedGet<T>(prefix(id) + key) ?? fallback)) as vscode.Memento['get'],
+                    update: (key, value) => this.scopedUpdate(prefix(id) + key, clone(value)),
+                });
+            }),
         };
     }
 
@@ -469,5 +542,13 @@ export class ConnectionRegistry implements vscode.Disposable {
         };
     }
 
-    dispose(): void { this.disposed = true; this.changed.dispose(); }
+    async dispose(): Promise<void> {
+        if (this.disposed) return;
+        this.disposed = true;
+        this.lifetime.abort(new Error('Connection registry is disposed.'));
+        clearInterval(this.observer);
+        this.changed.dispose();
+        await this.queue;
+        this.profile?.dispose();
+    }
 }

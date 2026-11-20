@@ -1,7 +1,7 @@
 import * as assert from 'assert';
 import { ConnectionRegistry, type ConnectionDefinition, type ConnectionPatch } from '../../connections';
 import * as vscode from 'vscode';
-import { updateConnectionWithGroup } from '../../extension';
+import { removeConnectionWithGroup, updateConnectionWithGroup } from '../../extension';
 
 function fixture() {
     let connection: ConnectionDefinition = {
@@ -55,6 +55,20 @@ suite('connection metadata and native group edits', () => {
             update: async () => { assert.fail('Native configuration must stay closed'); },
         }, 'local', { settings: { creditLimit: 12 } });
         assert.strictEqual(result.settings.creditLimit, 12);
+    });
+
+    test('rotating a key with the same connection name does not open the native configuration', async () => {
+        const { store, snapshot } = fixture();
+        const before = snapshot();
+        await updateConnectionWithGroup({
+            get: store.get,
+            update: async (id, patch, key) => {
+                assert.strictEqual(key, 'replacement-key');
+                return store.update(id, patch);
+            },
+        }, {
+            update: async () => { assert.fail('Native configuration must stay closed'); },
+        }, before.id, { name: before.name }, 'replacement-key');
     });
 
     test('a native rename failure leaves the saved endpoint and credential untouched', async () => {
@@ -111,5 +125,35 @@ suite('connection metadata and native group edits', () => {
         { name: 'Renamed' }, null), /cleanup failed/);
         assert.deepStrictEqual(names, ['Renamed']);
         assert.strictEqual(snapshot().name, 'Renamed');
+    });
+
+    test('a registry removal failure restores the native group if the connection still exists', async () => {
+        const { store, snapshot } = fixture();
+        const before = snapshot();
+        const events: string[] = [];
+        await assert.rejects(removeConnectionWithGroup({
+            get: store.get,
+            remove: async () => { events.push('registry remove'); throw new Error('Storage failed'); },
+        }, {
+            remove: async id => {
+                assert.strictEqual(id, before.id);
+                events.push('native remove');
+                return async () => { events.push('native restore'); };
+            },
+        }, before.id), /Storage failed/);
+        assert.deepStrictEqual(events, ['native remove', 'registry remove', 'native restore']);
+    });
+
+    test('cleanup failure after committed removal leaves the native group deleted', async () => {
+        const { snapshot } = fixture();
+        const before = snapshot();
+        let exists = true;
+        await assert.rejects(removeConnectionWithGroup({
+            get: () => exists ? before : undefined,
+            remove: async () => { exists = false; throw new Error('Old credential cleanup failed'); },
+        }, {
+            remove: async () => async () => { assert.fail('A committed deletion must not restore the native group'); },
+        }, before.id), /cleanup failed/);
+        assert.strictEqual(exists, false);
     });
 });

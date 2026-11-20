@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { connectionModelId, decodeModelId } from './connectionProvider';
 import { DEFAULT_CONNECTION_NAME, LEGACY_CONNECTION_ID } from './connections';
+import { t } from './i18n';
 
 const DEFAULT_VENDOR = 'openrouter-copilot-request-credit';
 const CONFIGURATION_COMMAND = 'workbench.action.openLanguageModelsJson';
@@ -19,6 +20,8 @@ export interface NativeGroupEdit {
 export interface NativeGroupDocument {
     readonly version: number;
     readonly isDirty: boolean;
+    readonly isClosed: boolean;
+    readonly eol: vscode.EndOfLine;
     getText(): string;
     save(): Thenable<boolean>;
 }
@@ -26,7 +29,6 @@ export interface NativeGroupDocument {
 export interface NativeGroupHost {
     openConfiguration(): Promise<NativeGroupDocument>;
     applyEdits(document: NativeGroupDocument, edits: readonly NativeGroupEdit[]): Promise<boolean>;
-    addGroup(group: { vendor: string; name: string; connectionId: string }): Promise<void>;
 }
 
 const vscodeHost: NativeGroupHost = {
@@ -34,8 +36,8 @@ const vscodeHost: NativeGroupHost = {
         // This command resolves the UI client's active profile, including from a remote extension host.
         await vscode.commands.executeCommand(CONFIGURATION_COMMAND);
         const document = vscode.window.activeTextEditor?.document;
-        if (!document || !document.uri.path.endsWith('/chatLanguageModels.json')) {
-            throw new Error('VS Code did not open the active profile’s Language Models JSON.');
+        if (document?.uri.scheme !== 'vscode-userdata' || !document.uri.path.endsWith('/chatLanguageModels.json')) {
+            throw new Error(t('VS Code did not open the active profile’s Language Models JSON.'));
         }
         return document;
     },
@@ -47,13 +49,6 @@ const vscodeHost: NativeGroupHost = {
                 change.text);
         }
         return vscode.workspace.applyEdit(edit);
-    },
-    async addGroup(group) {
-        if (vscode.workspace.textDocuments.some(document => document.isDirty &&
-            document.uri.path.endsWith('/chatLanguageModels.json'))) {
-            throw new Error('Save or discard your unsaved Language Models JSON edits before migrating connections.');
-        }
-        await vscode.commands.executeCommand('lm.addLanguageModelsProviderGroup', group);
     },
 };
 
@@ -74,7 +69,7 @@ class JsoncDocument {
         this.root = this.readValue();
         this.skipTrivia();
         if (this.offset !== text.length || !this.root.items) {
-            throw new Error('Language Models JSON must contain a valid JSONC array.');
+            throw new Error(t('Language Models JSON must contain a valid JSONC array.'));
         }
     }
 
@@ -88,7 +83,7 @@ class JsoncDocument {
             }
             if (this.text.startsWith('/*', offset)) {
                 const end = this.text.indexOf('*/', offset + 2);
-                if (end < 0) { throw new Error('Unterminated comment in Language Models JSON.'); }
+                if (end < 0) { throw new Error(t('Unterminated comment in Language Models JSON.')); }
                 offset = end + 2;
                 continue;
             }
@@ -107,7 +102,11 @@ class JsoncDocument {
                 const character = this.text[this.offset++];
                 if (character === '\\') { this.offset++; }
                 else if (character === '"') {
-                    return { start, end: this.offset, value: JSON.parse(this.text.slice(start, this.offset)) };
+                    try {
+                        return { start, end: this.offset, value: JSON.parse(this.text.slice(start, this.offset)) };
+                    } catch {
+                        return this.invalid();
+                    }
                 }
             }
         } else if (first === '[' || first === '{') {
@@ -144,7 +143,7 @@ class JsoncDocument {
     }
 
     private invalid(): never {
-        throw new Error('Language Models JSON is invalid or has duplicate object properties; fix it before syncing.');
+        throw new Error(t('Language Models JSON is invalid or has duplicate object properties. Fix it before syncing.'));
     }
 }
 
@@ -177,7 +176,7 @@ export class NativeGroupManager {
         return this.sync(connection, false);
     }
 
-    reconcileDefault(connection: NativeGroupConnection): Promise<void> {
+    repair(connection: NativeGroupConnection): Promise<void> {
         return this.sync(connection, connection.id === LEGACY_CONNECTION_ID && connection.name === DEFAULT_CONNECTION_NAME);
     }
 
@@ -190,7 +189,9 @@ export class NativeGroupManager {
                 const group = groupValue(item);
                 return group?.vendor === this.vendor && group.connectionId === connection.id;
             });
-            if (own.length > 1) { throw new Error('Several native groups use this connection ID; fix Language Models JSON.'); }
+            if (own.length > 1) {
+                throw new Error(t('Several native groups use this connection ID. Fix Language Models JSON.'));
+            }
             const conflicts = items.filter(item => {
                 const group = groupValue(item);
                 return group?.vendor === this.vendor && group.name === connection.name && item !== own[0];
@@ -198,7 +199,7 @@ export class NativeGroupManager {
             if (conflicts.length > 0) {
                 const legacy = conflicts[0];
                 if (!adoptLegacy || own.length || conflicts.length !== 1 || legacy.properties!.has('connectionId')) {
-                    throw new Error(`A native model group named “${connection.name}” already exists.`);
+                    throw new Error(t('A native model group named “{0}” already exists.', connection.name));
                 }
                 const edits = [prependProperties(source, legacy, [`"connectionId": ${JSON.stringify(connection.id)}`])];
                 const settings = legacy.properties!.get('settings');
@@ -218,24 +219,29 @@ export class NativeGroupManager {
                 return;
             }
             const name = own[0]?.properties?.get('name');
-            if (own[0] && !name) { throw new Error('The native connection group has no name; fix Language Models JSON.'); }
+            if (own[0] && !name) {
+                throw new Error(t('The native connection group has no name. Fix Language Models JSON.'));
+            }
             if (name?.value === connection.name) { return; }
             if (name) {
                 await this.saveEdits(document, [{ start: name.start, end: name.end, text: JSON.stringify(connection.name) }]);
             } else {
                 const last = items.at(-1);
-                const hasComma = last && source.text[source.skipTrivia(last.end)] === ',';
-                const eol = source.text.includes('\r\n') ? '\r\n' : '\n';
+                const commaPosition = last && source.text[source.skipTrivia(last.end)] !== ',' ? last.end : undefined;
+                const close = source.root.end - 1;
+                const eol = document.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
                 const group = JSON.stringify({ vendor: this.vendor, name: connection.name, connectionId: connection.id });
-                const edits: NativeGroupEdit[] = [{ start: source.root.end - 1, end: source.root.end - 1,
-                    text: `${eol}\t${group}${eol}` }];
-                if (last && !hasComma) { edits.push({ start: last.end, end: last.end, text: ',' }); }
+                const edits: NativeGroupEdit[] = [{ start: close, end: close,
+                    text: `${commaPosition === close ? ',' : ''}${eol}\t${group}${eol}` }];
+                if (commaPosition !== undefined && commaPosition !== close) {
+                    edits.push({ start: commaPosition, end: commaPosition, text: ',' });
+                }
                 await this.saveEdits(document, edits);
             }
         });
     }
 
-    remove(connectionId: string): Promise<void> {
+    remove(connectionId: string): Promise<(() => Promise<void>) | undefined> {
         return this.enqueue(async () => {
             const document = await this.openCleanDocument();
             const source = new JsoncDocument(document.getText());
@@ -252,46 +258,43 @@ export class NativeGroupManager {
                 // A preceding comma may become a valid JSONC trailing comma; leave adjacent comments intact.
                 edits.push({ start: item.start, end: item.end, text: '' });
             }
-            if (edits.length) { await this.saveEdits(document, edits); }
-        });
-    }
-
-    /** One-time legacy migration only: the native command identifies duplicates by vendor/name, not connection ID. */
-    ensureDefault(connection: NativeGroupConnection): Promise<'added' | 'exists'> {
-        return this.enqueue(async () => {
-            try {
-                await this.host.addGroup({ vendor: this.vendor, name: connection.name, connectionId: connection.id });
-                return 'added';
-            } catch (error) {
-                const message = error instanceof Error ? error.message : String(error);
-                if (message === `Language model group with name ${connection.name} already exists for vendor ${this.vendor}`) {
-                    return 'exists';
+            if (!edits.length) { return undefined; }
+            const applied = await this.saveEdits(document, edits);
+            return () => this.enqueue(async () => {
+                if (document.isClosed || document.isDirty || document.version !== applied.version ||
+                    document.getText() !== applied.text) {
+                    throw new Error(t('Language Models JSON changed before the native model group could be restored.'));
                 }
-                throw error;
-            }
+                await this.saveEdits(document, [{ start: 0, end: applied.text.length, text: source.text }]);
+            });
         });
     }
 
     private async openCleanDocument(): Promise<NativeGroupDocument> {
         const document = await this.host.openConfiguration();
         if (document.isDirty) {
-            throw new Error('Save or discard your unsaved Language Models JSON edits before changing connections.');
+            throw new Error(t('Save or discard your unsaved Language Models JSON edits before changing connections.'));
         }
         return document;
     }
 
-    private async saveEdits(document: NativeGroupDocument, edits: readonly NativeGroupEdit[]): Promise<void> {
+    private async saveEdits(
+        document: NativeGroupDocument, edits: readonly NativeGroupEdit[]
+    ): Promise<{ text: string; version: number }> {
         const version = document.version;
         const expected = applyTextEdits(document.getText(), edits);
         // Validate the complete result before applying an edit to the user's profile.
         new JsoncDocument(expected);
-        if (document.isDirty || document.version !== version || !await this.host.applyEdits(document, edits)) {
-            throw new Error('Language Models JSON changed during the connection update; retry the action.');
+        if (document.isClosed || document.isDirty || document.version !== version ||
+            !await this.host.applyEdits(document, edits)) {
+            throw new Error(t('Language Models JSON changed during the connection update. Retry the action.'));
         }
         if (document.getText() !== expected) {
-            throw new Error('Language Models JSON changed during the update. Review and save the file manually.');
+            throw new Error(t('Language Models JSON changed during the update. Review the open file.'));
         }
-        if (!await document.save()) { throw new Error('Could not save Language Models JSON; review the open file.'); }
+        const appliedVersion = document.version;
+        if (!await document.save()) { throw new Error(t('Could not save Language Models JSON. Review the open file.')); }
+        return { text: expected, version: appliedVersion };
     }
 
     private enqueue<T>(operation: () => Promise<T>): Promise<T> {

@@ -20,6 +20,7 @@
 !out/nativeGroups.js
 !out/panel.js
 !out/provider.js
+!out/profileStorage.js
 !out/storage.js
 !l10n/bundle.l10n.ja.json
 !l10n/bundle.l10n.zh-cn.json
